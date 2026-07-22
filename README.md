@@ -1,5 +1,7 @@
 # skillscan
 
+[中文](README.zh-CN.md)
+
 Enterprise Skill security detection system — scans Agent Skill packages
 (`SKILL.md` + `scripts/` + bundled `.mcp.json`/hooks) before marketplace admission
 and produces a `PASS` / `REVIEW` / `BLOCK` verdict. Internal tool, on-prem, zero
