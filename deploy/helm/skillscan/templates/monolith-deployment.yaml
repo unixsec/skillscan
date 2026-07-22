@@ -1,0 +1,76 @@
+# core-monolith (coding spec §3/§7.2): the ONLY component holding DB/Vault/IdP
+# credentials - deliberately runs under the DEFAULT (non-gVisor) RuntimeClass,
+# since INV-11 requires it never parse untrusted Skill content itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skillscan-monolith
+  namespace: skillscan
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core-monolith
+spec:
+  replicas: {{ .Values.replicaCount.monolith }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: skillscan
+      app.kubernetes.io/component: core-monolith
+  template:
+    metadata:
+      labels:
+        {{- include "skillscan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: core-monolith
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # SECURITY/BUG (found live-applying this to the real k3s cluster, not
+        # by inspection): `runAsNonRoot: true` with no explicit `runAsUser`
+        # fails closed with "container has runAsNonRoot and image has
+        # non-numeric user (skillscan), cannot verify user is non-root" -
+        # this Dockerfile's `USER skillscan` (a name, matching k8s convention
+        # for readability) can't be resolved to a uid at admission time
+        # without kubelet running /etc/passwd lookup logic it doesn't have.
+        # Explicit numeric runAsUser (matching the Dockerfile's real
+        # `useradd --uid 10001 skillscan`) sidesteps needing that resolution
+        # at all - this was ALREADY broken before fsGroup below was ever
+        # added; simply never live-tested until now.
+        runAsUser: 10001
+        # SECURITY/BUG (found via a real bulk-import test, not by inspection):
+        # monolith (uid 10001) and engine-runner (uid 10002) are deliberately
+        # DIFFERENT identities - never made to match, that would undo the
+        # isolation. But both write into the SAME blobstore findings/{scan_id}/
+        # tree (only when it's a shared hostPath volume, i.e. the VM/dev
+        # fallback from deploy/vm/20-blobstore-hostpath.md when MinIO isn't
+        # provisioned - see engine-runner-deployment.yaml's own docstring:
+        # intended production reads/writes blobstore via MinIO, which has no
+        # Unix permission model to race on). Whichever of the two writes a
+        # given scan_id's directory first fixes its owning uid; the other's
+        # write then fails closed with EACCES - if that's a REQUIRED engine,
+        # the scan can never decide and eventually dead-letters to BLOCK via
+        # the poison-pill path. A shared fsGroup is the standard k8s fix for
+        # multiple distinct uids needing write access to one mounted volume,
+        # without collapsing their separate identities.
+        fsGroup: 10000
+      containers:
+        - name: monolith
+          image: {{ include "skillscan.image" (dict "root" $ "repo" .Values.image.monolithRepository) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: skillscan-config
+            - secretRef:
+                name: {{ .Values.secretRefs.name }}
+          resources:
+            {{- toYaml .Values.resources.monolith | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }

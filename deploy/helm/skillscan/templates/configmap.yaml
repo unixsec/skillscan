@@ -1,0 +1,24 @@
+# SECURITY: only non-secret configuration lives here - every credential is a
+# Secret reference (values.yaml's secretRefs), never a literal in this
+# ConfigMap (coding spec §13: config-as-code for endpoints, Vault for secrets).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: skillscan-config
+  namespace: skillscan
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+data:
+  SKILLSCAN_DB_HOST: {{ .Values.config.mysqlHost | quote }}
+  SKILLSCAN_DB_NAME: {{ .Values.config.mysqlDatabase | quote }}
+  SKILLSCAN_REDIS_URL: {{ .Values.config.redisUrl | quote }}
+  SKILLSCAN_BLOBSTORE_ROOT: "/var/lib/skillscan/blobstore"
+  SKILLSCAN_VLLM_BASE_URL: {{ .Values.config.vllmBaseUrl | quote }}
+  SKILLSCAN_LLM_MODEL: {{ .Values.config.llmModel | quote }}
+  SKILLSCAN_OSV_SOURCE: {{ .Values.config.osvSource | quote }}
+  SKILLSCAN_VAULT_ADDR: {{ .Values.config.vaultAddr | quote }}
+  SKILLSCAN_VAULT_TRANSIT_KEY_NAME: "skillscan-gate-signing"
+  SKILLSCAN_MARKETPLACE_API_BASE_URL: {{ .Values.config.marketplaceApiBaseUrl | quote }}
+  SKILLSCAN_RECONCILIATION_POLL_ENABLED: {{ .Values.config.reconciliationPollEnabled | quote }}
+  SKILLSCAN_RECONCILIATION_PUSH_ENABLED: {{ .Values.config.reconciliationPushEnabled | quote }}
+  SKILLSCAN_GATE_POLICY_PATH: "/etc/skillscan/policies/gate/v1.yaml"

@@ -1,0 +1,113 @@
+# Per-module MySQL GRANT manifest (coding spec §7.2) — config-as-code, PR-reviewed.
+#
+# SECURITY: no user here may be granted access to another module's private tables.
+# gate_outbox/audit_intent/baseline/skill/skill_version/scan_result/audit_entry are
+# the only deliberate cross-module contract seams, and they get asymmetric, minimal
+# grants (producer INSERT-only or reader SELECT/UPDATE-only), never the owning
+# module's full ALL privilege.
+#
+# `db/setup_grants.py` applies this manifest against a root/admin connection — it is
+# NOT run through alembic (alembic manages schema, not privileged user administration).
+# Passwords here are LOCAL DEV ONLY placeholders; production injects them from Vault
+# (coding spec §13, FR-DEP-060) and never commits real credentials to this file.
+#
+# SECURITY: MySQL only supports LOCK TABLES as a database- or global-scoped grant,
+# never per-table (`GRANT LOCK TABLES ON db.table` is rejected by the server) - so any
+# module whose service code issues `SELECT ... FOR UPDATE` needs an explicit
+# `database_privileges` entry below, even though the row-lock itself only ever
+# touches that module's own table at the SQL-statement level. This is strictly a
+# grant-shape workaround for a MySQL limitation, not a widening of table access -
+# `tables:` above still governs exactly which tables each user may touch.
+
+users:
+  # svc_gateway: no MySQL tables of its own - session/introspection caching lives in
+  # Redis/in-memory (libs/common + gateway/auth/session.py), not a session_cache
+  # table (coding spec §7.2 marks that table as "或用 Redis" - optional alternative,
+  # and this project took the Redis path). The user still exists for parity with the
+  # spec's module list and in case a future gateway-owned table is added.
+  svc_gateway:
+    password_env: SKILLSCAN_DB_PASSWORD_GATEWAY
+    tables: {}
+  svc_orchestration:
+    password_env: SKILLSCAN_DB_PASSWORD_ORCHESTRATION
+    tables:
+      scan_job: ALL
+      scan_result: ALL
+      baseline: [SELECT]  # SECURITY: drift.py (M4, SUP-05) reads the approved baseline only
+    database_privileges: [LOCK TABLES]  # scan_job SELECT ... FOR UPDATE (single-flight decide)
+  svc_gate:
+    password_env: SKILLSCAN_DB_PASSWORD_GATE
+    tables:
+      verdict: ALL
+      allowlist: ALL
+      gate_outbox: ALL
+      audit_intent: [INSERT]  # SECURITY: gate may only append intents, never read/update the chain
+      policy_proposal: ALL # M8 §9 admin·policy two-person hard-gate approval workflow
+  svc_inventory:
+    password_env: SKILLSCAN_DB_PASSWORD_INVENTORY
+    tables:
+      skill: ALL
+      skill_version: ALL
+      baseline: ALL
+      skill_lifecycle_event: ALL # M8 §16.2 lifecycle state machine (append-only)
+      # SECURITY: mirrors svc_gate's own pattern - a lifecycle transition and
+      # its audit_intent are written in ONE transaction (INV-12), never as two
+      # separate, unsynchronized writes.
+      audit_intent: [INSERT]
+  svc_reeval:
+    password_env: SKILLSCAN_DB_PASSWORD_REEVAL
+    tables:
+      reconciliation: ALL
+      scan_job: [INSERT]  # to trigger re-scans
+      # SECURITY: read-only, minimal cross-module grant (M7 controller.py,
+      # same shape as svc_orchestration's baseline:[SELECT] in M4) - lets
+      # toolchain-staleness detection identify which published skills need a
+      # rescan without granting reeval any write access to inventory's tables.
+      skill: [SELECT]
+      skill_version: [SELECT]
+  svc_relay:
+    password_env: SKILLSCAN_DB_PASSWORD_RELAY
+    tables:
+      gate_outbox: [SELECT, UPDATE]  # SECURITY: drains the outbox only, never touches verdict
+    database_privileges: [LOCK TABLES]  # gate_outbox SELECT ... FOR UPDATE SKIP LOCKED (drain)
+  svc_audit:
+    password_env: SKILLSCAN_DB_PASSWORD_AUDIT
+    tables:
+      audit_intent: [SELECT, UPDATE]
+      audit_entry: [INSERT, SELECT]
+    database_privileges: [LOCK TABLES]  # tail/pending-intent SELECT ... FOR UPDATE (§7.3 chain append)
+  svc_intel:
+    password_env: SKILLSCAN_DB_PASSWORD_INTEL
+    tables:
+      threat_indicator: ALL
+  svc_reporting:
+    password_env: SKILLSCAN_DB_PASSWORD_REPORTING
+    tables:
+      report_schedule: ALL # M8 §16.2 FR-REP - reporting's own schedule storage
+      # SECURITY: read-only, minimal cross-module grants (mirrors svc_reeval's
+      # skill/skill_version:[SELECT] shape) - reports are built entirely from
+      # other modules' already-committed history/results, never written back.
+      audit_entry: [SELECT]
+      scan_result: [SELECT]
+  svc_admin:
+    password_env: SKILLSCAN_DB_PASSWORD_ADMIN
+    tables:
+      # 2026-07-14 (item #13) - admin's first-ever owned tables; every prior
+      # admin/router.py write (policy proposals, allowlist) borrowed ANOTHER
+      # module's session/credentials for its own domain data. Local account
+      # management and IdP group->role mapping are genuinely admin's own
+      # bounded context, same "new module, new user" precedent svc_reporting
+      # set for report_schedule.
+      local_account: ALL
+      group_role_mapping: ALL
+      # SECURITY: every account/role-map mutation is audited in the SAME
+      # transaction (INV-12), mirroring svc_gate/svc_inventory's own
+      # audit_intent:[INSERT] shape - never SELECT/UPDATE, admin can append
+      # an audit intent but never read back or alter the chain itself.
+      audit_intent: [INSERT]
+
+# SECURITY: no user above has write access to any other module's private business
+# table; gate_outbox/audit_intent/skill/skill_version/scan_result/audit_entry are
+# the only cross-module seams and use minimal, asymmetric grants as annotated.
+# Enforced by MySQL itself (INV: cross-module GRANT violations rejected by the
+# DB), not just application-layer convention.

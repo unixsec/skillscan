@@ -1,0 +1,115 @@
+# Authoritative pin manifest for vendored OSS detection engines (coding spec §10A.2).
+# SECURITY: "latest stable" is resolved ONCE at vendoring time and frozen here as an
+# exact commit SHA - builds always use this pin, never track upstream. Upgrading is a
+# deliberate, reviewed re-vendor (bump SHA + review diff + re-run license scan), never
+# automatic.
+#
+# Vendored 2026-07-05 in a networked coding session per §10A.3; all refs verified to
+# exist upstream via `git ls-remote` immediately before `git submodule add`.
+
+engines:
+  skillspector:
+    repo: https://github.com/NVIDIA/SkillSpector
+    # SECURITY: no release tag exists upstream - only main branch - so the commit SHA
+    # itself is the pin; any bump requires re-reviewing the diff (weaker supply-chain
+    # posture than a signed/tagged release, noted here explicitly).
+    ref_type: commit
+    commit: dde36f258729b5aec7c835295a9556e64a2def0c
+    license: Apache-2.0
+    role: mandatory
+    adapter_status: built
+    # OSV lookups in the vendored source hit https://api.osv.dev directly with no
+    # internal-mirror override found (osv_client.py) - full INV-14 compliance for this
+    # engine needs a network-level control (egress proxy/firewall) this Python adapter
+    # cannot enforce alone; documented in skillspector.py's own module docstring too.
+
+  aig:
+    repo: https://github.com/Tencent/AI-Infra-Guard
+    ref_type: tag
+    tag: v4.1.15
+    commit: 31b2184b0b5656f44b3cb2eb5164775dc750c46f
+    license: Apache-2.0  # migrated from MIT in 2026; NOTICE file retained per attribution terms
+    role: mandatory
+    # UPDATED 2026-07-09 - the 2026-07-05 finding below (AIG's top-level `scan`
+    # command being a network-service scanner) is still correct and still a
+    # dead end, but that earlier pass checked only `scan` and `agent-scan/
+    # main.py` (dismissed for unparseable Python-repr logging) - it never
+    # looked at `mcp-scan/`, which the repo's own README calls out as a
+    # SEPARATE capability ("MCP Server & Agent Skills scan"). A dedicated
+    # investigation this session (see docs/stories/BACKLOG.md's 2026-07-09
+    # AIG entry) found `mcp-scan/main.py --repo <dir>` genuinely takes a
+    # local directory (a Skill package's files, no live target needed) and
+    # produces structured, parseable `<vuln><title>/<desc>/<risk_type>/
+    # <level>/<suggestion></vuln>` blocks - confirmed against the tool's own
+    # parser, `mcp-scan/utils/extract_vuln.py`. The catch: every finding
+    # requires a real, live LLM API call (main.py exits 1 with no API key
+    # resolvable, before touching the target at all) - there is no
+    # `--no-llm`/static mode anywhere in mcp-scan, unlike skillspector.
+    # `services/engine_runner/adapters/aig.py` now exists, gated the same
+    # way as skillspector's LLM path (SKILLSCAN_VLLM_BASE_URL, INV-14
+    # internal-endpoint-only) - see that file's own module docstring for the
+    # full interface writeup. `scan` and `agent-scan/`/`AIG-PromptSecurity/`/
+    # `skills/` remain correctly un-adapted per the original finding below.
+    adapter_status: built
+    adapter_status_reason: mcp_scan_subsystem_llm_gated_see_aig_py
+    # ORIGINAL 2026-07-05 finding (coding spec §10A.3 "读真实 vendor 源码,不
+    # 臆测接口" - read the real vendored source, don't guess the interface),
+    # kept verbatim rather than deleted, since it's still accurate for the
+    # subsystems it actually covered: AIG's top-level CLI (`ai-infra-guard
+    # scan`) is a NETWORK-SERVICE scanner (`--target http://host:port`
+    # against a running Ollama/vLLM/Dify endpoint), not a local file-bundle
+    # scanner - it cannot serve skillscan's need for those specific
+    # subsystems. `agent-scan/main.py` logs a Python repr, not structured
+    # JSON/XML, so parsing it would mean guessing an undocumented format -
+    # still un-adapted for that reason.
+
+  bandit:
+    repo: https://github.com/PyCQA/bandit
+    ref_type: tag
+    tag: "1.9.4"
+    commit: 92ae8b82fb422a639f0ed8d99e96cea769594e08
+    license: Apache-2.0
+    role: mandatory
+    adapter_status: built
+    # verified via a real end-to-end run against the installed bandit CLI (see
+    # apps/monolith/tests/test_bandit_adapter.py::TestRealEndToEnd), which caught a
+    # genuine schema gap: hashlib.md5() emits test ID B324 on bandit 1.9.4, not B303 -
+    # bandit.py's _CODE_12_TEST_IDS now includes both.
+
+  osv_scanner:
+    repo: https://github.com/google/osv-scanner
+    ref_type: tag
+    tag: v2.4.0
+    commit: b56b5191101d5f27d4787d5583d8d01e9518a7af
+    license: Apache-2.0
+    role: mandatory
+    adapter_status: built
+    # SECURITY: this key is `osv_scanner` (underscore, matching this repo's own Python
+    # naming) but the actual `git submodule add` created `vendor/osv-scanner` (hyphen,
+    # matching the upstream repo name itself - see .gitmodules). vendor_path records the
+    # TRUE on-disk directory explicitly rather than assuming key==directory - scripts/
+    # vendor_engines.py's verify-pins/license-scan read this field, not the dict key, to
+    # locate the submodule (caught by that script actually being run against the real
+    # repo state, not assumed to match).
+    vendor_path: osv-scanner
+    # no real osv-scanner binary available in this environment (Go binary + prebuilt
+    # offline vuln DB per §10A) - schema-based parsing tests only, not live-binary E2E.
+
+  yara:
+    repo: https://github.com/VirusTotal/yara
+    ref_type: tag
+    tag: v4.5.7
+    commit: d72b85f09fcd86583836eb8c4f349cb269ec875d
+    license: BSD-3-Clause
+    role: mandatory
+    adapter_status: built
+    # no real yara binary available in this environment - CLI output format
+    # (`rule_name [meta_k=v,...] file_path`) is an informed assumption, not verified
+    # live; `_MATCH_LINE_RE` in yara.py is flagged as the single place to adjust if a
+    # real binary's output differs.
+
+# SECURITY: license scan result (spot-checked LICENSE/COPYING file headers, 2026-07-05):
+# skillspector=Apache-2.0, aig=Apache-2.0, bandit=Apache-2.0, osv_scanner=Apache-2.0,
+# yara=BSD-3-Clause (COPYING file, standard BSD-3 redistribution text). All permissive;
+# none GPL/LGPL/AGPL. No modification made to any vendored source (LICENSE §10A.1
+# copyleft-isolation invariant: adapters call these via subprocess only, never import).

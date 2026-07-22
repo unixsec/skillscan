@@ -1,0 +1,37 @@
+# DEV-ONLY sandbox egress exception - NOT part of the production manifest.
+#
+# This directory (deploy/networkpolicy/dev/) is deliberately a SUBDIRECTORY so
+# the production apply pattern `deploy/networkpolicy/*.yaml` (non-recursive)
+# never matches it. Apply it ONLY on a developer/VM cluster, in addition to the
+# base policies:
+#     kubectl apply -f deploy/networkpolicy/            # base (prod-safe)
+#     kubectl apply -f deploy/networkpolicy/dev/        # dev extras (this file)
+#
+# NetworkPolicy egress is ADDITIVE across policies selecting the same pods, so
+# this separate policy grants the engine-runner sandbox exactly one extra
+# egress target on top of sandbox-egress-allowlist.yaml's five internal ones.
+#
+# WHY (2026-07-14): the host running the dev VM (Parallels bridge 10.211.55.2,
+# private RFC1918 - passes INV-14's require_internal_endpoint without any code
+# exception) runs a local mlx_vlm.server so SKILLSCAN_VLLM_BASE_URL can be
+# tested against a real model without a dedicated in-cluster vLLM deployment.
+# REMOVE this whole dev/ policy once a real in-cluster vLLM pod (matched by the
+# base file's `app.kubernetes.io/component: vllm` rule) replaces it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-egress-dev-mlx
+  namespace: skillscan
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: engine-runner
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.211.55.2/32
+      ports:
+        - protocol: TCP
+          port: 8001

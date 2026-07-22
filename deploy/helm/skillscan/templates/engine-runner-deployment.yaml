@@ -1,0 +1,79 @@
+# engine-runner (sandbox, coding spec §10/§11.7): gVisor RuntimeClass, no
+# ServiceAccount token, no DB/Vault credentials at all (INV-10) - reads/writes
+# only via the airlock (Redis control plane + MinIO payload plane), never
+# directly to the monolith or its DB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skillscan-engine-runner
+  namespace: skillscan
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: engine-runner
+spec:
+  replicas: {{ .Values.replicaCount.engineRunner }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: skillscan
+      app.kubernetes.io/component: engine-runner
+  template:
+    metadata:
+      labels:
+        {{- include "skillscan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: engine-runner
+    spec:
+      runtimeClassName: {{ .Values.runtimeClass.engineRunner }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # See the matching comment in monolith-deployment.yaml: without this,
+        # `runAsNonRoot: true` fails closed at admission ("image has
+        # non-numeric user (engine-runner), cannot verify user is non-root")
+        # since this Dockerfile's `USER engine-runner` is a name, not a uid -
+        # confirmed live against the real k3s cluster, not by inspection.
+        # Matches the Dockerfile's real `useradd --uid 10002 engine-runner`.
+        runAsUser: 10002
+        # See the matching comment in monolith-deployment.yaml: this fsGroup
+        # must stay identical to that one's, so a shared hostPath blobstore
+        # (the VM/dev fallback when MinIO isn't provisioned) is writable by
+        # both this uid (10002) and the monolith's (10001) without collapsing
+        # either identity. Only matters for the hostPath fallback - the
+        # intended MinIO-backed production path has no Unix permission model
+        # to race on in the first place.
+        fsGroup: 10000
+      containers:
+        - name: engine-runner
+          image: {{ include "skillscan.image" (dict "root" $ "repo" .Values.image.engineRunnerRepository) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          env:
+            - name: SKILLSCAN_REDIS_URL
+              valueFrom:
+                configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_REDIS_URL }
+            - name: SKILLSCAN_VLLM_BASE_URL
+              valueFrom:
+                configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_VLLM_BASE_URL }
+            - name: SKILLSCAN_OSV_SOURCE
+              valueFrom:
+                configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_OSV_SOURCE }
+            - name: SKILLSCAN_LLM_MODEL
+              valueFrom:
+                configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_LLM_MODEL }
+            # SECURITY (INV-10 note): the one Secret-sourced key in this
+            # Deployment - see values.yaml's secretRefs entry for why this,
+            # specifically, is the deliberate exception to "no DB/Vault
+            # credentials at all" here. `optional: true` so a deployment
+            # that hasn't provisioned this key (the default, safe state)
+            # still starts cleanly - aig-mcp-scan's own placeholder-key
+            # fallback handles an empty value, it doesn't crash on it.
+            - name: SKILLSCAN_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretRefs.name }}
+                  key: SKILLSCAN_LLM_API_KEY
+                  optional: true
+          resources:
+            {{- toYaml .Values.resources.engineRunner | nindent 12 }}

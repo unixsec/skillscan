@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: skillscan-monolith
+  namespace: skillscan
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: skillscan
+    app.kubernetes.io/component: core-monolith
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

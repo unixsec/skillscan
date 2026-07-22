@@ -1,0 +1,25 @@
+# Default-deny-all NetworkPolicy (coding spec §8/§11.7 INV-14: "default-deny
+# egress; sandbox 白名单仅内网...外部出站不可能(边界+NetworkPolicy双重强制)").
+#
+# SECURITY: applies to every pod in the skillscan namespace (empty podSelector
+# matches all pods) - both Ingress and Egress default to deny. Every other
+# NetworkPolicy in this directory is an ADDITIVE allowlist on top of this
+# baseline (Kubernetes NetworkPolicies are purely additive - a pod's
+# effective policy is the union of every NetworkPolicy that selects it), so
+# nothing in this namespace has ANY network access until explicitly granted.
+#
+# NOT VERIFIED: no real Kubernetes cluster is available in this development
+# environment (macOS, no Linux-only CNI enforcement) - this manifest has not
+# been applied/tested here. Coding spec's own acceptance criterion for this
+# invariant is explicit that isolation tests only count when run on Linux
+# ("沙箱相关安全测试仅在真实隔离运行时(Linux)下计入门禁").
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: skillscan
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress

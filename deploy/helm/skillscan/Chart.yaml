@@ -1,0 +1,6 @@
+apiVersion: v2
+name: skillscan
+description: Enterprise Skill security detection system (zero-external-network, on-prem)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

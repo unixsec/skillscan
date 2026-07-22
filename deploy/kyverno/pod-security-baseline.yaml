@@ -1,0 +1,93 @@
+# Admission: 禁特权/资源上限/非 root (coding spec §11.7). Three related pod-
+# security checks bundled in one policy (each its own named rule so a
+# violation report names the SPECIFIC failing check, not just "policy
+# rejected").
+#
+# NOT VERIFIED: see require-signed-images.yaml's own note - no real cluster
+# available in this environment.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: pod-security-baseline
+  annotations:
+    policies.kyverno.io/title: Pod Security Baseline
+    policies.kyverno.io/description: >-
+      Disallow privileged containers, require CPU/memory limits, require
+      non-root, for every pod in the skillscan namespace.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: disallow-privileged
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - skillscan
+      validate:
+        message: "Privileged containers are not allowed."
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+
+    - name: require-non-root
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - skillscan
+      validate:
+        # SECURITY (2026-07-10): container-level securityContext OVERRIDES
+        # pod-level (k8s semantics) - a pattern that only checks
+        # spec.securityContext.runAsNonRoot would admit a pod whose container
+        # sets its own runAsNonRoot: false (or omits it on a root-UID base
+        # image), since Kyverno's pattern match never inspected the
+        # container-level field to catch that override. anyPattern (OR of
+        # patterns, upstream Kyverno's own require-run-as-non-root shape)
+        # closes that: pattern 1 requires pod-level true AND no container
+        # explicitly overrides to false (this project's real Deployments -
+        # see monolith/engine-runner-deployment.yaml - rely on exactly this:
+        # pod-level true, no container-level field at all); pattern 2 is the
+        # fallback for a pod with no pod-level securityContext at all, which
+        # instead requires EVERY container to set its own runAsNonRoot: true
+        # explicitly - either path is sufficient, but at least one must hold.
+        message: >-
+          Containers must run as non-root: either pod-level
+          spec.securityContext.runAsNonRoot=true with no container-level
+          override to false, or every container must explicitly set its own
+          securityContext.runAsNonRoot=true.
+        anyPattern:
+          - spec:
+              securityContext:
+                runAsNonRoot: true
+              containers:
+                - =(securityContext):
+                    =(runAsNonRoot): "true"
+          - spec:
+              containers:
+                - securityContext:
+                    runAsNonRoot: true
+
+    - name: require-resource-limits
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - skillscan
+      validate:
+        message: "Every container must declare CPU and memory limits."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"

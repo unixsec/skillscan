@@ -1,0 +1,48 @@
+# Gate policy v1 (coding spec §11.6: "GatePolicy 从版本化 yaml 加载;每判定记
+# policy_version;config-as-code, PR 评审"). This file's `version:` value is what
+# every VerdictRow.policy_version records - bump it (new file, e.g. v2.yaml, or a
+# reviewed edit) only via a deliberate, PR-reviewed change, never silently in place.
+#
+# required_engines: the floor engines (services/engine_runner/detectors/*.py +
+# skillscan_core.StaticKeywordEngine) that INV-1 requires unconditionally, by their
+# real `EngineMetadata.name` values - a scan missing any of these is not required_ok.
+version: "v1"
+
+required_engines:
+  - static-keyword
+  - inhouse-pii
+  - inhouse-file-type
+  - inhouse-crypto-weak
+  - inhouse-toctou
+  - inhouse-provenance
+  - inhouse-prompt-injection-zh
+  - inhouse-jailbreak-inducement-zh
+
+# hard_gate_rules: rule_ids that are unwaivable (INV-3/INV-8: allowlist can never
+# suppress these, regardless of scope_type) - the PII/credential detectors'
+# highest-confidence rules, config-as-code so this list is reviewable.
+#
+# NOTE (2026-07 FP-tuning): pii.credit_card was REMOVED from the hard gate. A
+# regex+Luhn card match is high-value but NOT high-enough-confidence to be
+# unwaivable/force-BLOCK: real skills carrying schema examples, sample data, and
+# 16-digit IDs produced false BLOCKs. It remains a HIGH finding (-> REVIEW by
+# default tier / BLOCK on public tier), so a genuine leaked PAN still surfaces
+# for human adjudication - it just no longer auto-blocks unwaivably. us_ssn
+# (a far more specific ddd-dd-dddd shape) stays a hard gate.
+hard_gate_rules:
+  - pii.us_ssn
+  - provenance.unsigned_high_trust_claim
+
+review_confidence: 0.6
+block_on_severity: CRITICAL
+review_on_severity: HIGH
+
+# tier_block_overrides: may only TIGHTEN (lower) the base block_on_severity per
+# trust tier, never loosen it (skillscan_core.GatePolicy.__post_init__ enforces
+# this at construction time regardless of what this file says).
+tier_block_overrides:
+  - tier: public
+    severity: HIGH
+
+allowlistable_max_severity: HIGH
+fail_closed_verdict: BLOCK

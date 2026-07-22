@@ -1,0 +1,36 @@
+# Redis ingress allowlist (coding spec §8/§11.7 INV-10/INV-14).
+#
+# Found live-authored on the dev VM but never committed to this repo -
+# reconstructed here from the applied object, then extended: it only allowed
+# `core-monolith` as a source, which was correct as long as no separate
+# engine-runner process existed to also need Redis access (per
+# apps/monolith/worker.py's `run_mock_engine_worker_tick` docstring, that
+# process substituted for the real sandboxed worker up to this point). Now
+# that services/engine_runner is a real, separate deployable consuming the
+# SAME airlock scans/results streams, it needs to be an allowed source too -
+# discovered live (ConnectionRefusedError, not a silent policy drop) when
+# `sandbox-egress-allowlist.yaml` was applied for the first time and
+# engine-runner's outbound side started working before this ingress side was
+# updated to match.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: skillscan
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: core-monolith
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: engine-runner
+      ports:
+        - port: 6379
+          protocol: TCP

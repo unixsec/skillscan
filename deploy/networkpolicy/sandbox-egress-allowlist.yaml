@@ -1,0 +1,78 @@
+# Sandbox (engine-runner/dynamic-sandbox) egress allowlist (coding spec §8/
+# §11.7 INV-10/INV-14): "sandbox 白名单仅内网(CoreDNS/Redis/MinIO/vLLM/OSV)".
+#
+# SECURITY: this is additive on top of default-deny.yaml - sandbox pods get
+# EXACTLY these five egress targets and nothing else; there is deliberately
+# no rule for any address outside this cluster/namespace, and no 0.0.0.0/0
+# fallback of any kind. Combined with the pod-level boundary (no DB/Vault
+# credentials in this pod at all, per INV-10 - see services/engine_runner's
+# own module docstrings), external egress from a compromised sandboxed
+# engine is blocked by TWO independent controls, not just this one.
+#
+# NOT VERIFIED: see default-deny.yaml's own note - no real cluster available
+# in this environment to apply/test this against.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-egress-allowlist
+  namespace: skillscan
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: engine-runner
+  policyTypes:
+    - Egress
+  egress:
+    # CoreDNS - name resolution for the four internal targets below.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Redis (airlock control plane) - control-plane only, no payload access.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # MinIO (airlock payload plane) - artifacts/* read-only, findings/* write-only
+    # credentials are enforced at the MinIO IAM layer, not by this NetworkPolicy.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    # vLLM - internal LLM inference endpoint (SKILLSCAN_VLLM_BASE_URL).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: vllm
+      ports:
+        - protocol: TCP
+          port: 8000
+    # OSV mirror - internal vulnerability-DB mirror (never api.osv.dev, INV-14).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: osv-mirror
+      ports:
+        - protocol: TCP
+          port: 8080
+    # NOTE: any dev-only egress exception (e.g. reaching an mlx_vlm.server on
+    # the developer host instead of an in-cluster vLLM pod) lives in
+    # deploy/networkpolicy/dev/sandbox-egress-dev.yaml, which is a SEPARATE,
+    # additive NetworkPolicy applied ONLY in dev. It is intentionally NOT in
+    # this directory so the production apply (`deploy/networkpolicy/*.yaml`,
+    # non-recursive) can never pick it up. Keep this file free of any address
+    # outside the cluster/namespace.

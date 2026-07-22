@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.claude/
+
+# Real secrets for docker-compose.yml - see .env.example for the template
+.env
+
+# Local blob store (runtime scan artifacts + findings) - never versioned
+var/
+
+# Playwright MCP browser-test artifacts (screenshots, console logs, downloads)
+.playwright-mcp/
+
+# Subagent-driven-development scratch state (progress ledger, review packages)
+.superpowers/
+
+# Local-only dev notes (may contain VM debug credentials) - never versioned
+.local/
+
+# Ad-hoc UI verification screenshots dropped in the repo root during VM testing.
+# Root-scoped on purpose: web/ may legitimately version image assets later.
+/*.png
+
+# Working spreadsheets / binary docs - this repo versions reports as .html/.md only
+/*.xlsx
+/doc/devfile/*.pdf

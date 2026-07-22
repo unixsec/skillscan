@@ -1,0 +1,15 @@
+[submodule "vendor/skillspector"]
+	path = vendor/skillspector
+	url = https://github.com/NVIDIA/SkillSpector
+[submodule "vendor/aig"]
+	path = vendor/aig
+	url = https://github.com/Tencent/AI-Infra-Guard
+[submodule "vendor/bandit"]
+	path = vendor/bandit
+	url = https://github.com/PyCQA/bandit
+[submodule "vendor/osv-scanner"]
+	path = vendor/osv-scanner
+	url = https://github.com/google/osv-scanner
+[submodule "vendor/yara"]
+	path = vendor/yara
+	url = https://github.com/VirusTotal/yara

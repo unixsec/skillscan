@@ -1,0 +1,117 @@
+# Production-shaped one-click deployment (coding spec §4.3 docker-compose /
+# VM topology B2). Brings up MySQL 8 + Redis + the monolith (BFF API) + the
+# web console behind an nginx reverse proxy, applying migrations/GRANTs once
+# via a one-shot `migrate` service before the monolith starts.
+#
+# NOT VERIFIED: no Docker daemon is available in this development environment
+# - this compose file (and the images it builds) has never been run here,
+# same honestly-labeled posture as apps/monolith/Dockerfile,
+# deploy/engines/*/Dockerfile, and web/Dockerfile individually.
+#
+# SECURITY: no default/dev credentials anywhere in this file - every secret
+# comes from .env (copy .env.example -> .env and fill in real values first;
+# see docs/DEPLOYMENT_GUIDE.md). Without a real Vault + OIDC/SAML IdP
+# configured, the monolith starts but has NO working login path (break-glass
+# stays disabled by default, per INV-17 - this compose file does not turn it
+# on for you). This is the real production-shaped target; for local dev/demo
+# without any of that, use scripts/one_click_dev.sh instead.
+#
+# This does NOT include services/engine-runner (real OSS detection engines) -
+# see deploy/helm/skillscan for the full K8s topology (coding spec §4.3
+# Topology A) that also runs engine-runner in a separate, gVisor-sandboxed
+# namespace; this compose file targets Topology B2 (single/few-VM, no K8s).
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "${SKILLSCAN_MYSQL_ROOT_PASSWORD:?set in .env}"
+      MYSQL_DATABASE: skillscan
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${SKILLSCAN_MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: alembic migrate + per-module GRANT manifest, then exits.
+  # `monolith` waits for this to succeed before starting (never races a
+  # partially-migrated schema).
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/monolith/Dockerfile
+      args:
+        PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      SKILLSCAN_MIGRATION_DB_URL: "mysql+aiomysql://root:${SKILLSCAN_MYSQL_ROOT_PASSWORD}@mysql/skillscan"
+      SKILLSCAN_ADMIN_DB_DSN: "mysql://root:${SKILLSCAN_MYSQL_ROOT_PASSWORD}@mysql/skillscan"
+    entrypoint: ["sh", "-c", "alembic upgrade head && python db/setup_grants.py"]
+
+  monolith:
+    build:
+      context: .
+      dockerfile: apps/monolith/Dockerfile
+      args:
+        PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      SKILLSCAN_DB_HOST: mysql
+      SKILLSCAN_REDIS_URL: redis://redis:6379/0
+      SKILLSCAN_BLOBSTORE_ROOT: /app/var/blobstore
+      # Background worker (apps/monolith/worker.py): scan execution, verdicts,
+      # lifecycle, audit/outbox drains, report schedules. Override to "false"
+      # only if a separate dedicated worker deployment runs these loops.
+      SKILLSCAN_WORKER_ENABLED: "${SKILLSCAN_WORKER_ENABLED:-true}"
+    volumes:
+      - blobstore_data:/app/var/blobstore
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        NPM_CONFIG_REGISTRY: "${SKILLSCAN_NPM_REGISTRY:-}"
+    restart: unless-stopped
+    depends_on:
+      monolith:
+        condition: service_healthy
+    ports:
+      - "80:80"
+
+volumes:
+  mysql_data:
+  redis_data:
+  blobstore_data:

@@ -1,0 +1,10 @@
+skillscan {{ .Chart.AppVersion }} deployed to namespace {{ .Release.Namespace }}.
+
+Apply alongside this release (not templated into it - these are cluster-scoped
+or namespace-scoped-but-independent-lifecycle resources):
+  kubectl apply -f deploy/networkpolicy/
+  kubectl apply -f deploy/kyverno/
+
+Verify:
+  kubectl -n {{ .Release.Namespace }} get pods
+  kubectl -n {{ .Release.Namespace }} exec deploy/skillscan-monolith -- curl -s localhost:8000/healthz

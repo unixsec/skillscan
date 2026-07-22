@@ -1,0 +1,93 @@
+[project]
+name = "skillscan"
+version = "0.1.0"
+description = "Enterprise Skill security detection system"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.*",
+    "uvicorn[standard]==0.34.*",
+    "pydantic==2.10.*",
+    "pydantic-settings>=2.6",
+    "authlib==1.4.*",
+    "python3-saml==1.16.*",
+    "httpx==0.28.*",
+    "sqlalchemy[asyncio]==2.0.*",
+    "aiomysql==0.2.*",
+    "alembic>=1.13",
+    "redis==5.2.*",
+    "pyyaml>=6.0",
+    "pyjwt[crypto]==2.10.*",
+    "python-multipart==0.0.*",
+    "pymysql==1.2.*",
+    "cryptography>=43.0",
+    "hvac>=2.4.0",
+    "prometheus-client>=0.25.0",
+    "opentelemetry-api>=1.43.0",
+    "opentelemetry-sdk>=1.43.0",
+    "pyotp>=2.10.0",
+    "fpdf2>=2.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "ruff>=0.8",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "bandit>=1.9.4",
+]
+
+[tool.mypy]
+strict = true
+files = [
+    "libs/skillscan_core",
+    "libs/common",
+    "libs/schemas",
+    "libs/ports",
+    "apps/monolith",
+    "services/engine_runner",
+    "services/intel_sync",
+    "scripts",
+]
+
+[[tool.mypy.overrides]]
+module = ["onelogin.*", "authlib.*", "pymysql.*", "yaml.*", "hvac.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["apps/monolith/tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# SECURITY (INV-15): vendor/ holds pinned, license-scanned third-party OSS
+# engine source (git submodules, vendor/engines.lock.yaml) - it must never be
+# reformatted or auto-fixed in place, only consumed via subprocess. Excluding
+# it here means even an unscoped `ruff check .`/`ruff format .` can't drift it
+# away from the audited upstream pinned commit.
+extend-exclude = ["vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom is `param: T = Depends(...)` - a function
+# call as an argument default is required, not a mutable-default-argument bug.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Cookie"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "libs/skillscan_core",
+    "libs/common",
+    "libs/schemas",
+    "libs/ports",
+    "apps/monolith",
+    "services/engine_runner",
+    "services/intel_sync",
+]

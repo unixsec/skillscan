@@ -1,0 +1,102 @@
+# Default values for the skillscan chart. Zero-external-network by
+# construction: every *_url/*_addr value below MUST resolve to an
+# internal/private address - libs/common/config.py's require_internal_endpoint
+# enforces this at application startup too (defense in depth, not reliance on
+# this file alone being correct).
+
+image:
+  registry: internal-registry.example.local
+  monolithRepository: skillscan/monolith
+  engineRunnerRepository: skillscan/engine-runner
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount:
+  monolith: 2
+  engineRunner: 3
+
+resources:
+  monolith:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  engineRunner:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "2", memory: 2Gi }
+
+# SECURITY (coding spec §11.7/§10): the sandbox runs under gVisor - the
+# monolith deliberately does NOT (INV-11: it never parses untrusted content).
+runtimeClass:
+  engineRunner: gvisor
+
+# SECURITY: reconciliation.poll defaults true in a real deployment (coding
+# spec §13: poll=off must alert, never be silently the production default).
+config:
+  mysqlHost: mysql.skillscan.svc.cluster.local
+  mysqlDatabase: skillscan
+  redisUrl: redis://redis.skillscan.svc.cluster.local:6379/0
+  minioEndpoint: minio.skillscan.svc.cluster.local:9000
+  vllmBaseUrl: http://vllm.skillscan.svc.cluster.local:8000
+  osvSource: http://osv-mirror.skillscan.svc.cluster.local:8080
+  vaultAddr: http://vault.skillscan.svc.cluster.local:8200
+  marketplaceApiBaseUrl: https://marketplace.skillscan.svc.cluster.local
+  reconciliationPollEnabled: true
+  reconciliationPushEnabled: false
+  # 2026-07-09: for an enterprise privatized model deployment - point
+  # vllmBaseUrl above at it (must still resolve internally, per this file's
+  # header comment - "internal" covers a privatized/on-prem deployment just
+  # as much as a literal vLLM process) and name the served model here if it
+  # requires one. secretRefs.keys below carries the API key, if that
+  # deployment enforces its own auth.
+  llmModel: ""  # e.g. an enterprise-internal model's own name/identifier
+
+# SECURITY: every *_password_env/*_token/*_secret name below is a REFERENCE to
+# a Kubernetes Secret key (populated from Vault at deploy time, coding spec
+# §13) - never a literal value in this file.
+secretRefs:
+  name: skillscan-secrets
+  # SECURITY (2026-07-10): this list must have one SKILLSCAN_DB_PASSWORD_<X>
+  # entry for every module apps/monolith/main.py's _build_scan_runtime()
+  # actually calls _default_module_dsn("svc_<x>") for - anything short of
+  # that set silently falls back to _default_module_dsn's hardcoded
+  # local-dev default password in a real deployment (that fallback has no
+  # other guardrail). Cross-check both ends before adding/removing a key:
+  # policies/grants/manifest.yaml lists every module with real DB grants,
+  # but grants alone don't imply main.py wires up an engine for it - e.g.
+  # svc_gateway has a manifest entry (empty tables: {}, kept only "for
+  # parity with the spec's module list") yet main.py never calls
+  # _default_module_dsn("svc_gateway"); adding a key for it here would be
+  # dead config with nothing to consume it. Add SKILLSCAN_DB_PASSWORD_GATEWAY
+  # only once main.py actually builds a svc_gateway engine.
+  keys:
+    - SKILLSCAN_DB_PASSWORD_GATE
+    - SKILLSCAN_DB_PASSWORD_ORCHESTRATION
+    - SKILLSCAN_DB_PASSWORD_REEVAL
+    - SKILLSCAN_DB_PASSWORD_RELAY
+    - SKILLSCAN_DB_PASSWORD_AUDIT
+    - SKILLSCAN_DB_PASSWORD_INTEL
+    - SKILLSCAN_DB_PASSWORD_INVENTORY
+    - SKILLSCAN_DB_PASSWORD_REPORTING
+    - SKILLSCAN_VAULT_TOKEN
+    - SKILLSCAN_MARKETPLACE_POLL_TOKEN
+    - SKILLSCAN_MARKETPLACE_WRITE_TOKEN
+    - SKILLSCAN_RECONCILIATION_PUSH_HMAC_SECRET
+    # SECURITY (INV-10 note, 2026-07-09): the one credential this Secret
+    # delivers to engine-runner rather than the monolith - a deliberate,
+    # documented exception to that Deployment's normal "no DB/Vault
+    # credentials at all" posture, since the LLM call has to originate from
+    # the component that touches untrusted content (INV-11). Empty/unset in
+    # Vault is fine and matches every other key here defaulting to unused -
+    # aig-mcp-scan falls back to a placeholder that only works against an
+    # unauthenticated endpoint; populate this only if the enterprise's
+    # privatized model deployment enforces its own auth. vllmBaseUrl itself
+    # must still resolve internally regardless (INV-14) - this key never
+    # changes that, it only carries credentials for whatever internal
+    # endpoint is already configured there.
+    - SKILLSCAN_LLM_API_KEY
+
+networkPolicy:
+  # Applies deploy/networkpolicy/*.yaml (non-recursive) - the prod-safe base
+  # policies only. The deploy/networkpolicy/dev/ SUBDIRECTORY holds dev-only
+  # egress exceptions (e.g. reaching a developer-host mlx_vlm.server) and is
+  # intentionally NOT matched here; apply it separately on dev clusters only.
+  enabled: true

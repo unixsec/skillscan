@@ -1,0 +1,38 @@
+# VM-local engine-runner deployment (raw manifest, matches the style of the
+# existing ~/k8s/*.yaml on 10.211.55.10 - not the deploy/helm/skillscan chart,
+# which is the "real" production-shaped target this VM manifest is a
+# dev/test analogue of, same relationship 30-monolith.yaml already has to
+# apps/monolith's Helm Deployment template).
+#
+# SECURITY (INV-10): no SKILLSCAN_DB_HOST, no Vault env var, no
+# ServiceAccount token - only Redis (airlock control plane) and the shared
+# blobstore hostPath (airlock payload plane, see 20-blobstore-hostpath.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: engine-runner, namespace: skillscan }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: engine-runner } }
+  template:
+    # SECURITY: `app.kubernetes.io/component: engine-runner` is REQUIRED, not
+    # cosmetic - deploy/networkpolicy/sandbox-egress-allowlist.yaml's own
+    # podSelector keys on exactly this label. Without it this pod matches no
+    # egress-allow policy and default-deny-all silently drops everything,
+    # including DNS (found live: CoreDNS itself was healthy, gethostbyname
+    # failed with "temporary failure in name resolution" for 20+ retries -
+    # looked like flaky VM networking, was actually this).
+    metadata: { labels: { app: engine-runner, app.kubernetes.io/component: engine-runner } }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: engine-runner
+          image: docker.io/skillscan/engine-runner:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SKILLSCAN_REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: SKILLSCAN_BLOBSTORE_ROOT, value: /var/lib/skillscan/blobstore }
+          volumeMounts:
+            - { name: blobstore, mountPath: /var/lib/skillscan/blobstore }
+      volumes:
+        - name: blobstore
+          hostPath: { path: /var/lib/skillscan-blobstore, type: DirectoryOrCreate }

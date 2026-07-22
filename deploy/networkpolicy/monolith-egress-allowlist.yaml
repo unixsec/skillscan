@@ -1,0 +1,84 @@
+# Monolith (core-monolith, holds credentials) egress allowlist. Broader than
+# the sandbox's (coding spec §7.2: the monolith is the ONLY component with
+# DB/Vault/IdP credentials), but still an explicit, internal-only allowlist -
+# additive on top of default-deny.yaml, same posture as sandbox-egress-
+# allowlist.yaml.
+#
+# NOT VERIFIED: see default-deny.yaml's own note.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monolith-egress-allowlist
+  namespace: skillscan
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: core-monolith
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: mysql
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    # Vault - Transit signing (gate.signer.VaultTransitSigner), SKILLSCAN_VAULT_ADDR.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: vault
+      ports:
+        - protocol: TCP
+          port: 8200
+    # Internal IdP - OIDC/SAML (M2), introspection (session.py).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: idp
+      ports:
+        - protocol: TCP
+          port: 443
+    # Internal SIEM - integration_relay outbox forwarding (NotificationPort).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: siem
+      ports:
+        - protocol: TCP
+          port: 443
+    # Internal marketplace - MarketplacePort (write_verdict/list_published/quarantine).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: marketplace
+      ports:
+        - protocol: TCP
+          port: 443

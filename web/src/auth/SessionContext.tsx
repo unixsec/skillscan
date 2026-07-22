@@ -1,0 +1,63 @@
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
+import { api, ApiError } from '../api/client'
+import type { Session } from '../api/types'
+
+interface SessionState {
+  session: Session | null
+  loading: boolean
+  refresh: () => void
+}
+
+// SECURITY (coding spec §9: "前端隐藏仅UX"): this context is ONLY used to
+// decide what the UI shows - hiding a nav link for a role that doesn't have
+// it is a convenience, never a security boundary. Every backend route
+// independently re-checks the caller's role regardless of what this context
+// says, so a tampered/absent client-side session state can only ever make
+// the UI show LESS, never grant more access than the backend allows.
+const SessionCtx = createContext<SessionState>({ session: null, loading: true, refresh: () => {} })
+
+export function SessionProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<Session | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [generation, setGeneration] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    api
+      .get<Session>('/v1/me')
+      .then((s) => {
+        if (!cancelled) setSession(s)
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          if (err instanceof ApiError && err.status === 401) {
+            setSession(null)
+          } else {
+            setSession(null)
+          }
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [generation])
+
+  const refresh = () => setGeneration((g) => g + 1)
+
+  return (
+    <SessionCtx.Provider value={{ session, loading, refresh }}>{children}</SessionCtx.Provider>
+  )
+}
+
+export function useSession(): SessionState {
+  return useContext(SessionCtx)
+}
+
+export function hasAnyRole(session: Session | null, ...roles: string[]): boolean {
+  if (!session) return false
+  return roles.some((r) => session.roles.includes(r))
+}

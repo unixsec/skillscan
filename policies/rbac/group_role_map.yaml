@@ -1,0 +1,16 @@
+# IdP group -> role mapping (coding spec §16.3, INV-17). config-as-code,
+# PR-reviewed, deployment-team-owned - the REAL group names below are
+# deployment-specific placeholders (the enterprise's own IdP group naming),
+# not something this codebase can know in advance.
+#
+# SECURITY: deny-by-default (gateway.auth.rbac.resolve_roles) - any IdP group
+# NOT listed here contributes nothing; every authenticated subject always
+# resolves to at least `submitter`. There is no local admin password anywhere
+# in this file or this codebase - the ONLY way to become `admin` through the
+# normal path is SSO login as a member of whichever IdP group is mapped to
+# `admin` below. Break-glass (a SEPARATE, default-disabled emergency path -
+# see modules/admin/breakglass.py) exists for when the IdP itself is down.
+group_role_map:
+  skillscan-admins: admin
+  skillscan-approvers: approver
+  skillscan-auditors: auditor

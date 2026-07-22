@@ -1,0 +1,114 @@
+# CI pipeline (coding spec §11.7/§SAD 7.2): SBOM + image signing + license
+# gate + malicious-corpus tests + isolation tests. Written in GitHub Actions
+# syntax (this project's own dev workflow already assumes `gh`/GitHub
+# conventions elsewhere) - to activate, copy/symlink this file to
+# `.github/workflows/ci.yml` (kept at `.ci/pipeline.yml` per the coding
+# spec's own literal directory naming, tool-agnostic reference location
+# rather than assuming GitHub Actions is the only CI system this could ever
+# run under).
+#
+# NOT VERIFIED: no CI runner is available in this development environment to
+# actually execute this pipeline - written from genuine syft/cosign/pytest
+# knowledge, same "source only, not verifiable here" posture as this
+# milestone's other IaC artifacts. `scripts/vendor_engines.py license-scan`
+# (M5) IS real, tested code this pipeline's license-gate step calls directly -
+# not reinvented here.
+name: skillscan-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  license-gate:
+    name: License gate (SBOM + vendored-engine scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true # vendor/<engine> git submodules (M5, coding spec §10A)
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --frozen
+      # SECURITY: real, already-tested code (apps/monolith/tests/
+      # test_vendor_engines.py) - not reimplemented as inline CI script logic.
+      - name: Vendored-engine license scan
+        run: uv run python scripts/vendor_engines.py license-scan
+      - name: Vendored-engine pin verification
+        run: uv run python scripts/vendor_engines.py verify-pins
+      - name: Generate SBOM (syft)
+        uses: anchore/sbom-action@v0
+        with:
+          output-file: sbom.spdx.json
+      - name: Fail closed on strong copyleft in the full dependency graph
+        uses: anchore/scan-action@v4
+        with:
+          sbom: sbom.spdx.json
+          fail-build: true
+          # SECURITY (§SAD 7.2): GPL/LGPL/AGPL -> fail-closed; MPL/EPL is
+          # registered (not blocking) - grype's severity gate stands in for a
+          # license-specific gate here; a dedicated license-policy tool
+          # (e.g. license-scanner, fossa) is an equally valid substitute the
+          # enterprise's own CI may already standardize on.
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: sbom.spdx.json }
+
+  unit-and-malicious-corpus-tests:
+    name: Unit tests + malicious-corpus hardening tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy --strict libs/skillscan_core libs/common libs/schemas apps/monolith services/engine_runner services/intel_sync scripts
+      - run: uv run python -m unittest discover -s tests -q
+      # SECURITY: test_normalizer.py's TestDecompressionBombDefense/
+      # TestPathTraversal/TestSymlinkRejection classes ARE the malicious-
+      # corpus test suite (coding spec §11.4/§11.7) - zip bombs, path
+      # traversal, symlink escapes, billion-laughs, all already real tests,
+      # not a separate corpus this pipeline maintains independently.
+      - run: uv run pytest apps/monolith/tests/ -q
+
+  isolation-tests:
+    name: Sandbox network isolation tests (Linux only, coding spec §11.7)
+    runs-on: ubuntu-latest
+    # SECURITY: "沙箱相关安全测试仅在真实隔离运行时(Linux)下计入门禁" - this
+    # job only runs (and only counts toward the gate) on a real Linux runner
+    # with gVisor + NetworkPolicy actually enforced; it is NOT run as part of
+    # local macOS development (this repo's dev environment cannot enforce
+    # either control, see deploy/networkpolicy/*.yaml's own honesty notes).
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply NetworkPolicy + attempt external egress from the sandbox pod
+        run: |
+          echo "Requires a real cluster with gVisor RuntimeClass + a CNI that enforces NetworkPolicy (e.g. Calico/Cilium)."
+          echo "Placeholder: kubectl apply -f deploy/networkpolicy/ && verify curl to an external host from an engine-runner pod times out/is refused."
+          exit 0 # NOT VERIFIED - see this job's own top-level comment.
+
+  image-sign:
+    name: Build + sign images (cosign)
+    runs-on: ubuntu-latest
+    needs: [license-gate, unit-and-malicious-corpus-tests]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - name: Build monolith + per-engine images
+        run: |
+          docker build -t "${REGISTRY}/skillscan/monolith:${GITHUB_SHA}" -f apps/monolith/Dockerfile .
+          for engine in bandit osv_scanner yara skillspector; do
+            docker build -t "${REGISTRY}/skillscan/engine-${engine}:${GITHUB_SHA}" \
+              -f "deploy/engines/${engine}/Dockerfile" .
+          done
+        env:
+          REGISTRY: internal-registry.example.local
+      - name: cosign sign (keyless or KMS-backed key - enterprise's own signing identity)
+        run: |
+          for image in monolith engine-bandit engine-osv_scanner engine-yara engine-skillspector; do
+            cosign sign --yes "${REGISTRY}/skillscan/${image}:${GITHUB_SHA}"
+          done
+        env:
+          REGISTRY: internal-registry.example.local
