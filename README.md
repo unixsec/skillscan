@@ -5,31 +5,24 @@ Enterprise Skill security detection system — scans Agent Skill packages
 and produces a `PASS` / `REVIEW` / `BLOCK` verdict. Internal tool, on-prem, zero
 external network connectivity.
 
-Specs (authoritative, in this order for implementation vs. architecture):
-
-- `企业Skill安全检测系统-系统设计文档-编码规格v2.0.md` — coding spec (drives implementation)
-- `企业Skill安全检测系统-架构设计说明书-SAD-v2.0.md` — architecture
-- `企业Skill安全检测系统-需求规格说明书-SRS-v2.2.md` — requirements (FR-*/NFR-* IDs)
-- `docs/stories/BACKLOG.md` — milestone-by-milestone story backlog, each with its own
-  authoritative "Status:" note (most granular, most current source on "is X really done")
-- `docs/BUILD_GUIDE.md` / `docs/DEPLOYMENT_GUIDE.md` / `docs/USAGE_GUIDE.md` /
-  `docs/MAINTENANCE_GUIDE.md` — the 4 operational guides (Chinese), split by concern;
-  `docs/USER_GUIDE.md` is now just an index pointing to these
-- `docs/THREAT_MODEL.md` — kernel threat model (M1 deliverable)
+The project is built against a layered spec set (requirements → architecture →
+coding spec), a milestone-by-milestone story backlog with per-story status
+notes, a set of operational guides split by concern (build/deploy/usage/
+maintenance), and a dedicated kernel threat model — maintained separately from
+this repository's public snapshot.
 
 ## Status
 
-**M1-M8 all implemented**, and a full requirement-by-requirement audit against the
-coding spec (2026-07-06, 6 independent verification passes against live code/tests)
-found 18 real gaps — **all 18 are now fixed**, including a critical kernel defect
-where a dedup collision in `gate.decide()` could silently drop a trifecta-completing
-finding (fixed with dedicated regression tests), a missing CSRF check on
-`POST /v1/reeval/{skill_id}`, and — the most consequential structural gap — a real
-OIDC/SAML login callback now exists (`/v1/auth/oidc/*`, `/v1/auth/saml/*`);
-break-glass is no longer the only working session path. See
-`docs/MAINTENANCE_GUIDE.md` §2 for the full fix list and §3 for what honestly
-remains open (the scan-decision worker loop still isn't invoked by any live
-process — the single biggest remaining gap, out of scope for that audit).
+**M1-M8 all implemented**, and a full requirement-by-requirement audit against
+the coding spec (2026-07-06, 6 independent verification passes against live
+code/tests) found 18 real gaps — **all 18 are now fixed**, including a critical
+kernel defect where a dedup collision in `gate.decide()` could silently drop a
+trifecta-completing finding (fixed with dedicated regression tests), a missing
+CSRF check on `POST /v1/reeval/{skill_id}`, and — the most consequential
+structural gap — a real OIDC/SAML login callback now exists
+(`/v1/auth/oidc/*`, `/v1/auth/saml/*`); break-glass is no longer the only
+working session path. The one big known gap that remains: the scan-decision
+worker loop still isn't invoked by any live process.
 
 706 backend tests passing against real local MySQL/Redis (no mocking of systems
 under test), `mypy --strict`/ruff/ruff-format all clean across 171 files; frontend
@@ -56,10 +49,10 @@ cd web && npm install && npm run build && npm run lint   # frontend
 
 Or just run `./scripts/one_click_dev.sh` — brings up MySQL/Redis, migrates, builds
 the frontend, and starts the backend with a working (dev-only) break-glass login in
-one command. See `docs/DEPLOYMENT_GUIDE.md` for that and the production-shaped
-Docker Compose path; `docs/BUILD_GUIDE.md`/`docs/USAGE_GUIDE.md`/
-`docs/MAINTENANCE_GUIDE.md` for everything else (local MySQL/Redis setup detail,
-per-role usage, known footguns).
+one command, for local dev; a production-shaped Docker Compose path is also
+available via `docker-compose.yml` + `scripts/one_click_deploy_docker.sh`. Local
+MySQL/Redis setup detail, per-role usage notes, and known footguns are covered in
+the project's internal operational documentation.
 
 `libs/skillscan_core` itself still has **zero runtime dependencies** by design
 (coding spec §2) — it must remain testable with nothing but the stdlib, independent
