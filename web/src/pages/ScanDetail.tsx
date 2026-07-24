@@ -33,7 +33,13 @@ function maxSeverityOf(findings: Finding[]): number | null {
   return Math.max(...findings.map((f) => f.severity))
 }
 
-function byEngine(data: ScanDetail): ModuleRow[] {
+function engineLabel(name: string, t: (key: string) => string): string {
+  const translationKey = `engine.${name}`
+  const translated = t(translationKey)
+  return translated === translationKey ? name : translated
+}
+
+function byEngine(data: ScanDetail, t: (key: string) => string): ModuleRow[] {
   const engines = new Map<string, string>() // name -> version
   for (const [name, version] of data.provenance) {
     engines.set(name, version)
@@ -48,7 +54,13 @@ function byEngine(data: ScanDetail): ModuleRow[] {
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([name, version]) => {
       const findings = data.findings.filter((f) => f.source_engine === name)
-      return { key: name, label: name, version, count: findings.length, maxSeverity: maxSeverityOf(findings) }
+      return {
+        key: name,
+        label: engineLabel(name, t),
+        version,
+        count: findings.length,
+        maxSeverity: maxSeverityOf(findings),
+      }
     })
 }
 
@@ -67,38 +79,40 @@ function byCategory(data: ScanDetail, t: (key: string) => string): ModuleRow[] {
 function ModuleTable({ rows, moduleLabel, versionLabel }: { rows: ModuleRow[]; moduleLabel: string; versionLabel?: string }) {
   const { t } = useI18n()
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>{moduleLabel}</th>
-          {versionLabel && <th>{versionLabel}</th>}
-          <th>{t('scanDetail.colFindingCount')}</th>
-          <th>{t('scanDetail.colMaxSeverity')}</th>
-          <th>{t('scanDetail.colStatus')}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((row) => (
-          <tr key={row.key}>
-            <td>{row.label}</td>
-            {versionLabel && (
-              <td>
-                <code>{row.version || '—'}</code>
-              </td>
-            )}
-            <td>{row.count}</td>
-            <td>
-              <SeverityBadge severity={row.maxSeverity} />
-            </td>
-            <td>
-              <span className={row.count === 0 ? 'badge badge-pass' : 'badge badge-block'}>
-                {row.count === 0 ? t('scanDetail.statusPass') : t('scanDetail.statusFail')}
-              </span>
-            </td>
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>{moduleLabel}</th>
+            {versionLabel && <th>{versionLabel}</th>}
+            <th>{t('scanDetail.colFindingCount')}</th>
+            <th>{t('scanDetail.colMaxSeverity')}</th>
+            <th>{t('scanDetail.colStatus')}</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.key}>
+              <td>{row.label}</td>
+              {versionLabel && (
+                <td>
+                  <code>{row.version || '—'}</code>
+                </td>
+              )}
+              <td>{row.count}</td>
+              <td>
+                <SeverityBadge severity={row.maxSeverity} />
+              </td>
+              <td>
+                <span className={row.count === 0 ? 'badge badge-pass' : 'badge badge-block'}>
+                  {row.count === 0 ? t('scanDetail.statusPass') : t('scanDetail.statusFail')}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 
@@ -124,7 +138,11 @@ export function ScanDetailContent({ scanId }: { scanId: string }) {
         <>
           <div className="summary-grid">
             <div className="summary-stat">
-              <div className="value">{data.state}</div>
+              <div className="value">
+                {t(`scanState.${data.state}`) === `scanState.${data.state}`
+                  ? data.state
+                  : t(`scanState.${data.state}`)}
+              </div>
               <div className="label">{t('scanDetail.state')}</div>
             </div>
             <div className="summary-stat">
@@ -162,7 +180,7 @@ export function ScanDetailContent({ scanId }: { scanId: string }) {
               <p className="hint">{t('scanDetail.byModuleHint')}</p>
               <h2 style={{ fontSize: '0.95rem' }}>{t('scanDetail.byEngine')}</h2>
               <ModuleTable
-                rows={byEngine(data)}
+                rows={byEngine(data, t)}
                 moduleLabel={t('scanDetail.colModule')}
                 versionLabel={t('scanDetail.colEngineVersion')}
               />
@@ -177,35 +195,37 @@ export function ScanDetailContent({ scanId }: { scanId: string }) {
               {data.findings.length === 0 ? (
                 <p className="hint">{t('scanDetail.noFindings')}</p>
               ) : (
-                <table>
-                  <thead>
-                    <tr>
-                      <th>{t('scanDetail.colRule')}</th>
-                      <th>{t('scanDetail.colTitle')}</th>
-                      <th>{t('scanDetail.colSeverity')}</th>
-                      <th>{t('scanDetail.colPath')}</th>
-                      <th>{t('scanDetail.colEvidence')}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.findings.map((f, i) => (
-                      <tr key={i}>
-                        <td>
-                          <code>{f.rule_id}</code>
-                        </td>
-                        <td>{f.title}</td>
-                        <td>
-                          <SeverityBadge severity={f.severity} />
-                        </td>
-                        <td>
-                          {f.file_path ?? '—'}
-                          {f.start_line ? `:${f.start_line}` : ''}
-                        </td>
-                        <td>{f.evidence_redacted || '—'}</td>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>{t('scanDetail.colRule')}</th>
+                        <th>{t('scanDetail.colTitle')}</th>
+                        <th>{t('scanDetail.colSeverity')}</th>
+                        <th>{t('scanDetail.colPath')}</th>
+                        <th>{t('scanDetail.colEvidence')}</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {data.findings.map((f, i) => (
+                        <tr key={i}>
+                          <td>
+                            <code>{f.rule_id}</code>
+                          </td>
+                          <td>{f.title}</td>
+                          <td>
+                            <SeverityBadge severity={f.severity} />
+                          </td>
+                          <td>
+                            {f.file_path ?? '—'}
+                            {f.start_line ? `:${f.start_line}` : ''}
+                          </td>
+                          <td>{f.evidence_redacted || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </>
           )}

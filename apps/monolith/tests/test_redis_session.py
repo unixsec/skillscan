@@ -25,9 +25,10 @@ class TestRoundTrip:
         token = await redis_session.create_session(
             redis_client, key_prefix=_PREFIX, ttl_s=60, payload="alice"
         )
-        assert await redis_session.resolve_session(
-            redis_client, key_prefix=_PREFIX, token=token
-        ) == "alice"
+        assert (
+            await redis_session.resolve_session(redis_client, key_prefix=_PREFIX, token=token)
+            == "alice"
+        )
 
     @pytest.mark.asyncio
     async def test_dict_payload_round_trips(self, redis_client: aioredis.Redis) -> None:
@@ -82,9 +83,7 @@ class TestStorageKeyIsHashedNotRawToken:
         assert await redis_client.get(hashed_key) is not None
 
     @pytest.mark.asyncio
-    async def test_no_stored_key_contains_the_raw_token(
-        self, redis_client: aioredis.Redis
-    ) -> None:
+    async def test_no_stored_key_contains_the_raw_token(self, redis_client: aioredis.Redis) -> None:
         token = await redis_session.create_session(
             redis_client, key_prefix=_PREFIX, ttl_s=60, payload="alice"
         )
@@ -106,4 +105,27 @@ class TestFailClosed:
         assert (
             await redis_session.resolve_session(redis_client, key_prefix=_PREFIX, token=token)
             is None
+        )
+
+
+class TestDeleteSession:
+    @pytest.mark.asyncio
+    async def test_deleted_session_no_longer_resolves(self, redis_client: aioredis.Redis) -> None:
+        token = await redis_session.create_session(
+            redis_client, key_prefix=_PREFIX, ttl_s=60, payload="alice"
+        )
+        await redis_session.delete_session(redis_client, key_prefix=_PREFIX, token=token)
+        assert (
+            await redis_session.resolve_session(redis_client, key_prefix=_PREFIX, token=token)
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_deleting_an_unknown_token_does_not_raise(
+        self, redis_client: aioredis.Redis
+    ) -> None:
+        # Logout must be idempotent - a session that's already gone (expired,
+        # or a double-click) is not an error.
+        await redis_session.delete_session(
+            redis_client, key_prefix=_PREFIX, token=f"nope-{uuid.uuid4().hex}"
         )

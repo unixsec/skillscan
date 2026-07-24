@@ -31,22 +31,44 @@ _PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
     (
         "toctou.hardcoded_tmp_path",
         r"""(?:["'])(?:/tmp/|/var/tmp/|/dev/shm/)[^"']*(?:["'])""",
-        "hardcoded predictable temp-directory path (bandit B108-equivalent, TOCTOU race)",
+        "硬编码的可预测临时目录路径",
         Severity.MEDIUM,
     ),
     (
         "toctou.insecure_mktemp",
         r"\btempfile\.mktemp\s*\(",
-        "tempfile.mktemp() only predicts a name, does not atomically create it (TOCTOU race)",
+        "使用了不安全的 tempfile.mktemp()",
         Severity.HIGH,
     ),
     (
         "toctou.symlink_creation",
         r"\bos\.symlink\s*\(",
-        "creates a symlink at runtime - review target for traversal/escape risk",
+        "运行时创建符号链接",
         Severity.LOW,
     ),
 )
+
+# 安全风险描述（2026-07-24）：title 只标注命中的模式，这里说明为什么它是风险
+# 及建议的规避方式（等同于 bandit B108 的检测口径）。
+_RISK_DESCRIPTIONS: dict[str, str] = {
+    "toctou.hardcoded_tmp_path": (
+        "使用固定、可预测的临时文件路径时，攻击者可在文件被创建之前抢先在该路径"
+        "放置符号链接或恶意文件，等 Skill 进程写入/读取时发生 TOCTOU（检查时间-使用"
+        "时间）竞争，导致数据被劫持或覆盖到攻击者指定的位置；建议改用 tempfile."
+        "mkstemp()/NamedTemporaryFile 生成不可预测且原子创建的临时文件。"
+    ),
+    "toctou.insecure_mktemp": (
+        "tempfile.mktemp() 只返回一个当前不存在的文件名，不会原子性地创建文件，"
+        "在“生成文件名”和“实际打开文件”之间存在竞争窗口，攻击者可抢先"
+        "创建同名文件或符号链接，导致数据被劫持、覆盖或写入到非预期位置；应改用"
+        "tempfile.mkstemp()/NamedTemporaryFile，由操作系统原子性地创建并返回已打开的文件。"
+    ),
+    "toctou.symlink_creation": (
+        "运行时创建符号链接本身不一定是恶意行为，但如果目标路径可被攻击者控制"
+        "或包含相对路径/上级目录引用，可能被用于目录穿越或将后续写入重定向到"
+        "Skill 沙箱之外的敏感文件；建议人工核查符号链接的目标来源是否可信。"
+    ),
+}
 
 
 def _metadata() -> EngineMetadata:
@@ -81,7 +103,7 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                             file_path=path,
                             start_line=line_no,
                             snippet_hash=hashlib.sha256(line.encode("utf-8")).hexdigest(),
-                            evidence_redacted=f"pattern {rule_id!r} matched",
+                            evidence_redacted=_RISK_DESCRIPTIONS[rule_id],
                         )
                     )
     return tuple(findings)

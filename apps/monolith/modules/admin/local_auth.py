@@ -278,3 +278,9 @@ async def resolve_local_session(redis: aioredis.Redis, token: str) -> tuple[str,
     if not isinstance(payload, dict) or "subject" not in payload or "role" not in payload:
         return None
     return payload["subject"], payload["role"]
+
+
+async def revoke_local_session(redis: aioredis.Redis, token: str) -> None:
+    """Logout: end this local-account session immediately rather than letting
+    it ride out its TTL."""
+    await redis_session.delete_session(redis, key_prefix=_SESSION_KEY_PREFIX, token=token)

@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import { hasAnyRole, useSession } from '../auth/SessionContext'
 import { useI18n } from '../i18n/I18nContext'
 import type { Locale } from '../i18n/translations'
 import { NAV_GROUP_LABEL_KEY, NAV_GROUP_ORDER, NAV_ITEMS } from '../nav/navItems'
 import { CommandPalette } from './CommandPalette'
+import { useToast } from './Toast'
 
 const NAV_COLLAPSED_KEY = 'skillscan.nav.collapsed'
 
@@ -27,9 +28,18 @@ function LanguageToggle() {
 }
 
 export function Layout() {
-  const { session, loading } = useSession()
+  const { session, loading, logout } = useSession()
   const { t } = useI18n()
+  const toast = useToast()
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(NAV_COLLAPSED_KEY) === '1')
+
+  async function handleLogout() {
+    try {
+      await logout()
+    } catch {
+      toast.error(t('app.logoutFailed'))
+    }
+  }
 
   useEffect(() => {
     localStorage.setItem(NAV_COLLAPSED_KEY, collapsed ? '1' : '0')
@@ -96,6 +106,18 @@ export function Layout() {
               {t('app.statusOnline')}
             </span>
             <LanguageToggle />
+            {!loading && session && (
+              <button
+                type="button"
+                className="logout-button"
+                onClick={handleLogout}
+                aria-label={t('app.logout')}
+                title={t('app.logout')}
+              >
+                <LogOut size={15} aria-hidden="true" />
+                {t('app.logout')}
+              </button>
+            )}
           </div>
         </header>
         <main className="app-content">

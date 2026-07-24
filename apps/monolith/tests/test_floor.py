@@ -10,14 +10,15 @@ class TestFloorEngines:
     def test_includes_static_keyword_engine(self) -> None:
         assert "static-keyword" in floor_engine_names()
 
-    def test_includes_all_five_inhouse_detectors(self) -> None:
+    def test_includes_all_four_inhouse_detectors(self) -> None:
+        # inhouse-provenance was removed 2026-07-24 (see
+        # detectors/__init__.py's module docstring for why).
         names = floor_engine_names()
         assert {
             "inhouse-crypto-weak",
             "inhouse-file-type",
             "inhouse-pii",
             "inhouse-toctou",
-            "inhouse-provenance",
         } <= names
 
     def test_includes_the_two_chinese_prompt_defense_detectors(self) -> None:

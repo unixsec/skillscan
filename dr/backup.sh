@@ -5,7 +5,7 @@
 #
 # SECURITY: no credentials are hardcoded here - every value comes from the
 # environment, matching this project's own "no hardcoded secrets" convention
-# (see project coding conventions). Requires SKILLSCAN_DB_HOST, SKILLSCAN_DB_PASSWORD_BACKUP (a
+# (CLAUDE.md). Requires SKILLSCAN_DB_HOST, SKILLSCAN_DB_PASSWORD_BACKUP (a
 # read-only MySQL user - see policies/grants/manifest.yaml's own per-module
 # least-privilege convention; a dedicated svc_backup user with SELECT-only
 # across all tables is the intended credential here, distinct from any

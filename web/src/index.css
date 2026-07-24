@@ -182,6 +182,24 @@ a {
   white-space: nowrap;
 }
 
+.logout-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--text-soft);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+.logout-button:hover {
+  color: var(--text);
+  border-color: var(--text-soft);
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
@@ -225,6 +243,21 @@ a {
 
 .app-shell-collapsed .app-nav {
   width: 64px;
+}
+
+/* BUG: collapsed .app-brand still lays out mark + gap + toggle button
+   (34px + 0.65rem gap + toggle) inside a 64px column - the toggle overflows
+   out of the visible strip and becomes unreachable, so a collapsed nav could
+   never be re-expanded by clicking it. Hide the mark and center the toggle
+   in the available width instead - the toggle is the only thing collapsed
+   mode needs to keep clickable. */
+.app-shell-collapsed .app-brand {
+  padding: 1.15rem 0.5rem 1rem;
+  justify-content: center;
+}
+
+.app-shell-collapsed .app-brand-mark {
+  display: none;
 }
 
 .app-shell-collapsed .nav-link {
@@ -318,6 +351,20 @@ table {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
   overflow: hidden;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin: 0.85rem 0 1.1rem;
+}
+
+.pager-status {
+  font-size: 0.85rem;
+  color: var(--text-soft);
+  white-space: nowrap;
 }
 
 th,

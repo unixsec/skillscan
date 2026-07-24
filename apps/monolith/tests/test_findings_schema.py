@@ -25,7 +25,7 @@ from skillscan_core import (
 
 
 def _valid_engine_result() -> EngineResult:
-    # NOTE: "eval() call detected" / "static.eval_call" below are inert string
+    # NOTE: "检测到 eval() 调用" / "static.eval_call" below are inert string
     # literals naming the finding that skillscan_core's real StaticKeywordEngine
     # (libs/skillscan_core/engines.py) emits when it finds eval( in scanned
     # content - nothing here calls eval() itself.
@@ -39,7 +39,7 @@ def _valid_engine_result() -> EngineResult:
         rule_id="static.eval_call",
         test_item_id="static.eval_call",
         category=DetectionCategory.CODE,
-        title="eval() call detected",
+        title="检测到 eval() 调用",
         severity=Severity.HIGH,
         confidence=1.0,
         source_engine="static-keyword",

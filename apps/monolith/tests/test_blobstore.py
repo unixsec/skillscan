@@ -130,6 +130,33 @@ class TestPutDirectoryPermissions:
         assert store.get("findings/scan-1/bandit.json") == b"first"
         assert store.get("findings/scan-1/yara.json") == b"second"
 
+    def test_preexisting_directory_with_wrong_permissions_is_repaired_on_next_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # BUG (found via a real 251-skill bulk-import test, 2026-07-23): a
+        # directory created BEFORE this fix existed in the deployed code (or
+        # by any path that predates it) stays at its OS-default restrictive
+        # mode forever, since the old code only fixed permissions on
+        # directories it just created in that same call - never one that
+        # already existed. 333 such directories were found permanently
+        # EACCES-looping in Redis's sandbox-dispatch consumer group. Simulate
+        # exactly that: a directory that already exists, owned by this
+        # process (so a real production owner-revisits-its-own-directory
+        # case), at the OS-default mode/group rather than the shared one.
+        monkeypatch.setattr("common.blobstore._shared_group_gid", lambda: os.getegid())
+        store = LocalFilesystemBlobStore(tmp_path)
+        stale_dir = tmp_path / "artifacts" / "abc123"
+        stale_dir.mkdir(parents=True)
+        stale_dir.chmod(0o755)
+        assert stat.S_IMODE(stale_dir.stat().st_mode) == 0o755
+
+        store.put("artifacts/abc123/pkg.tar", b"resubmitted content")
+
+        mode = stat.S_IMODE(stale_dir.stat().st_mode)
+        assert mode == 0o2770, (
+            f"pre-existing directory was never repaired on write, still {oct(mode)}"
+        )
+
     def test_writes_across_multiple_scan_ids_all_succeed(self, tmp_path: Path) -> None:
         store = LocalFilesystemBlobStore(tmp_path)
         for i in range(5):

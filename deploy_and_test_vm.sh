@@ -81,7 +81,11 @@ REMOTE_IMPORT
 echo "=== [4/6] health check ==="
 ssh "$VM" bash -s <<'REMOTE_HEALTH'
 set -euo pipefail
-mono_pod=$(kubectl get pods -n skillscan -o name | grep monolith | head -1)
+# --field-selector=status.phase=Running: right after `rollout restart`, the
+# old pod can still be Terminating for a few seconds and match `grep
+# monolith` too - `head -1` picked it once and died on a NotFound exec
+# because it was gone by the time this ran (2026-07-23).
+mono_pod=$(kubectl get pods -n skillscan --field-selector=status.phase=Running -o name | grep monolith | head -1)
 echo "--- $mono_pod /healthz, /readyz ---"
 kubectl exec -n skillscan "${mono_pod#pod/}" -- python3 -c "
 import urllib.request
@@ -135,4 +139,4 @@ echo "--- cleanup throwaway test containers ---"
 docker rm -f skillscan-test-mysql skillscan-test-redis >/dev/null 2>&1 || true
 REMOTE_TEST
 
-echo "=== DONE - review the pytest summary above (check anything marked !!! or FAILED) ==="
+echo "=== DONE - paste the pytest summary (and anything marked !!! or FAILED above) back to Claude ==="

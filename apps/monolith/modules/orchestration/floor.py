@@ -23,7 +23,6 @@ from engine_runner.detectors.file_type import FileTypeDetector
 from engine_runner.detectors.jailbreak_inducement_zh import JailbreakInducementZhDetector
 from engine_runner.detectors.pii import PiiDetector
 from engine_runner.detectors.prompt_injection_zh import PromptInjectionZhDetector
-from engine_runner.detectors.provenance import ProvenanceDetector
 from engine_runner.detectors.toctou import TocTouDetector
 from skillscan_core import DetectionEngine, StaticKeywordEngine
 
@@ -38,7 +37,6 @@ def floor_engines() -> dict[str, DetectionEngine]:
         FileTypeDetector(),
         PiiDetector(),
         TocTouDetector(),
-        ProvenanceDetector(),  # no trust anchor by default - see its own module docstring
         PromptInjectionZhDetector(),  # PROMPT-01 中文直接提示词注入
         JailbreakInducementZhDetector(),  # PROMPT-04 中文诱导提示/越权话术
     )

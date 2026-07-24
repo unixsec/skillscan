@@ -246,3 +246,9 @@ async def resolve_saml_session(
         # closed to bearer/cookie auth, contradicting both this function's and
         # get_session_context's "never raises / fail-closes to 401" contract.
         return None
+
+
+async def revoke_saml_session(redis: aioredis.Redis, token: str) -> None:
+    """Logout: end this SAML session immediately rather than letting it ride
+    out its TTL."""
+    await redis_session.delete_session(redis, key_prefix=_SAML_SESSION_KEY_PREFIX, token=token)

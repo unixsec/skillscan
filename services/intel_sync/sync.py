@@ -106,9 +106,10 @@ async def import_offline_package(
     """SECURITY (SEC-UPD-010, "离线包验签承重" - offline-package signature
     verification is the load-bearing control here): the package is REJECTED
     outright - zero IOCs applied - unless it verifies against a supplied
-    trusted key. There is no "unverifiable but apply anyway" path, unlike
-    `ProvenanceDetector` (which surfaces a Finding for a human/gate to weigh);
-    an offline update package is code-adjacent trust material, not a scan
+    trusted key. There is no "unverifiable but apply anyway" path - unlike a
+    scan-time detector, which can surface an unverifiable finding for a
+    human/gate to weigh; an offline update package is code-adjacent trust
+    material, not a scan
     result, so it fails closed with no partial credit.
     """
     if not trusted_public_keys:

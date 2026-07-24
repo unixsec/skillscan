@@ -57,6 +57,40 @@ from .base import SubprocessEngineAdapter
 _MATCH_LINE_RE = re.compile(r"^(?P<rule>\S+)\s+\[(?P<meta>.*)\]\s+(?P<path>.+)$")
 _FINDINGS_JSON_RE = re.compile(r'findings_json="((?:[^"\\]|\\.)*)"')
 
+# BUG (found 2026-07-23 via a real yara 4.5.0 binary, after adding Chinese
+# `title` text to this project's own .yar rules' findings_json meta):
+# yara's `-m` output does NOT re-escape a string meta value as JSON - it uses
+# C-style escaping, where `"`/`\` become `\"`/`\\` (which happened to look
+# like valid JSON escaping and is why this went unnoticed while every title
+# was plain ASCII) but any byte >= 0x80 becomes a 3-digit OCTAL escape
+# `\NNN`, one per raw UTF-8 byte (confirmed by hexdumping real `yara -m`
+# output: a Chinese title came back as literal ASCII text
+# `\346\214\207\344\273\244...`). `json.loads` has no such escape
+# (`\3` is not valid JSON) and raised `Invalid \escape`, so every one of
+# this file's non-ASCII titles silently failed the whole engine (parse
+# error -> EngineStatus.ERROR for the entire yara run, not just the
+# affected rule). `_unescape_yara_meta_string` below reverses yara's real
+# escaping (octal bytes decoded and re-assembled as UTF-8, `\"`/`\\` decoded
+# to literal characters) BEFORE handing the result to `json.loads`,
+# replacing the old naive `.replace('\\"', '"').replace('\\\\', '\\')`
+# (which never turned out to be enough even before Chinese text - a
+# genuine `\\` inside a title, e.g. quoting a Windows path, would have
+# unescaped in the wrong order with two separate greedy `.replace()` calls).
+_YARA_META_ESCAPE_RE = re.compile(r'\\(?:(["\\])|([0-7]{3}))')
+
+
+def _unescape_yara_meta_string(escaped: str) -> str:
+    result = bytearray()
+    pos = 0
+    for m in _YARA_META_ESCAPE_RE.finditer(escaped):
+        result.extend(escaped[pos : m.start()].encode("ascii", errors="replace"))
+        literal, octal = m.group(1), m.group(2)
+        result.append(ord(literal) if literal is not None else int(octal, 8))
+        pos = m.end()
+    result.extend(escaped[pos:].encode("ascii", errors="replace"))
+    return result.decode("utf-8", errors="replace")
+
+
 _SEVERITY_MAP = {
     "LOW": Severity.LOW,
     "MEDIUM": Severity.MEDIUM,
@@ -129,7 +163,7 @@ def parse_output(
             raise ValueError(
                 f"yara rule {match.group('rule')!r} matched but has no findings_json meta field"
             )
-        raw_json = json_match.group(1).replace('\\"', '"').replace("\\\\", "\\")
+        raw_json = _unescape_yara_meta_string(json_match.group(1))
         decoded = json.loads(raw_json)
 
         severity = _SEVERITY_MAP.get(str(decoded.get("severity")), Severity.HIGH)
@@ -146,7 +180,15 @@ def parse_output(
                 source_capability=EngineCapability.STATIC,
                 file_path=file_path or None,
                 snippet_hash=hashlib.sha256(line.encode("utf-8")).hexdigest(),
-                evidence_redacted=f"yara rule {match.group('rule')!r} matched",
+                # 安全风险描述 (2026-07-24): each rule's own findings_json meta
+                # now carries an optional "risk" field (same mechanism as
+                # "title" above) with a genuine explanation of the underlying
+                # security risk - a rule authored before this convention
+                # existed falls back to the old "matched rule 'X'" text,
+                # never a blank evidence field.
+                evidence_redacted=str(decoded.get("risk"))
+                if decoded.get("risk")
+                else f"匹配到 yara 规则 {match.group('rule')!r}",
             )
         )
     return tuple(findings)

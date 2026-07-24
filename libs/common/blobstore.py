@@ -131,15 +131,32 @@ class LocalFilesystemBlobStore:
         # its default restrictive mode, and the other uid can never create a
         # NEW scan_id subdirectory under it afterwards (the failure surfaces
         # at the mkdir() syscall itself, before any chmod ever runs). So every
-        # newly created level - from the shallowest missing ancestor down to
-        # `path` - gets created and fixed one at a time, root-to-leaf.
-        missing = []
+        # level - from the shallowest ancestor below `self._root` down to
+        # `path` - gets created (if missing) and (re-)fixed, every call.
+        #
+        # BUG (found via a real 251-skill bulk-import test, 2026-07-23): an
+        # earlier version of this method only called `_fix_permissions()` on
+        # levels it just created in THIS call, never on ones that already
+        # existed. That leaves two live gaps: (1) any directory created before
+        # this fix existed in the deployed code stays permanently broken -
+        # 333 such directories were found permanently EACCES-looping in
+        # Redis's sandbox-dispatch consumer group (delivery counts 1100+),
+        # since nothing ever revisited them; (2) `artifacts/<content_hash>/`
+        # keys the same content_hash for repeat/duplicate submissions of
+        # identical skill content, so a genuinely NEW submission can land on
+        # an OLD, already-existing artifact directory. Re-applying
+        # `_fix_permissions()` unconditionally - even to a directory this
+        # call didn't create - closes both gaps: if we own that directory, the
+        # chgrp/chmod succeeds and repairs it; if we don't, `_fix_permissions`
+        # already swallows the resulting PermissionError, same as before.
+        chain = []
         cur = path
-        while not cur.exists():
-            missing.append(cur)
+        while cur != self._root:
+            chain.append(cur)
             cur = cur.parent
-        for directory in reversed(missing):
-            directory.mkdir(exist_ok=True)
+        for directory in reversed(chain):
+            if not directory.exists():
+                directory.mkdir(exist_ok=True)
             self._fix_permissions(directory)
 
     def put(self, key: str, data: bytes) -> None:

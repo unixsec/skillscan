@@ -34,7 +34,10 @@ from monolith.modules.gateway.auth.dependencies import AuthRuntime
 from monolith.modules.gateway.auth.login_router import router as login_router
 from monolith.modules.gateway.auth.login_router import saml_acs
 from monolith.modules.gateway.auth.middleware import (
+    BREAKGLASS_SESSION_COOKIE_NAME,
     CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
+    LOCAL_SESSION_COOKIE_NAME,
     SAML_SESSION_COOKIE_NAME,
     SESSION_COOKIE_NAME,
 )
@@ -169,6 +172,11 @@ async def app(
         http_client=httpx.AsyncClient(),
         cache=IntrospectionCache(ttl_s=30),
         group_role_map={"skillscan-approvers": "approver", "skillscan-admins": "admin"},
+        # Wired so TestLogout can exercise a REAL, resolvable local session
+        # cookie (not a dependency-override shortcut) end-to-end through
+        # get_session_context - every other test here still doesn't send a
+        # LOCAL_SESSION_COOKIE_NAME cookie, so this is a no-op for them.
+        local_redis=redis_client,
     )
     fastapi_app = FastAPI()
     fastapi_app.state.scan = scan_runtime
@@ -411,6 +419,54 @@ class TestSamlFullFlow:
         assert resolved is not None
         _subject, roles = resolved
         assert roles == frozenset({"submitter"})
+
+
+class TestLogout:
+    @pytest.mark.asyncio
+    async def test_revokes_local_session_and_clears_cookies(
+        self, client: httpx.AsyncClient, redis_client: aioredis.Redis
+    ) -> None:
+        from monolith.modules.admin.local_auth import create_local_session, resolve_local_session
+
+        token = await create_local_session(redis_client, subject="alice", role="admin")
+        client.cookies.set(LOCAL_SESSION_COOKIE_NAME, token)
+        client.cookies.set(CSRF_COOKIE_NAME, "test-csrf-token")
+
+        response = await client.post(
+            "/v1/auth/logout", headers={CSRF_HEADER_NAME: "test-csrf-token"}
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "logged_out"}
+        assert await resolve_local_session(redis_client, token) is None
+        for name in (
+            SESSION_COOKIE_NAME,
+            BREAKGLASS_SESSION_COOKIE_NAME,
+            SAML_SESSION_COOKIE_NAME,
+            LOCAL_SESSION_COOKIE_NAME,
+            CSRF_COOKIE_NAME,
+        ):
+            cleared = response.cookies.get(name)
+            assert cleared is None or cleared == ""
+
+    @pytest.mark.asyncio
+    async def test_missing_csrf_is_403(
+        self, client: httpx.AsyncClient, redis_client: aioredis.Redis
+    ) -> None:
+        from monolith.modules.admin.local_auth import create_local_session
+
+        token = await create_local_session(redis_client, subject="alice", role="admin")
+        client.cookies.set(LOCAL_SESSION_COOKIE_NAME, token)
+        client.cookies.set(CSRF_COOKIE_NAME, "test-csrf-token")
+
+        response = await client.post("/v1/auth/logout")  # no X-CSRF-Token header
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_no_session_cookie_is_401(self, client: httpx.AsyncClient) -> None:
+        response = await client.post("/v1/auth/logout")
+        assert response.status_code == 401
 
 
 def _extract_query_param(url: str, name: str) -> str:

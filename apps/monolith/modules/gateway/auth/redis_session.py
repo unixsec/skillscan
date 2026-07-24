@@ -62,6 +62,16 @@ async def create_session(
     return token
 
 
+async def delete_session(redis: aioredis.Redis, *, key_prefix: str, token: str) -> None:
+    """Revoke a session immediately (logout) by deleting its Redis record.
+
+    Idempotent: deleting an already-missing/expired/unknown token is a no-op,
+    not an error - a logout call should never fail just because the session
+    it's trying to end is already gone.
+    """
+    await redis.delete(_storage_key(key_prefix, token))
+
+
 async def resolve_session(redis: aioredis.Redis, *, key_prefix: str, token: str) -> Any | None:
     """Return the payload the token resolves to, or None if the token is
     missing/expired/unrecognized/corrupt.

@@ -262,3 +262,9 @@ async def resolve_breakglass_session(redis: aioredis.Redis, token: str) -> str |
         redis, key_prefix=_SESSION_KEY_PREFIX, token=token
     )
     return payload if isinstance(payload, str) else None
+
+
+async def revoke_breakglass_session(redis: aioredis.Redis, token: str) -> None:
+    """Logout: end this break-glass session immediately rather than letting
+    it ride out its TTL."""
+    await redis_session.delete_session(redis, key_prefix=_SESSION_KEY_PREFIX, token=token)

@@ -37,6 +37,7 @@ from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
+from monolith.modules.inventory.service import register_skill_version, transition_skill
 from monolith.modules.orchestration.models import ScanResultRow
 from monolith.tests.conftest import SessionmakerFixture
 
@@ -78,6 +79,7 @@ def _fake_session(subject: str, roles: frozenset[str]) -> SessionContext:
 def app(
     orchestration_sessionmaker: SessionmakerFixture,
     gate_sessionmaker: SessionmakerFixture,
+    inventory_sessionmaker: SessionmakerFixture,
     redis_client: aioredis.Redis,
     blobstore: LocalFilesystemBlobStore,
 ) -> FastAPI:
@@ -95,6 +97,7 @@ def app(
         engine_metadatas=(_ENGINE.metadata,),
         allowlist=(),
         signer=LocalDevSigner(),
+        inventory_session_factory=inventory_sessionmaker,
     )
     return create_app(scan_runtime=scan_runtime)
 
@@ -230,6 +233,83 @@ class TestSubmitAndFetch:
         # real IdP (see test_dependencies.py::test_no_cookie_is_401).
         response = await client.get(f"/v1/scans/{uuid.uuid4()}")
         assert response.status_code == 401
+
+
+class TestSkillIdRegistration:
+    """coding spec §7.1/§16.2: a scan submission that names `skill_id` also
+    registers/advances that skill's inventory lifecycle. Found live
+    2026-07-24 via a real clawhub.ai re-import batch: resubmitting new
+    content for an already-published skill_id crashed as an unhandled 500
+    (register_skill_version's `InvalidTransitionError`, uncaught) - a real,
+    expected caller scenario (duplicate/re-run submission), not a system
+    fault, so it must surface as a client error instead."""
+
+    @pytest.mark.asyncio
+    async def test_new_skill_id_is_registered_on_submission(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        tar_bytes = _make_tar_bytes(f"print({uuid.uuid4().hex!r})\n".encode())
+        response = await client.post(
+            "/v1/scans",
+            files={"package": ("skill.tar", tar_bytes, "application/x-tar")},
+            data={"skill_id": skill_id},
+        )
+        assert response.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_resubmitting_a_published_skill_id_with_new_content_is_409(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        # submitted -> scanning -> published (a real, valid prior lifecycle -
+        # exactly what clawhub re-import hit: a skill already fully published
+        # from an earlier round)
+        async with inventory_sessionmaker() as session, session.begin():
+            await register_skill_version(
+                session,
+                skill_id=skill_id,
+                source="test-suite",
+                trust_tier="public",
+                content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                toolchain_digest="digest-v1",
+                declared_perms=None,
+                operator="tester",
+            )
+        async with inventory_sessionmaker() as session, session.begin():
+            await transition_skill(
+                session,
+                skill_id=skill_id,
+                to_state="scanning",
+                reason="scan started",
+                actor="system",
+            )
+        async with inventory_sessionmaker() as session, session.begin():
+            await transition_skill(
+                session,
+                skill_id=skill_id,
+                to_state="published",
+                reason="passed gate",
+                actor="system",
+            )
+
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        tar_bytes = _make_tar_bytes(f"print({uuid.uuid4().hex!r})\n".encode())
+        response = await client.post(
+            "/v1/scans",
+            files={"package": ("skill.tar", tar_bytes, "application/x-tar")},
+            data={"skill_id": skill_id},
+        )
+        assert response.status_code == 409
+        assert skill_id in response.json()["detail"]
 
 
 class TestObjectLevelAuthorization:

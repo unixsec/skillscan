@@ -15,6 +15,10 @@ SECURITY: no `require_csrf` on any handler here - every one of them is, by
 definition, PRE-session (the login-start endpoints have no session yet; the
 callback/ACS endpoints are what CREATES the session, so there is nothing for
 require_csrf's cookie-presence check to find yet either). Don't add it.
+
+EXCEPTION: `/logout` below is POST-session (a state-changing request from an
+already-authenticated caller), so it DOES depend on `require_csrf` - the
+"don't add it" guidance above is about the pre-session handlers, not this one.
 """
 
 from __future__ import annotations
@@ -25,13 +29,20 @@ from typing import Any
 import redis.asyncio as aioredis
 from common.config import OidcSettings, SamlSettings
 from common.log import get_logger
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from starlette.datastructures import FormData
 
+from monolith.modules.admin.breakglass import revoke_breakglass_session
+from monolith.modules.admin.local_auth import revoke_local_session
+
+from .dependencies import require_csrf, require_role
 from .middleware import (
+    BREAKGLASS_SESSION_COOKIE_NAME,
+    LOCAL_SESSION_COOKIE_NAME,
     SAML_SESSION_COOKIE_NAME,
     SESSION_COOKIE_NAME,
+    clear_all_session_cookies,
     generate_csrf_token,
     set_csrf_cookie,
     set_session_cookie,
@@ -44,6 +55,7 @@ from .saml import (
     build_request_data,
     create_saml_session,
     process_saml_response,
+    revoke_saml_session,
 )
 from .saml import (
     begin_authorization as saml_begin_authorization,
@@ -51,6 +63,7 @@ from .saml import (
 
 router = APIRouter(prefix="/v1/auth")
 _logger = get_logger("skillscan.gateway.auth.login")
+_authenticated = require_role()  # any resolved role - logging out needs no specific one
 
 # SECURITY: access_token TTL bound (coding spec §9/§13, ≤600s) governs how
 # long session.authenticate() will keep re-accepting this token via
@@ -250,3 +263,28 @@ async def saml_acs(request: Request, response: Response) -> dict[str, str]:
     csrf_token = generate_csrf_token()
     set_csrf_cookie(response, csrf_token, max_age_s=28800)
     return {"status": "ok", "subject": identity.name_id}
+
+
+@router.post("/logout")
+async def logout(
+    request: Request,
+    response: Response,
+    _session: Any = Depends(_authenticated),
+    _csrf: None = Depends(require_csrf),
+) -> dict[str, str]:
+    """Ends whichever cookie-authenticated session the caller currently has
+    (break-glass/SAML/local are Redis-backed - revoked immediately below;
+    OIDC's session cookie IS the IdP's own opaque access_token, not a
+    redis_session record, so there is nothing to revoke server-side for it -
+    clearing the cookie is the whole story there) and clears every session +
+    CSRF cookie regardless of which one was actually present.
+    """
+    redis = _get_redis(request)
+    if (token := request.cookies.get(LOCAL_SESSION_COOKIE_NAME)) is not None:
+        await revoke_local_session(redis, token)
+    if (token := request.cookies.get(BREAKGLASS_SESSION_COOKIE_NAME)) is not None:
+        await revoke_breakglass_session(redis, token)
+    if (token := request.cookies.get(SAML_SESSION_COOKIE_NAME)) is not None:
+        await revoke_saml_session(redis, token)
+    clear_all_session_cookies(response)
+    return {"status": "logged_out"}

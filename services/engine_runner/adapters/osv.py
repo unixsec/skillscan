@@ -121,7 +121,12 @@ def parse_output(
                         rule_id=f"osv.{vuln_id}",
                         test_item_id="SUP-01",
                         category=DetectionCategory.SUPPLY_CHAIN,
-                        title=f"known vulnerability {vuln_id} in {pkg_name}@{pkg_version}",
+                        # i18n (2026-07-23): translate the template's own
+                        # words; vuln_id/pkg_name/pkg_version stay as-is -
+                        # they're identifiers (a CVE/GHSA ID, a real package
+                        # name), not prose, exactly the "professional
+                        # terminology" carve-out.
+                        title=f"已知漏洞 {vuln_id}，影响 {pkg_name}@{pkg_version}",
                         severity=severity_by_vuln_id.get(vuln_id, Severity.MEDIUM),
                         # SECURITY: OSV entries are curated, CVE-equivalent - high-confidence.
                         confidence=0.9,
@@ -131,7 +136,24 @@ def parse_output(
                         snippet_hash=hashlib.sha256(
                             f"{pkg_name}@{pkg_version}".encode()
                         ).hexdigest(),
-                        evidence_redacted=summary[:200],
+                        # i18n (2026-07-24): `summary` itself is OSV's own
+                        # vulnerability-database prose (sourced from the
+                        # upstream CVE/GHSA advisory text) - genuinely not a
+                        # fixed, enumerable set the way bandit's/
+                        # skillspector's rule catalogs are, so unlike `title`
+                        # above it can't be pre-translated via a lookup
+                        # table; kept verbatim as OSV's own text, an honest
+                        # documented gap (also the "professional/technical
+                        # terminology" carve-out - an official CVE/GHSA
+                        # advisory is exactly that). A fixed Chinese risk-
+                        # framing prefix is added ahead of it so the finding
+                        # still reads as a real risk description, not a bare
+                        # untranslated sentence.
+                        evidence_redacted=(
+                            "该依赖组件存在已被 osv.dev 收录的已知安全漏洞，"
+                            f"可能被攻击者利用造成远程代码执行、权限提升、拒绝服务等"
+                            f"后果，具体应以下方官方漏洞描述为准：{summary[:200]}"
+                        ),
                     )
                 )
     return tuple(findings)

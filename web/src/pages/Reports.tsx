@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import { useApiData } from '../api/useApiData'
 import { DataState } from '../components/DataState'
+import { Pager } from '../components/Pager'
 import { SummaryGrid } from '../components/SummaryGrid'
 import { TableFilterBar, useTableFilter } from '../components/TableFilter'
 import type { FilterField } from '../components/TableFilter'
@@ -17,6 +18,12 @@ const TEMPLATES = [
   'engine_coverage',
   'exception_audit',
 ]
+
+// BUG (reported 2026-07-23): a report with 737 rows only ever showed the
+// first 100 - a hardcoded `.slice(0, 100)` with no way to see the rest. Real
+// pagination replaces it; the backend already returns every row, so this is
+// a page-through-what-we-have UI, not a new API call per page.
+const PAGE_SIZE = 50
 
 function rowKeyLabel(key: string, t: (k: string) => string): string {
   const translationKey = `row.${key}`
@@ -123,6 +130,16 @@ export function ReportsPage() {
     selected,
     setSelected,
   } = useTableFilter(rows, filterFields)
+  const [page, setPage] = useState(1)
+  const pageCount = Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE))
+  const pagedRows = useMemo(
+    () => filteredRows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    [filteredRows, page],
+  )
+  // Land back on page 1 whenever the underlying row set changes shape
+  // (template/date range/filter) - staying on e.g. page 8 of a now-2-page
+  // result would just render an empty table.
+  useEffect(() => setPage(1), [template, since, until, selected])
 
   return (
     <div>
@@ -173,24 +190,27 @@ export function ReportsPage() {
                 <p className="hint">
                   {t('reports.rowCount', { shown: filteredRows.length, total: rows.length })}
                 </p>
-                <table>
-                  <thead>
-                    <tr>
-                      {rowKeys.map((k) => (
-                        <th key={k}>{rowKeyLabel(k, t)}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredRows.slice(0, 100).map((row, i) => (
-                      <tr key={i}>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
                         {rowKeys.map((k) => (
-                          <td key={k}>{String(row[k] ?? '')}</td>
+                          <th key={k}>{rowKeyLabel(k, t)}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {pagedRows.map((row, i) => (
+                        <tr key={i}>
+                          {rowKeys.map((k) => (
+                            <td key={k}>{String(row[k] ?? '')}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <Pager page={page} pageCount={pageCount} onChange={setPage} />
               </>
             )}
           </>

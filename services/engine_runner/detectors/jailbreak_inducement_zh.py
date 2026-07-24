@@ -63,6 +63,25 @@ _A2 = r"(?:不受限制|无限制|越狱|无审查|无道德|没有(?:任何)?�
 # M2: persona/role noun
 _M2 = r"(?:AI|助手|角色|人工智能)"
 
+# 安全风险描述（2026-07-24）：受 INV-9 约束不能展示命中的原文行，这里给出每
+# 类规则固定的攻击手法说明（BUG 修复：此前这三条 evidence 一直是未翻译的英文
+# 占位文本，2026-07-23 的中文化提交遗漏了本文件）。
+_CONSTRAINT_RELEASE_RISK = (
+    "该行文本试图诱导 AI 助手忘记/解除此前的系统训练或规则设定，属于记忆擦除类"
+    "越狱手法。若被宿主 AI 助手当作合法指令执行，可能导致其此前配置的安全护栏"
+    "或行为约束被清空，进而输出不受限制的内容。"
+)
+_BYPASS_REVIEW_RISK = (
+    "该行文本试图诱导 AI 助手绕过/跳过安全审查、内容过滤等检测机制，属于"
+    "明确以逃避安全防护为目标的越狱话术，风险等级高于普通的约束解除类表述。"
+)
+_ROLEPLAY_INDUCTION_RISK = (
+    "该行文本试图诱导 AI 助手扮演一个不受限制/无审查的虚构角色，是经典的"
+    "角色扮演类越狱手法（如“假装你是没有任何限制的 AI”）。此类话术利用"
+    "角色扮演的外壳绕过安全护栏，可能导致 AI 助手以“角色”名义输出违反"
+    "使用政策的内容。"
+)
+
 
 def _metadata() -> EngineMetadata:
     hasher = hashlib.sha256()
@@ -108,7 +127,7 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         file_path=path,
                         start_line=line_no,
                         snippet_hash=snippet_hash,
-                        evidence_redacted="constraint-release (verb+noun+qualifier, redacted)",
+                        evidence_redacted=_CONSTRAINT_RELEASE_RISK,
                     )
                 )
             if _line_has_all(line, _V2, _N2B):
@@ -125,7 +144,7 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         file_path=path,
                         start_line=line_no,
                         snippet_hash=snippet_hash,
-                        evidence_redacted="bypass-security-review phrase (verb+noun, redacted)",
+                        evidence_redacted=_BYPASS_REVIEW_RISK,
                     )
                 )
             if _line_has_all(line, _P2, _A2, _M2):
@@ -142,7 +161,7 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         file_path=path,
                         start_line=line_no,
                         snippet_hash=snippet_hash,
-                        evidence_redacted="roleplay-jailbreak (verb+adjective+noun, redacted)",
+                        evidence_redacted=_ROLEPLAY_INDUCTION_RISK,
                     )
                 )
     return tuple(findings)

@@ -14,7 +14,6 @@ required_engines:
   - inhouse-file-type
   - inhouse-crypto-weak
   - inhouse-toctou
-  - inhouse-provenance
   - inhouse-prompt-injection-zh
   - inhouse-jailbreak-inducement-zh
 
@@ -31,7 +30,6 @@ required_engines:
 # (a far more specific ddd-dd-dddd shape) stays a hard gate.
 hard_gate_rules:
   - pii.us_ssn
-  - provenance.unsigned_high_trust_claim
 
 review_confidence: 0.6
 block_on_severity: CRITICAL

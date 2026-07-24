@@ -135,6 +135,28 @@ def set_csrf_cookie(response: Response, token: str, *, max_age_s: int) -> None:
     )
 
 
+def clear_all_session_cookies(response: Response) -> None:
+    """Logout: clear every cookie-authenticated session type PLUS the CSRF
+    cookie, unconditionally - a real browser only ever has one of the four
+    session cookies set, but clearing all four is harmless (deleting an
+    absent cookie is a no-op) and, per the same single-source-of-truth
+    reasoning as SESSION_COOKIE_NAMES itself, means a future fifth session
+    type is covered automatically instead of needing its own hand-copied
+    logout-clearing line.
+
+    The `secure`/`samesite`/`httponly` attributes passed to `delete_cookie`
+    must match how each cookie was originally SET for browsers to reliably
+    recognize it as the same cookie to delete.
+    """
+    for name in SESSION_COOKIE_NAMES:
+        response.delete_cookie(
+            key=name, httponly=True, secure=_cookie_secure(), samesite=_cookie_samesite()
+        )
+    response.delete_cookie(
+        key=CSRF_COOKIE_NAME, httponly=False, secure=_cookie_secure(), samesite=_cookie_samesite()
+    )
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """SECURITY (INV-16): strict CSP (no inline/eval, no external sources),
     clickjacking denial, MIME-sniffing denial, HSTS."""

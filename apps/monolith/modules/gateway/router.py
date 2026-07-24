@@ -30,6 +30,7 @@ from monolith.modules.admin.engine_registry import filter_enabled_engines
 from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
 from monolith.modules.gateway.auth.session import SessionContext
+from monolith.modules.inventory.lifecycle import InvalidTransitionError
 from monolith.modules.inventory.models import SkillVersionRow
 from monolith.modules.inventory.service import register_skill_version, transition_skill
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow
@@ -117,24 +118,39 @@ async def create_scan(
         async with runtime.inventory_session_factory() as inv_session, inv_session.begin():
             known = await inv_session.get(SkillVersionRow, c_hash)
             if known is None:
-                await register_skill_version(
-                    inv_session,
-                    skill_id=skill_id,
-                    source="web-upload",
-                    trust_tier=tier.value,
-                    content_hash=c_hash,
-                    toolchain_digest=t_digest,
-                    declared_perms=None,
-                    operator=session.subject,
-                )
-                await transition_skill(
-                    inv_session,
-                    skill_id=skill_id,
-                    to_state="scanning",
-                    reason=f"scan {scan_id} submitted",
-                    actor=session.subject,
-                    content_hash=c_hash,
-                )
+                try:
+                    await register_skill_version(
+                        inv_session,
+                        skill_id=skill_id,
+                        source="web-upload",
+                        trust_tier=tier.value,
+                        content_hash=c_hash,
+                        toolchain_digest=t_digest,
+                        declared_perms=None,
+                        operator=session.subject,
+                    )
+                    await transition_skill(
+                        inv_session,
+                        skill_id=skill_id,
+                        to_state="scanning",
+                        reason=f"scan {scan_id} submitted",
+                        actor=session.subject,
+                        content_hash=c_hash,
+                    )
+                except InvalidTransitionError as exc:
+                    # SECURITY (found live 2026-07-24 via a real clawhub.ai
+                    # re-import batch): re-submitting new content for a
+                    # skill_id that's already published/quarantined/retired
+                    # is a real, expected caller scenario (a duplicate or
+                    # re-run submission), not a system fault - it must not
+                    # crash as an unhandled 500. Same FR-API-060 posture as
+                    # the sibling 409 below: this message only describes
+                    # skill_id's OWN lifecycle state, never internal system
+                    # state, so it's safe to return verbatim.
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"cannot submit a new scan for skill {skill_id!r}: {exc}",
+                    ) from exc
             elif str(known.skill_id) != skill_id:
                 # SECURITY: the same content is already registered under a
                 # DIFFERENT skill_id - never silently re-attribute it.

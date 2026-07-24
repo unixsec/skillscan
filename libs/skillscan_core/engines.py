@@ -55,7 +55,7 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         DetectionCategory.CODE,
         Severity.HIGH,
         None,
-        "eval() call detected",
+        "检测到 eval() 调用",
     ),
     (
         "curl http",
@@ -63,7 +63,7 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         DetectionCategory.NETWORK_INTEL,
         Severity.MEDIUM,
         TrifectaSignal.EXTERNAL_EGRESS,
-        "outbound curl to http(s) endpoint",
+        "通过 curl 向 http(s) 端点发起出站请求",
     ),
     (
         "os.environ",
@@ -71,7 +71,7 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         DetectionCategory.DATA_CREDENTIAL,
         Severity.MEDIUM,
         TrifectaSignal.PRIVATE_DATA_ACCESS,
-        "environment variable access",
+        "访问环境变量",
     ),
     (
         "input(",
@@ -79,9 +79,35 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         DetectionCategory.INSTRUCTION,
         Severity.LOW,
         TrifectaSignal.UNTRUSTED_INPUT,
-        "interactive input() call",
+        "交互式 input() 调用",
     ),
 )
+
+# 安全风险描述（2026-07-24）：title 只标注命中的关键词，这里说明为什么这个
+# 关键词在 Skill 代码里值得关注。
+_RISK_DESCRIPTIONS: dict[str, str] = {
+    "static.eval_call": (
+        "eval() 会将字符串当作 Python 代码动态执行，如果该字符串包含任何"
+        "用户输入或外部数据，攻击者可借此注入并执行任意代码；即使参数看似"
+        "固定，也建议改用更安全的替代方案（如 ast.literal_eval 仅用于解析"
+        "字面量）。"
+    ),
+    "static.curl_http": (
+        "该行代码通过 curl 向外部 http(s) 端点发起出站网络请求，可能用于"
+        "从远程下载并执行代码、向攻击者控制的服务器回传数据，或与命令与"
+        "控制（C2）服务器通信；建议核实目标地址的可信度及请求的必要性。"
+    ),
+    "static.os_environ": (
+        "该行代码读取了进程环境变量，环境变量中常常存放 API 密钥、数据库"
+        "凭据、云服务账号等敏感信息；如果 Skill 将读取到的值回传/打印/写入"
+        "日志，可能造成凭据泄露，建议核实读取的具体变量及其后续用途。"
+    ),
+    "static.input_call": (
+        "该行代码通过 input() 接收交互式用户输入，如果后续未经校验就将其"
+        "用于文件路径、shell 命令、SQL 查询等敏感操作，可能引入路径穿越、"
+        "命令注入、SQL 注入等风险；建议核实输入后续的使用方式。"
+    ),
+}
 
 
 def _static_keyword_ruleset_digest() -> str:
@@ -156,7 +182,7 @@ class StaticKeywordEngine:
                                 start_line=line_no,
                                 # SECURITY (INV-9): store a digest, never the raw line.
                                 snippet_hash=hashlib.sha256(line.encode("utf-8")).hexdigest(),
-                                evidence_redacted=f"pattern {pattern!r} matched",
+                                evidence_redacted=_RISK_DESCRIPTIONS[rule_id],
                             )
                         )
 

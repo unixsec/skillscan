@@ -6,6 +6,7 @@ interface SessionState {
   session: Session | null
   loading: boolean
   refresh: () => void
+  logout: () => Promise<void>
 }
 
 // SECURITY (coding spec §9: "前端隐藏仅UX"): this context is ONLY used to
@@ -14,7 +15,12 @@ interface SessionState {
 // independently re-checks the caller's role regardless of what this context
 // says, so a tampered/absent client-side session state can only ever make
 // the UI show LESS, never grant more access than the backend allows.
-const SessionCtx = createContext<SessionState>({ session: null, loading: true, refresh: () => {} })
+const SessionCtx = createContext<SessionState>({
+  session: null,
+  loading: true,
+  refresh: () => {},
+  logout: async () => {},
+})
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null)
@@ -48,8 +54,23 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   const refresh = () => setGeneration((g) => g + 1)
 
+  // POST /v1/auth/logout revokes the session server-side (Redis) and clears
+  // every session/CSRF cookie regardless of which auth method was in use;
+  // refresh() re-fetches /v1/me, which now 401s, setting session to null -
+  // App.tsx's RequireAuth guard then redirects to /login on its own, no
+  // navigation call needed here.
+  const logout = async () => {
+    try {
+      await api.post('/v1/auth/logout')
+    } finally {
+      refresh()
+    }
+  }
+
   return (
-    <SessionCtx.Provider value={{ session, loading, refresh }}>{children}</SessionCtx.Provider>
+    <SessionCtx.Provider value={{ session, loading, refresh, logout }}>
+      {children}
+    </SessionCtx.Provider>
   )
 }
 

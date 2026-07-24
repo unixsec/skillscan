@@ -5,6 +5,7 @@ override, matching test_admin_router.py's established pattern.
 
 from __future__ import annotations
 
+import datetime
 import uuid
 from collections.abc import AsyncIterator
 
@@ -27,6 +28,7 @@ from skillscan_core import (
 )
 
 from monolith.main import create_app
+from monolith.modules.audit.models import AuditEntry
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.middleware import (
@@ -38,6 +40,28 @@ from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.orchestration.models import ScanResultRow
 from monolith.tests.conftest import SessionmakerFixture
+
+
+async def _seed_audit_entry(
+    session_factory: SessionmakerFixture,
+    *,
+    action: str,
+    payload: dict[str, object],
+    operator: str = "tester",
+    chained_at: datetime.datetime | None = None,
+) -> None:
+    async with session_factory() as session, session.begin():
+        session.add(
+            AuditEntry(
+                prev_hash="0" * 64,
+                entry_hash=f"dummy-{uuid.uuid4().hex}",
+                operator=operator,
+                action=action,
+                payload=payload,
+                chained_at=chained_at or datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+            )
+        )
+
 
 _ENGINE = StaticKeywordEngine()
 
@@ -186,6 +210,36 @@ class TestGetReport:
             "/v1/reports", params={"template": "engine_coverage", "export": "xml"}
         )
         assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_bare_date_until_includes_the_whole_day(
+        self, app: FastAPI, client: httpx.AsyncClient, audit_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # BUG (reported 2026-07-23): a `<input type="date">` sends a bare
+        # "YYYY-MM-DD" for `until`, which pydantic parses as midnight - an
+        # entry from LATER the same day then fell outside `chained_at <=
+        # until` and the UI looked like "filtering finds nothing" whenever
+        # since/until were set to the same day. An entry timestamped in the
+        # afternoon must still be included when `until` is that same bare date.
+        day = datetime.date(2026, 3, 10)
+        marker = f"scan-{uuid.uuid4().hex[:12]}"
+        await _seed_audit_entry(
+            audit_sessionmaker,
+            action="verdict_issued",
+            payload={"scan_id": marker, "verdict": "BLOCK", "policy_version": "v1"},
+            chained_at=datetime.datetime.combine(day, datetime.time(18, 30)),
+        )
+        _as(app, "carol", frozenset({"admin"}))
+        response = await client.get(
+            "/v1/reports",
+            params={
+                "template": "compliance_status",
+                "since": day.isoformat(),
+                "until": day.isoformat(),
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["summary"]["verdict_counts"].get("BLOCK", 0) >= 1
 
     @pytest.mark.asyncio
     async def test_reporting_not_configured_is_500(

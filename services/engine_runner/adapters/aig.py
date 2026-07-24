@@ -54,6 +54,19 @@ Real output format confirmed by reading `mcp-scan/utils/extract_vuln.py`
     than imported, per INV-15's subprocess-only boundary: this adapter never
     imports vendored source).
 
+i18n (2026-07-23, confirmed - no code change needed here): unlike bandit/
+skillspector/osv-scanner, whose `title`/`evidence_redacted` needed an
+in-adapter Chinese lookup table or template rewrite (those tools have no
+concept of an output language), AIG's `<title>`/`<desc>` are LLM-generated
+free text from mcp-scan's OWN process, which this adapter already invokes
+with `--language zh` (`_ArgvBuilder.__call__` below, confirmed against
+`vendor/aig/mcp-scan/main.py`'s `--language` flag - "Output language",
+default "zh", threaded into the prompt the LLM itself receives) - so these
+fields are already Chinese at the source, not something this parsing code
+could retroactively translate even if it needed to. `_KEYWORD_RULES` below
+already carries Chinese keywords alongside English ones for exactly this
+reason.
+
 test_item_id mapping (SECURITY/CORRECTNESS): unlike skillspector.py's
 `test_item_id=rule_id` passthrough - confirmed this session to be the root
 of a systemic compliance-reporting gap (real findings invisible to any

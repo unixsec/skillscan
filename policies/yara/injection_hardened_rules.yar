@@ -35,7 +35,7 @@
 
 rule instruction_bypass_phrase_hardened {
     meta:
-        findings_json = "{\"test_item_id\":\"PROMPT-01\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"instruction-bypass injection phrase (case-insensitive, tolerates inserted qualifiers)\"}"
+        findings_json = "{\"test_item_id\":\"PROMPT-01\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"指令绕过型提示词注入话术（不区分大小写，容忍插入限定词）\",\"risk\":\"该内容试图诱导宿主 AI 助手忽略/无视此前的系统指令或规则约束，属于直接提示词注入攻击的典型话术。若被宿主 AI 助手当作合法指令解析，可能导致其绕过安全策略、泄露系统提示词或执行未经授权的操作。\"}"
     strings:
         /*
          * Structure required: <override verb> [optional qualifiers] <temporal
@@ -63,7 +63,7 @@ rule instruction_bypass_phrase_hardened {
 
 rule markdown_image_exfiltration_hardened {
     meta:
-        findings_json = "{\"test_item_id\":\"NET-03\",\"category\":\"network_intel\",\"severity\":\"HIGH\",\"title\":\"image reference whose URL query carries interpolated data (rendered-image exfiltration side-channel)\"}"
+        findings_json = "{\"test_item_id\":\"NET-03\",\"category\":\"network_intel\",\"severity\":\"HIGH\",\"title\":\"图片引用的 URL 查询参数携带插值数据（利用渲染图片的外泄旁路）\",\"risk\":\"markdown/HTML 图片会被渲染器自动请求，如果图片 URL 的查询参数里插入了模板变量或明显的外泄型参数名，攻击者可以在用户毫无察觉、无需任何点击的情况下，把对话内容或敏感数据通过图片请求的 URL 悄悄带到攻击者控制的服务器（零点击外泄）。\"}"
     strings:
         /*
          * Markdown image whose URL query interpolates a template variable -

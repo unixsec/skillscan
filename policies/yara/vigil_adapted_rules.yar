@@ -69,7 +69,7 @@
 
 rule instruction_bypass_phrase {
     meta:
-        findings_json = "{\"test_item_id\":\"PROMPT-01\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"instruction-bypass injection phrase (ignore/disregard prior instructions)\"}"
+        findings_json = "{\"test_item_id\":\"PROMPT-01\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"指令绕过型提示词注入话术（忽略/无视此前指令）\",\"risk\":\"该内容试图诱导宿主 AI 助手忽略/无视此前的系统指令或规则约束，属于直接提示词注入攻击的典型话术。若被宿主 AI 助手当作合法指令解析，可能导致其绕过安全策略、泄露系统提示词或执行未经授权的操作。\"}"
     strings:
         $a = /(Ignore|Disregard|Skip|Forget|Neglect|Overlook|Omit|Bypass|Pay no attention to|Do not follow|Do not obey)\s*(prior|previous|preceding|above|foregoing|earlier|initial)?\s*(content|text|instructions|instruction|directives|directive|commands|command|context|conversation|input|inputs|data|message|messages|communication|response|responses|request|requests)\s*(and start over|and start anew|and begin afresh|and start from scratch)?/
     condition:
@@ -78,7 +78,7 @@ rule instruction_bypass_phrase {
 
 rule fake_system_role_tags {
     meta:
-        findings_json = "{\"test_item_id\":\"PROMPT-03\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"embedded fake system/role-turn tags (chat-template injection)\"}"
+        findings_json = "{\"test_item_id\":\"PROMPT-03\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"嵌入伪造的 system/角色轮次标签（对话模板注入）\",\"risk\":\"该内容嵌入了伪造的对话模板控制标签（如 <|im_start|>system、<<SYS>> 等），试图让模型把后续文本误认为是真正的系统级指令而非普通用户输入，从而绕过角色边界注入伪造的高权限指令。\"}"
     strings:
         $a = "System Instruction: " ascii
         $b = "[system](#assistant)" ascii
@@ -95,7 +95,7 @@ rule fake_system_role_tags {
 
 rule markdown_image_exfiltration {
     meta:
-        findings_json = "{\"test_item_id\":\"NET-03\",\"category\":\"network_intel\",\"severity\":\"HIGH\",\"title\":\"markdown image with query-string used as a rendered-image exfiltration side-channel\"}"
+        findings_json = "{\"test_item_id\":\"NET-03\",\"category\":\"network_intel\",\"severity\":\"HIGH\",\"title\":\"带查询字符串的 markdown 图片，被用作渲染图片的外泄旁路\",\"risk\":\"markdown 图片会被渲染器自动请求，如果图片 URL 带有查询字符串，攻击者可以把敏感数据编码进查询参数，在用户毫无察觉、无需任何点击的情况下随图片请求一起外泄到攻击者控制的服务器（零点击外泄）。\"}"
     strings:
         $a = /\!\[\w+]\((https?:\/\/[\w\.-]+)\/(\w+)\?q=\)/
     condition:

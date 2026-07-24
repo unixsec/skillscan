@@ -32,19 +32,19 @@ _PII_PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
     (
         "pii.credit_card",
         r"\b(?:\d[ -]?){13,19}\b",
-        "credit-card-shaped number",
+        "疑似信用卡号",
         Severity.HIGH,
     ),
     (
         "pii.us_ssn",
         r"\b\d{3}-\d{2}-\d{4}\b",
-        "US SSN-shaped number",
+        "疑似美国社会安全号（SSN）",
         Severity.HIGH,
     ),
     (
         "pii.email",
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-        "email address",
+        "电子邮件地址",
         Severity.LOW,
     ),
     # SECURITY/FP-TUNING: require actual phone formatting (parens around the area
@@ -55,10 +55,35 @@ _PII_PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
     (
         "pii.phone_number",
         r"(?<!\d)(?:\+?1[-. ])?(?:\(\d{3}\)[-. ]?|\d{3}[-. ])\d{3}[-. ]\d{4}(?!\d)",
-        "phone-number-shaped string",
+        "疑似电话号码",
         Severity.LOW,
     ),
 )
+
+# 安全风险描述（2026-07-24）：与上面的 title 区分开——title 只说"找到了什么"，
+# 这里说"为什么这是风险"。受 INV-9 约束不能展示匹配到的原文，所以这里是每类
+# PII 固定的风险说明，不含任何具体命中内容。
+_RISK_DESCRIPTIONS: dict[str, str] = {
+    "pii.credit_card": (
+        "Skill 包内硬编码了疑似真实的支付卡号，一旦随包分发或被日志/遥测意外记录，"
+        "将造成持卡人数据泄露，违反 PCI-DSS 等合规要求；建议改用环境变量/密钥管理服务，"
+        "并对已提交历史做清理。"
+    ),
+    "pii.us_ssn": (
+        "Skill 包内硬编码了疑似美国社会安全号（SSN），属于高价值身份盗用素材，"
+        "一旦泄露可用于冒名开户、税务欺诈等；不应出现在代码、配置或测试数据中，"
+        "即使是示例数据也应使用明显不可用的占位值。"
+    ),
+    "pii.email": (
+        "Skill 包内硬编码了真实邮箱地址，可能是开发者/用户的个人信息意外提交，"
+        "存在被用于钓鱼、垃圾邮件定向投放或身份关联分析的风险；建议改用示例域名"
+        "（如 example.com）或从配置/密钥管理中读取。"
+    ),
+    "pii.phone_number": (
+        "Skill 包内硬编码了真实格式的电话号码，可能是意外提交的个人联系方式，"
+        "存在被用于骚扰、社工钓鱼或身份关联分析的风险；建议改用明显的示例号码。"
+    ),
+}
 
 _CATEGORY = DetectionCategory.DATA_CREDENTIAL
 
@@ -119,7 +144,7 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                             rule_id=rule_id,
                             test_item_id="DATA-06",
                             category=_CATEGORY,
-                            title=f"possible {title} detected",
+                            title=f"检测到{title}",
                             severity=severity,
                             confidence=0.7,
                             source_engine="inhouse-pii",
@@ -127,7 +152,10 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                             file_path=path,
                             start_line=line_no,
                             snippet_hash=snippet_hash,
-                            evidence_redacted=f"{title} ({len(raw)} chars, redacted)",
+                            evidence_redacted=(
+                                f"{_RISK_DESCRIPTIONS[rule_id]}"
+                                f"（命中长度 {len(raw)} 字符，原文已脱敏不予展示）"
+                            ),
                         )
                     )
     return tuple(findings)

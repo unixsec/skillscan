@@ -67,6 +67,16 @@ async def get_report(
     session: SessionContext = Depends(_reader),
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> Response:
+    # BUG (reported 2026-07-23): the UI's date-range picker is a bare
+    # `<input type="date">` (no time component) - pydantic parses that as
+    # midnight, so `until` on its own means "through 00:00:00 of that day,"
+    # not through the end of it. Picking the same since/until day then
+    # compared as `>= day 00:00 AND <= day 00:00`, an empty instant, making
+    # the filter look like it "finds nothing." Treat a midnight `until` as
+    # end-of-day inclusive - a caller that explicitly wants an exact midnight
+    # cutoff (a non-midnight time never triggers this) is unaffected.
+    if until is not None and until.time() == datetime.time.min:
+        until = until + datetime.timedelta(days=1) - datetime.timedelta(microseconds=1)
     session_factory = _require_reporting_session_factory(runtime)
     try:
         async with session_factory() as db_session:

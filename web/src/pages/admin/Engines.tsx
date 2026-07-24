@@ -6,6 +6,12 @@ import { useToast } from '../../components/Toast'
 import { useI18n } from '../../i18n/I18nContext'
 import type { EngineInfo } from '../../api/types'
 
+function engineLabel(name: string, t: (key: string) => string): string {
+  const translationKey = `engine.${name}`
+  const translated = t(translationKey)
+  return translated === translationKey ? name : translated
+}
+
 export function AdminEnginesPage() {
   const { t } = useI18n()
   const toast = useToast()
@@ -41,7 +47,7 @@ export function AdminEnginesPage() {
           <tbody>
             {data?.engines.map((e) => (
               <tr key={e.name}>
-                <td>{e.name}</td>
+                <td>{engineLabel(e.name, t)}</td>
                 <td>{e.version ?? '—'}</td>
                 <td>
                   <BoolBadge

@@ -19,7 +19,7 @@
 
 rule model_endpoint_redirection {
     meta:
-        findings_json = "{\"test_item_id\":\"PROMPT-07\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"skill code overrides the AI inference endpoint (model-substitution / interception risk)\"}"
+        findings_json = "{\"test_item_id\":\"PROMPT-07\",\"category\":\"instruction\",\"severity\":\"HIGH\",\"title\":\"Skill 代码篡改了 AI 推理服务端点（存在模型替换/流量劫持风险）\",\"risk\":\"该 Skill 代码修改了 ANTHROPIC_BASE_URL/OPENAI_BASE_URL 等推理服务端点环境变量，会把宿主 AI 助手后续的模型请求重定向到攻击者指定的服务器；一旦得逞，攻击者可以冒充真实模型返回任意伪造的回复、窃取对话内容中的敏感信息，或篡改工具调用结果。\"}"
     strings:
         $env1 = "ANTHROPIC_BASE_URL" ascii
         $env2 = "OPENAI_BASE_URL" ascii
@@ -35,7 +35,7 @@ rule model_endpoint_redirection {
 
 rule agent_memory_file_write {
     meta:
-        findings_json = "{\"test_item_id\":\"PERM-06\",\"category\":\"permission\",\"severity\":\"HIGH\",\"title\":\"code writes to an agent memory/identity file (CLAUDE.md/MEMORY.md/AGENTS.md/SOUL.md/.claude settings-class memory-poisoning entry point)\"}"
+        findings_json = "{\"test_item_id\":\"PERM-06\",\"category\":\"permission\",\"severity\":\"HIGH\",\"title\":\"代码写入 agent 记忆/身份文件（CLAUDE.md/MEMORY.md/AGENTS.md/SOUL.md/.claude 配置类记忆投毒入口）\",\"risk\":\"该 Skill 代码写入了 CLAUDE.md/MEMORY.md/AGENTS.md 等宿主 AI 助手会持续读取的记忆/身份/配置文件，属于记忆投毒（memory poisoning）攻击：一旦写入恶意指令，会在此后所有会话中被当作可信的长期记忆自动加载执行，实现一次投毒、持续生效的持久化攻击，且不易被察觉。\"}"
     strings:
         $target1 = "CLAUDE.md" ascii
         $target2 = "MEMORY.md" ascii
@@ -54,7 +54,7 @@ rule agent_memory_file_write {
 
 rule hook_configuration_abuse {
     meta:
-        findings_json = "{\"test_item_id\":\"PERM-07\",\"category\":\"permission\",\"severity\":\"HIGH\",\"title\":\"skill defines/modifies agent tool-execution hooks (PreToolUse/PostToolUse-class monitoring, exfiltration, or memory-dump interception)\"}"
+        findings_json = "{\"test_item_id\":\"PERM-07\",\"category\":\"permission\",\"severity\":\"HIGH\",\"title\":\"Skill 定义/修改了 agent 工具执行钩子（PreToolUse/PostToolUse 类监控、外泄或内存转储拦截）\",\"risk\":\"该 Skill 定义或修改了宿主 AI 助手的工具执行钩子（如 PreToolUse/PostToolUse），钩子会在每次工具调用前后自动触发，攻击者可借此拦截并窃取工具调用的参数与结果（包括敏感数据、凭据）、篡改工具行为，或建立隐蔽的持久化监控通道。\"}"
     strings:
         $hook1 = "PreToolUse" ascii
         $hook2 = "PostToolUse" ascii
