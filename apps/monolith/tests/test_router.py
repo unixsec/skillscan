@@ -19,6 +19,7 @@ avoids that entirely.
 
 from __future__ import annotations
 
+import datetime
 import io
 import tarfile
 import uuid
@@ -33,6 +34,7 @@ from fastapi import FastAPI
 from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
 
 from monolith.main import create_app
+from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.session import SessionContext
@@ -170,6 +172,98 @@ class TestSubmitAndFetch:
 
         get_response = await client.get(f"/v1/scans/{scan_id}")
         assert get_response.json()["required_ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_scored_scan_exposes_score_and_is_safe(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        tar_bytes = _make_tar_bytes(f"print({uuid.uuid4().hex!r})\n".encode())
+        response = await client.post(
+            "/v1/scans", files={"package": ("skill.tar", tar_bytes, "application/x-tar")}
+        )
+        scan_id = response.json()["scan_id"]
+
+        async with gate_sessionmaker() as session, session.begin():
+            session.add(
+                VerdictRow(
+                    scan_id=scan_id,
+                    content_hash="a" * 64,
+                    verdict="PASS",
+                    policy_version="test-v1",
+                    jti=str(uuid.uuid4()),
+                    jws_signature="sig",
+                    effective_severity=0,
+                    score=97,
+                    reasons=[],
+                    issued_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+
+        get_response = await client.get(f"/v1/scans/{scan_id}")
+        body = get_response.json()
+        assert body["score"] == 97
+        assert body["is_safe"] is True
+
+    @pytest.mark.asyncio
+    async def test_unscored_scan_reports_null_score_and_is_safe(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        tar_bytes = _make_tar_bytes(f"print({uuid.uuid4().hex!r})\n".encode())
+        response = await client.post(
+            "/v1/scans", files={"package": ("skill.tar", tar_bytes, "application/x-tar")}
+        )
+        scan_id = response.json()["scan_id"]
+
+        get_response = await client.get(f"/v1/scans/{scan_id}")
+        body = get_response.json()
+        assert body["score"] is None
+        assert body["is_safe"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_scans_includes_score_and_is_safe(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        tar_bytes = _make_tar_bytes(f"print({uuid.uuid4().hex!r})\n".encode())
+        response = await client.post(
+            "/v1/scans", files={"package": ("skill.tar", tar_bytes, "application/x-tar")}
+        )
+        scan_id = response.json()["scan_id"]
+
+        async with gate_sessionmaker() as session, session.begin():
+            session.add(
+                VerdictRow(
+                    scan_id=scan_id,
+                    content_hash="b" * 64,
+                    verdict="BLOCK",
+                    policy_version="test-v1",
+                    jti=str(uuid.uuid4()),
+                    jws_signature="sig",
+                    effective_severity=4,
+                    score=12,
+                    reasons=[],
+                    issued_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+
+        list_response = await client.get("/v1/scans")
+        items = {item["scan_id"]: item for item in list_response.json()["items"]}
+        assert items[scan_id]["score"] == 12
+        assert items[scan_id]["is_safe"] is False
 
     @pytest.mark.asyncio
     async def test_list_scans_includes_skill_name_from_skill_md(

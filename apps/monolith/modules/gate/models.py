@@ -27,6 +27,7 @@ class VerdictRow(Base):
     jti: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
     jws_signature: Mapped[str] = mapped_column(Text, nullable=False)
     effective_severity: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    score: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     issued_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=False), nullable=False)
 

@@ -8,7 +8,7 @@ import { FileField } from '../components/FileField'
 import { TableFilterBar, useTableFilter } from '../components/TableFilter'
 import type { FilterField } from '../components/TableFilter'
 import { useToast } from '../components/Toast'
-import { VerdictBadge } from '../components/Badge'
+import { ScoreBadge, VerdictBadge } from '../components/Badge'
 import { useI18n } from '../i18n/I18nContext'
 import type { ScanSummary } from '../api/types'
 import { ScanDetailContent } from './ScanDetail'
@@ -138,6 +138,7 @@ export function ScansPage() {
               <th>{t('scans.colSkillId')}</th>
               <th>{t('scans.colState')}</th>
               <th>{t('scans.colVerdict')}</th>
+              <th>{t('scans.colScore')}</th>
               <th>{t('scans.colSubmitter')}</th>
               <th>{t('scans.colContentHash')}</th>
             </tr>
@@ -155,6 +156,9 @@ export function ScansPage() {
                 <td>{t(`scanState.${s.state}`) === `scanState.${s.state}` ? s.state : t(`scanState.${s.state}`)}</td>
                 <td>
                   <VerdictBadge verdict={s.verdict} />
+                </td>
+                <td>
+                  <ScoreBadge score={s.score} verdict={s.verdict} />
                 </td>
                 <td>{s.submitter}</td>
                 <td>

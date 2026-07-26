@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import unittest
 
-from skillscan_core import EngineCapability, EngineStatus, Severity, TrifectaSignal
-from skillscan_core.scoring import _dedup, evaluate_findings
+from skillscan_core import (
+    CategoryWeights,
+    DetectionCategory,
+    EngineCapability,
+    EngineStatus,
+    Severity,
+    TrifectaSignal,
+    Verdict,
+)
+from skillscan_core.scoring import _dedup, evaluate_findings, security_score
 
 from tests._helpers import default_policy, make_finding, scan_result_from_findings
 
@@ -191,6 +199,66 @@ class TestAggregate(unittest.TestCase):
         self.assertTrue(result.findings_capped)
         self.assertEqual(len(result.findings), 1)
         self.assertEqual(result.findings[0].rule_id, "critical")
+
+
+class TestSecurityScore(unittest.TestCase):
+    def test_pass_with_no_findings_scores_100(self) -> None:
+        self.assertEqual(security_score(Verdict.PASS, []), 100)
+
+    def test_pass_with_a_finding_stays_within_pass_band_but_below_100(self) -> None:
+        findings = [make_finding(rule_id="a", severity=Severity.LOW, confidence=0.9)]
+        score = security_score(Verdict.PASS, findings)
+        self.assertGreaterEqual(score, 75)
+        self.assertLess(score, 100)
+
+    def test_review_score_falls_within_review_band(self) -> None:
+        findings = [make_finding(rule_id="a", severity=Severity.HIGH, confidence=0.9)]
+        score = security_score(Verdict.REVIEW, findings)
+        self.assertGreaterEqual(score, 40)
+        self.assertLessEqual(score, 74)
+
+    def test_block_score_falls_within_block_band(self) -> None:
+        findings = [make_finding(rule_id="a", severity=Severity.CRITICAL, confidence=1.0)]
+        score = security_score(Verdict.BLOCK, findings)
+        self.assertGreaterEqual(score, 0)
+        self.assertLessEqual(score, 39)
+
+    def test_hard_gate_triggered_pins_score_to_the_band_floor(self) -> None:
+        # A single LOW-severity finding would ordinarily land well above 0 in
+        # the BLOCK band - hard-gate must override that, since INV-3 makes it
+        # the unwaivable, most-severe class regardless of the finding's own
+        # severity field.
+        findings = [make_finding(rule_id="gate.hit", severity=Severity.LOW, confidence=1.0)]
+        score = security_score(Verdict.BLOCK, findings, hard_gate_triggered=True)
+        self.assertEqual(score, 0)
+
+    def test_more_findings_never_increase_the_score(self) -> None:
+        one = [make_finding(rule_id="a", severity=Severity.MEDIUM, confidence=0.8)]
+        two = one + [make_finding(rule_id="b", severity=Severity.MEDIUM, confidence=0.8)]
+        self.assertGreaterEqual(
+            security_score(Verdict.PASS, one), security_score(Verdict.PASS, two)
+        )
+
+    def test_category_weight_scales_the_penalty(self) -> None:
+        findings = [
+            make_finding(
+                rule_id="a",
+                severity=Severity.HIGH,
+                confidence=1.0,
+                category=DetectionCategory.DATA_CREDENTIAL,
+            )
+        ]
+        neutral = security_score(Verdict.REVIEW, findings, weights=CategoryWeights())
+        weighted = security_score(
+            Verdict.REVIEW, findings, weights=CategoryWeights(data_credential=2.0)
+        )
+        self.assertLess(weighted, neutral)
+
+    def test_score_is_deterministic(self) -> None:
+        findings = [make_finding(rule_id="a", severity=Severity.MEDIUM, confidence=0.5)]
+        self.assertEqual(
+            security_score(Verdict.PASS, findings), security_score(Verdict.PASS, findings)
+        )
 
 
 if __name__ == "__main__":

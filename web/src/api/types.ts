@@ -13,6 +13,8 @@ export interface ScanSummary {
   submitter: string
   content_hash: string
   verdict: string | null
+  score: number | null
+  is_safe: boolean | null
   skill_id: string | null
   skill_name: string | null
 }
@@ -23,6 +25,8 @@ export interface ScanDetail {
   submitter: string
   verdict: string | null
   severity: number | null
+  score: number | null
+  is_safe: boolean | null
   findings: Finding[]
   provenance: string[][]
   required_ok: boolean | null

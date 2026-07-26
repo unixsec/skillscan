@@ -51,6 +51,7 @@ async def _seed_verdict(
                 scan_id=str(uuid.uuid4()),
                 content_hash=content_hash,
                 verdict=verdict,
+                score={"PASS": 87, "REVIEW": 57, "BLOCK": 20}[verdict],
                 policy_version="test-policy-v1",
                 jti=str(uuid.uuid4()),
                 jws_signature="test-jws-signature",

@@ -6,6 +6,7 @@ import unittest
 
 from skillscan_core import (
     AllowlistEntry,
+    CategoryWeights,
     DetectionCategory,
     EngineCapability,
     EngineMetadata,
@@ -18,6 +19,7 @@ from skillscan_core import (
     TrifectaSignal,
     TrustTier,
     Verdict,
+    VerdictResult,
 )
 
 
@@ -254,6 +256,32 @@ class TestAllowlistEntry(unittest.TestCase):
         )
         self.assertTrue(entry.waives(finding))
         self.assertFalse(entry.waives(other))
+
+
+class TestCategoryWeights(unittest.TestCase):
+    def test_defaults_are_all_neutral(self) -> None:
+        weights = CategoryWeights()
+        for category in DetectionCategory:
+            self.assertEqual(weights.for_category(category), 1.0)
+
+    def test_for_category_reads_the_matching_field(self) -> None:
+        weights = CategoryWeights(data_credential=2.5)
+        self.assertEqual(weights.for_category(DetectionCategory.DATA_CREDENTIAL), 2.5)
+        self.assertEqual(weights.for_category(DetectionCategory.CODE), 1.0)
+
+
+class TestVerdictResultScore(unittest.TestCase):
+    def test_score_field_round_trips(self) -> None:
+        result = VerdictResult(
+            verdict=Verdict.PASS,
+            reasons=(),
+            policy_version="v1",
+            effective_severity=Severity.NONE,
+            trifecta_present=False,
+            hard_gate_hits=(),
+            score=100,
+        )
+        self.assertEqual(result.score, 100)
 
 
 if __name__ == "__main__":

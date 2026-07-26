@@ -144,6 +144,38 @@ def serialize_finding(f: Finding) -> dict[str, Any]:
     }
 
 
+def deserialize_finding(d: dict[str, Any]) -> Finding:
+    """Inverse of serialize_finding - reconstructs a Finding from its stored
+    JSON shape (e.g. a ScanResultRow.findings row), for callers that need to
+    recompute something from a scan's already-decided findings rather than
+    treat them as opaque JSON. Same fail-closed posture as parse_engine_result:
+    any schema violation raises UntrustedFindingsError rather than silently
+    accepting a partially-valid finding.
+    """
+    try:
+        dto = FindingDTO.model_validate(d)
+    except ValidationError as exc:
+        raise UntrustedFindingsError(f"finding failed schema validation: {exc}") from exc
+    try:
+        return Finding(
+            rule_id=dto.rule_id,
+            test_item_id=dto.test_item_id,
+            category=dto.category,
+            title=dto.title,
+            severity=dto.severity,
+            confidence=dto.confidence,
+            source_engine=dto.source_engine,
+            source_capability=dto.source_capability,
+            trifecta_signals=frozenset(dto.trifecta_signals),
+            file_path=dto.file_path,
+            start_line=dto.start_line,
+            snippet_hash=dto.snippet_hash,
+            evidence_redacted=dto.evidence_redacted,
+        )
+    except ValueError as exc:
+        raise UntrustedFindingsError(f"finding violated a domain invariant: {exc}") from exc
+
+
 def serialize_engine_result(result: EngineResult) -> dict[str, Any]:
     """Inverse of parse_engine_result - used by test fixtures / reference
     engines to produce the bytes a real sandboxed worker would write."""

@@ -2,7 +2,7 @@ import { useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import { useApiData } from '../api/useApiData'
 import { DataState } from '../components/DataState'
-import { SeverityBadge, VerdictBadge } from '../components/Badge'
+import { ScoreBadge, SeverityBadge, VerdictBadge } from '../components/Badge'
 import { useI18n } from '../i18n/I18nContext'
 import type { Finding, ScanDetail } from '../api/types'
 
@@ -150,6 +150,12 @@ export function ScanDetailContent({ scanId }: { scanId: string }) {
                 <VerdictBadge verdict={data.verdict} />
               </div>
               <div className="label">{t('scanDetail.verdict')}</div>
+            </div>
+            <div className="summary-stat">
+              <div className="value">
+                <ScoreBadge score={data.score} verdict={data.verdict} />
+              </div>
+              <div className="label">{t('scanDetail.score')}</div>
             </div>
             <div className="summary-stat">
               <div className="value">{data.submitter}</div>

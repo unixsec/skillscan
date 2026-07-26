@@ -9,12 +9,14 @@ from collections.abc import Iterable
 
 from skillscan_core.models import (
     ALL_TRIFECTA_SIGNALS,
+    CategoryWeights,
     EngineResult,
     Finding,
     GatePolicy,
     ScanResult,
     Severity,
     TrifectaSignal,
+    Verdict,
 )
 
 
@@ -135,3 +137,50 @@ def aggregate(
         missing_or_failed_required=missing_or_failed,
         dedup_collision_rule_ids=collided_rule_ids,
     )
+
+
+_SCORE_BAND: dict[Verdict, tuple[int, int]] = {
+    Verdict.BLOCK: (0, 39),
+    Verdict.REVIEW: (40, 74),
+    Verdict.PASS: (75, 100),
+}
+
+_SEVERITY_PENALTY_WEIGHT: dict[Severity, float] = {
+    Severity.NONE: 0.0,
+    Severity.LOW: 3.0,
+    Severity.MEDIUM: 8.0,
+    Severity.HIGH: 18.0,
+    Severity.CRITICAL: 35.0,
+}
+
+_DEFAULT_WEIGHTS = CategoryWeights()
+
+
+def security_score(
+    verdict: Verdict,
+    findings: Iterable[Finding],
+    *,
+    hard_gate_triggered: bool = False,
+    weights: CategoryWeights = _DEFAULT_WEIGHTS,
+) -> int:
+    """0-100 advisory score, deterministically derived from an ALREADY-DECIDED
+    verdict (2026-07-24 scoring design doc). NEVER an input to decide() -
+    verdict/band selection always happens first; this only positions the
+    score within that band, so a score can never contradict (or be used to
+    relitigate) the verdict that produced it.
+
+    SECURITY (INV-3 parity): a hard-gate hit is the unwaivable, most-severe
+    class of finding - it always pins the score to the band floor (0 for
+    BLOCK) rather than letting the ordinary per-finding penalty formula
+    (which could land well above the floor for a single moderate-severity
+    hard-gate finding) understate it.
+    """
+    band_min, band_max = _SCORE_BAND[verdict]
+    if hard_gate_triggered:
+        return band_min
+    penalty = sum(
+        _SEVERITY_PENALTY_WEIGHT[f.severity] * f.confidence * weights.for_category(f.category)
+        for f in findings
+    )
+    raw = band_max - penalty
+    return max(band_min, min(band_max, round(raw)))

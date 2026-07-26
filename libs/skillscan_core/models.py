@@ -274,6 +274,26 @@ class AllowlistEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class CategoryWeights:
+    """Per-DetectionCategory multiplier for security_score()'s penalty term
+    (2026-07-24 scoring design doc). All-1.0 default = every category counts
+    equally; a caller (admin config, milestone C) can raise a category's
+    weight to make its findings cost more score."""
+
+    instruction: float = 1.0
+    code: float = 1.0
+    data_credential: float = 1.0
+    network_intel: float = 1.0
+    permission: float = 1.0
+    file_package: float = 1.0
+    supply_chain: float = 1.0
+    bundled_component: float = 1.0
+
+    def for_category(self, category: DetectionCategory) -> float:
+        return float(getattr(self, category.value))
+
+
+@dataclass(frozen=True, slots=True)
 class VerdictResult:
     verdict: Verdict
     reasons: tuple[str, ...]
@@ -281,3 +301,6 @@ class VerdictResult:
     effective_severity: Severity
     trifecta_present: bool
     hard_gate_hits: tuple[str, ...]
+    # 0-100 advisory score, derived from (verdict, findings) - NEVER an input
+    # to the verdict itself. See scoring.security_score().
+    score: int

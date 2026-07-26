@@ -153,5 +153,57 @@ class TestGateClassifyThresholds(unittest.TestCase):
         self.assertNotEqual(internal_verdict.verdict, Verdict.BLOCK)
 
 
+class TestGateScore(unittest.TestCase):
+    def test_pass_verdict_with_no_findings_scores_100(self) -> None:
+        policy = default_policy()
+        scan_result = scan_result_from_findings([], policy)
+        verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+        self.assertEqual(verdict_result.verdict, Verdict.PASS)
+        self.assertEqual(verdict_result.score, 100)
+
+    def test_hard_gate_hit_scores_zero(self) -> None:
+        policy = default_policy(hard_gate_rules=frozenset({"gate.hit"}))
+        finding = make_finding(rule_id="gate.hit", severity=Severity.LOW, confidence=1.0)
+        scan_result = scan_result_from_findings([finding], policy)
+        verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+        self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
+        self.assertEqual(verdict_result.score, 0)
+
+    def test_required_engine_missing_scores_within_block_band(self) -> None:
+        policy = default_policy(required_engines=frozenset({"static-keyword", "missing-engine"}))
+        scan_result = scan_result_from_findings([], policy)
+        verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+        self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
+        self.assertGreaterEqual(verdict_result.score, 0)
+        self.assertLessEqual(verdict_result.score, 39)
+
+    def test_review_verdict_scores_within_review_band(self) -> None:
+        policy = default_policy(
+            block_on_severity=Severity.CRITICAL, review_on_severity=Severity.HIGH
+        )
+        finding = make_finding(rule_id="r", severity=Severity.HIGH, confidence=0.9)
+        scan_result = scan_result_from_findings([finding], policy)
+        verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+        self.assertEqual(verdict_result.verdict, Verdict.REVIEW)
+        self.assertGreaterEqual(verdict_result.score, 40)
+        self.assertLessEqual(verdict_result.score, 74)
+
+    def test_required_engine_missing_and_hard_gate_hit_scores_zero(self) -> None:
+        # SECURITY (review 2026-07-25, Task 3): site 1 (required_ok fail-closed
+        # branch) must independently check hard_gate_hits rather than assuming
+        # a fail-closed scan never carries one - these are two unrelated
+        # signals that can co-occur (a missing required engine AND an already-
+        # collected hard-gate-matching finding from the engines that DID run).
+        policy = default_policy(
+            required_engines=frozenset({"static-keyword", "missing-engine"}),
+            hard_gate_rules=frozenset({"gate.hit"}),
+        )
+        finding = make_finding(rule_id="gate.hit", severity=Severity.LOW, confidence=1.0)
+        scan_result = scan_result_from_findings([finding], policy)
+        verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+        self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
+        self.assertEqual(verdict_result.score, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

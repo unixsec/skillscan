@@ -57,3 +57,13 @@ export function BoolBadge({
     </span>
   )
 }
+
+export function ScoreBadge({ score, verdict }: { score: number | null; verdict: string | null }) {
+  const { t } = useI18n()
+  if (score === null) return <span className="badge badge-neutral">{t('verdict.unknown')}</span>
+  // The score's band is fully determined by verdict by construction (2026-07-25
+  // scoring design doc: security_score() always clamps into verdict's band) -
+  // reuse VerdictBadge's color scheme instead of re-deriving a band from the
+  // raw number here.
+  return <span className={VERDICT_CLASS[verdict ?? ''] ?? 'badge badge-neutral'}>{score}</span>
+}

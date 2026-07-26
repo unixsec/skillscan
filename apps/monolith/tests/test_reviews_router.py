@@ -14,7 +14,17 @@ import pytest_asyncio
 import redis.asyncio as aioredis
 from common.blobstore import LocalFilesystemBlobStore
 from fastapi import FastAPI
-from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
+from schemas.findings import serialize_finding
+from skillscan_core import (
+    DetectionCategory,
+    EngineCapability,
+    Finding,
+    GatePolicy,
+    Severity,
+    StaticKeywordEngine,
+    TrustTier,
+    Verdict,
+)
 
 from monolith.main import create_app
 from monolith.modules.gate.models import VerdictRow
@@ -27,7 +37,7 @@ from monolith.modules.gateway.auth.middleware import (
 )
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
-from monolith.modules.orchestration.models import ScanJob
+from monolith.modules.orchestration.models import ScanJob, ScanResultRow
 from monolith.tests.conftest import SessionmakerFixture
 
 _ENGINE = StaticKeywordEngine()
@@ -97,6 +107,20 @@ async def _seed_review_scan(
     submitter: str,
 ) -> None:
     content_hash = uuid.uuid4().hex + uuid.uuid4().hex
+    # One MEDIUM/0.8-confidence finding, so submit_review_decision's new
+    # score-recompute has something real to work with. With the default
+    # CategoryWeights (all 1.0): penalty = 8.0 * 0.8 * 1.0 = 6.4, so an
+    # approve->PASS decision (band[75,100]) scores round(100-6.4)=94.
+    finding = Finding(
+        rule_id="review.test.finding",
+        test_item_id="review.test.finding",
+        category=DetectionCategory.CODE,
+        title="test finding for review-decision scoring",
+        severity=Severity.MEDIUM,
+        confidence=0.8,
+        source_engine="test-engine",
+        source_capability=EngineCapability.STATIC,
+    )
     async with orchestration_sessionmaker() as session, session.begin():
         session.add(
             ScanJob(
@@ -109,12 +133,27 @@ async def _seed_review_scan(
                 created_at=_naive_utcnow(),
             )
         )
+        session.add(
+            ScanResultRow(
+                scan_id=scan_id,
+                content_hash=content_hash,
+                severity=int(Severity.MEDIUM),
+                confidence_at_max=0.8,
+                trifecta_present=False,
+                findings_capped=False,
+                required_ok=True,
+                findings=[serialize_finding(finding)],
+                provenance=[],
+                hard_gate_hits=[],
+            )
+        )
     async with gate_sessionmaker() as session, session.begin():
         session.add(
             VerdictRow(
                 scan_id=scan_id,
                 content_hash=content_hash,
                 verdict="REVIEW",
+                score=57,
                 policy_version="v1",
                 jti=str(uuid.uuid4()),
                 jws_signature="original-sig",
@@ -172,6 +211,11 @@ class TestDecideReview:
         )
         assert response.status_code == 200
         assert response.json()["verdict"] == "PASS"
+
+        async with gate_sessionmaker() as session:
+            row = await session.get(VerdictRow, scan_id)
+        assert row is not None
+        assert row.score == 94
 
     @pytest.mark.asyncio
     async def test_reviewer_same_as_submitter_is_403(

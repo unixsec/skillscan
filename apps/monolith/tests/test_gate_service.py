@@ -12,6 +12,7 @@ import datetime
 import time
 import uuid
 
+import jwt as pyjwt
 import pytest
 from skillscan_core import (
     DetectionCategory,
@@ -143,6 +144,62 @@ class TestDecideAndRecord:
             ).scalar_one()
         assert row.policy_version == policy_version
 
+    @pytest.mark.asyncio
+    async def test_score_is_recorded_on_the_verdict_row(
+        self, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        content_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        scan_id = str(uuid.uuid4())
+
+        async with gate_sessionmaker() as session, session.begin():
+            result = await decide_and_record(
+                session,
+                scan_id=scan_id,
+                scan_result=_scan_result(content_hash=content_hash),
+                policy=_policy(version=f"test-{uuid.uuid4().hex[:8]}"),
+                trust_tier=TrustTier.INTERNAL,
+                allowlist=(),
+                signer=LocalDevSigner(),
+                operator="tester",
+                now=time.time(),
+            )
+        assert result.score == 100  # PASS, no findings
+
+        async with gate_sessionmaker() as session:
+            row = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        assert row.score == 100
+
+    @pytest.mark.asyncio
+    async def test_score_is_signed_into_the_jws(
+        self, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        content_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        scan_id = str(uuid.uuid4())
+
+        async with gate_sessionmaker() as session, session.begin():
+            await decide_and_record(
+                session,
+                scan_id=scan_id,
+                scan_result=_scan_result(
+                    content_hash=content_hash, findings=(_critical_finding(),)
+                ),
+                policy=_policy(version=f"test-{uuid.uuid4().hex[:8]}"),
+                trust_tier=TrustTier.INTERNAL,
+                allowlist=(),
+                signer=LocalDevSigner(),
+                operator="tester",
+                now=time.time(),
+            )
+
+        async with gate_sessionmaker() as session:
+            row = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        claims = pyjwt.decode(row.jws_signature, options={"verify_signature": False})
+        assert claims["score"] == row.score
+
 
 class TestListIssuedVerdicts:
     @pytest.mark.asyncio
@@ -190,6 +247,7 @@ class TestJtiReplayRejectedAtDbLayer:
                     scan_id=str(uuid.uuid4()),
                     content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
                     verdict="PASS",
+                    score=87,
                     policy_version="v1",
                     jti=shared_jti,
                     jws_signature="sig-1",
@@ -206,6 +264,7 @@ class TestJtiReplayRejectedAtDbLayer:
                         scan_id=str(uuid.uuid4()),
                         content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
                         verdict="PASS",
+                        score=87,
                         policy_version="v1",
                         jti=shared_jti,  # SECURITY: same jti - must be rejected
                         jws_signature="sig-2",

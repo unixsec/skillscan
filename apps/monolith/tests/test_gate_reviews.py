@@ -9,7 +9,10 @@ from __future__ import annotations
 import datetime
 import uuid
 
+import jwt as pyjwt
 import pytest
+from schemas.findings import serialize_finding
+from skillscan_core import DetectionCategory, EngineCapability, Finding, Severity
 
 from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gate.reviews import (
@@ -21,7 +24,7 @@ from monolith.modules.gate.reviews import (
 )
 from monolith.modules.gate.service import list_pending_reviews
 from monolith.modules.gate.signer import LocalDevSigner
-from monolith.modules.orchestration.models import ScanJob
+from monolith.modules.orchestration.models import ScanJob, ScanResultRow
 from monolith.tests.conftest import SessionmakerFixture
 
 
@@ -38,6 +41,21 @@ async def _seed_review_scan(
     verdict: str = "REVIEW",
 ) -> None:
     content_hash = uuid.uuid4().hex + uuid.uuid4().hex
+    # One MEDIUM/0.8-confidence finding, so submit_review_decision's new
+    # score-recompute has something real to work with. With the default
+    # CategoryWeights (all 1.0): penalty = 8.0 * 0.8 * 1.0 = 6.4, so
+    # approve->PASS band[75,100] scores round(100-6.4)=94, and
+    # reject->BLOCK band[0,39] scores round(39-6.4)=33 - both asserted below.
+    finding = Finding(
+        rule_id="review.test.finding",
+        test_item_id="review.test.finding",
+        category=DetectionCategory.CODE,
+        title="test finding for review-decision scoring",
+        severity=Severity.MEDIUM,
+        confidence=0.8,
+        source_engine="test-engine",
+        source_capability=EngineCapability.STATIC,
+    )
     async with orchestration_sessionmaker() as session, session.begin():
         session.add(
             ScanJob(
@@ -50,12 +68,27 @@ async def _seed_review_scan(
                 created_at=_naive_utcnow(),
             )
         )
+        session.add(
+            ScanResultRow(
+                scan_id=scan_id,
+                content_hash=content_hash,
+                severity=int(Severity.MEDIUM),
+                confidence_at_max=0.8,
+                trifecta_present=False,
+                findings_capped=False,
+                required_ok=True,
+                findings=[serialize_finding(finding)],
+                provenance=[],
+                hard_gate_hits=[],
+            )
+        )
     async with gate_sessionmaker() as session, session.begin():
         session.add(
             VerdictRow(
                 scan_id=scan_id,
                 content_hash=content_hash,
                 verdict=verdict,
+                score={"PASS": 87, "REVIEW": 57, "BLOCK": 20}[verdict],
                 policy_version="v1",
                 jti=str(uuid.uuid4()),
                 jws_signature="original-sig",
@@ -93,6 +126,7 @@ class TestSubmitReviewDecision:
                 signer=LocalDevSigner(),
             )
         assert result.verdict == "PASS"
+        assert result.score == 94
         assert "manual review by approver-carol" in result.reasons[-1]
 
     @pytest.mark.asyncio
@@ -121,6 +155,36 @@ class TestSubmitReviewDecision:
                 signer=LocalDevSigner(),
             )
         assert result.verdict == "BLOCK"
+        assert result.score == 33
+
+    @pytest.mark.asyncio
+    async def test_approve_signs_score_into_the_jws(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        scan_id = str(uuid.uuid4())
+        await _seed_review_scan(
+            orchestration_sessionmaker, gate_sessionmaker, scan_id=scan_id, submitter="dev-dave"
+        )
+
+        async with (
+            orchestration_sessionmaker() as orch_session,
+            gate_sessionmaker() as gate_session,
+            gate_session.begin(),
+        ):
+            result = await submit_review_decision(
+                orchestration_session=orch_session,
+                gate_session=gate_session,
+                scan_id=scan_id,
+                decision="approve",
+                reviewer="approver-carol",
+                reason="reviewed, looks fine",
+                signer=LocalDevSigner(),
+            )
+
+        claims = pyjwt.decode(result.jws_signature, options={"verify_signature": False})
+        assert claims["score"] == result.score == 94
 
     @pytest.mark.asyncio
     async def test_same_person_as_submitter_is_sod_violation(

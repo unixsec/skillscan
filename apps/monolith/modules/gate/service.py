@@ -63,6 +63,7 @@ async def decide_and_record(
             "verdict": verdict_result.verdict.name,
             "policy_version": verdict_result.policy_version,
             "effective_severity": int(verdict_result.effective_severity),
+            "score": verdict_result.score,
         }
     )
     # SECURITY: decode-without-verify is safe here specifically because we just
@@ -80,6 +81,7 @@ async def decide_and_record(
             jti=unverified_claims["jti"],
             jws_signature=jws,
             effective_severity=int(verdict_result.effective_severity),
+            score=verdict_result.score,
             reasons=list(verdict_result.reasons),
             issued_at=_naive_utcnow(),
         )

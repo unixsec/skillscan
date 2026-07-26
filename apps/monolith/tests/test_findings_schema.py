@@ -8,6 +8,7 @@ import json
 import pytest
 from schemas.findings import (
     UntrustedFindingsError,
+    deserialize_finding,
     parse_engine_result,
     serialize_engine_result,
     serialize_finding,
@@ -72,6 +73,11 @@ class TestRoundTrip:
         as_dict = serialize_engine_result(original)
         assert as_dict["findings"][0] == serialize_finding(original.findings[0])
 
+    def test_deserialize_finding_recovers_original(self) -> None:
+        original = _valid_engine_result().findings[0]
+        recovered = deserialize_finding(serialize_finding(original))
+        assert recovered == original
+
 
 class TestFailClosedOnSchemaViolation:
     def test_malformed_json_raises(self) -> None:
@@ -115,3 +121,7 @@ class TestFailClosedOnSchemaViolation:
         original["engine"]["requires_network"] = True
         with pytest.raises(UntrustedFindingsError):
             parse_engine_result(json.dumps(original).encode("utf-8"))
+
+    def test_deserialize_finding_malformed_dict_raises(self) -> None:
+        with pytest.raises(UntrustedFindingsError):
+            deserialize_finding({"not": "a valid finding"})

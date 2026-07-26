@@ -194,6 +194,8 @@ async def get_scan(
         "submitter": job.submitter,
         "verdict": verdict_row.verdict if verdict_row is not None else None,
         "severity": result_row.severity if result_row is not None else None,
+        "score": verdict_row.score if verdict_row is not None else None,
+        "is_safe": (verdict_row.verdict == "PASS") if verdict_row is not None else None,
         "findings": result_row.findings if result_row is not None else [],
         "provenance": result_row.provenance if result_row is not None else [],
         "required_ok": result_row.required_ok if result_row is not None else None,
@@ -262,29 +264,29 @@ async def list_scans(
     # and inventory are separate modules with their own least-privilege DB
     # grants (same reason GET /v1/scans/{scan_id} above does two queries
     # instead of one JOIN - gate and inventory aren't in the same schema/user).
-    verdicts_by_scan: dict[str, str] = {}
+    verdicts_by_scan: dict[str, tuple[str, int]] = {}
     if scan_ids:
         async with runtime.gate_session_factory() as gate_session:
             rows = (
                 await gate_session.execute(
-                    select(VerdictRow.scan_id, VerdictRow.verdict).where(
+                    select(VerdictRow.scan_id, VerdictRow.verdict, VerdictRow.score).where(
                         VerdictRow.scan_id.in_(scan_ids)
                     )
                 )
             ).all()
-        verdicts_by_scan = dict(rows)
+        verdicts_by_scan = {scan_id: (verdict, score) for scan_id, verdict, score in rows}
 
     skill_ids_by_hash: dict[str, str] = {}
     if content_hashes and runtime.inventory_session_factory is not None:
         async with runtime.inventory_session_factory() as inv_session:
-            rows = (
+            hash_rows = (
                 await inv_session.execute(
                     select(SkillVersionRow.content_hash, SkillVersionRow.skill_id).where(
                         SkillVersionRow.content_hash.in_(content_hashes)
                     )
                 )
             ).all()
-        skill_ids_by_hash = dict(rows)
+        skill_ids_by_hash = dict(hash_rows)
 
     return {
         "items": [
@@ -293,7 +295,15 @@ async def list_scans(
                 "state": j.state,
                 "submitter": j.submitter,
                 "content_hash": j.content_hash,
-                "verdict": verdicts_by_scan.get(j.scan_id),
+                "verdict": verdicts_by_scan[j.scan_id][0]
+                if j.scan_id in verdicts_by_scan
+                else None,
+                "score": verdicts_by_scan[j.scan_id][1] if j.scan_id in verdicts_by_scan else None,
+                "is_safe": (
+                    verdicts_by_scan[j.scan_id][0] == "PASS"
+                    if j.scan_id in verdicts_by_scan
+                    else None
+                ),
                 "skill_id": skill_ids_by_hash.get(j.content_hash),
                 "skill_name": j.skill_name,
             }

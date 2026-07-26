@@ -37,6 +37,7 @@ class TestCrossModuleWritesRejected:
                     scan_id="11111111-1111-1111-1111-111111111111",
                     content_hash="a" * 64,
                     verdict="PASS",
+                    score=87,
                     policy_version="v1",
                     jti="22222222-2222-2222-2222-222222222222",
                     jws_signature="x",

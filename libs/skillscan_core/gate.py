@@ -10,6 +10,7 @@ from collections.abc import Iterable
 
 from skillscan_core.models import (
     AllowlistEntry,
+    CategoryWeights,
     Finding,
     GatePolicy,
     ScanResult,
@@ -18,7 +19,9 @@ from skillscan_core.models import (
     Verdict,
     VerdictResult,
 )
-from skillscan_core.scoring import evaluate_findings
+from skillscan_core.scoring import evaluate_findings, security_score
+
+_DEFAULT_WEIGHTS = CategoryWeights()
 
 
 def _classify(
@@ -42,11 +45,13 @@ def decide(
     now: float,
     min_confidence: float = 0.0,
     skill_id: str | None = None,
+    weights: CategoryWeights = _DEFAULT_WEIGHTS,
 ) -> VerdictResult:
     # SECURITY (INV-1): required engine missing/failed -> fail-closed, no exceptions.
     if not scan_result.required_ok:
+        verdict = policy.fail_closed_verdict
         return VerdictResult(
-            verdict=policy.fail_closed_verdict,
+            verdict=verdict,
             reasons=(
                 "fail_closed:required_engine_missing_or_failed:"
                 + ",".join(scan_result.missing_or_failed_required),
@@ -55,6 +60,12 @@ def decide(
             effective_severity=scan_result.severity,
             trifecta_present=scan_result.trifecta_present,
             hard_gate_hits=scan_result.hard_gate_hits,
+            score=security_score(
+                verdict,
+                scan_result.findings,
+                hard_gate_triggered=bool(scan_result.hard_gate_hits),
+                weights=weights,
+            ),
         )
 
     # SECURITY (INV-3): hard-gate hits (recorded UNION recomputed against the CURRENT
@@ -72,6 +83,9 @@ def decide(
             effective_severity=scan_result.severity,
             trifecta_present=scan_result.trifecta_present,
             hard_gate_hits=tuple(sorted(combined_hard_gate)),
+            score=security_score(
+                Verdict.BLOCK, scan_result.findings, hard_gate_triggered=True, weights=weights
+            ),
         )
 
     allowlist = tuple(allowlist)
@@ -184,4 +198,5 @@ def decide(
         effective_severity=sev_all,
         trifecta_present=trif_all,
         hard_gate_hits=(),
+        score=security_score(verdict, effective, hard_gate_triggered=False, weights=weights),
     )

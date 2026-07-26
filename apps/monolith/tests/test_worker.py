@@ -909,6 +909,7 @@ class TestLifecycleSync:
                     scan_id=str(uuid.uuid4()),
                     content_hash=c_hash,
                     verdict="BLOCK",
+                    score=20,
                     policy_version="vt",
                     jti=str(uuid.uuid4()),
                     jws_signature="test",

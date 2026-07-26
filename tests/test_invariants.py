@@ -534,5 +534,65 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
 
 
+class TestScoreBandInvariant(unittest.TestCase):
+    # New invariant from the 2026-07-25 scoring design doc (not yet a
+    # numbered INV in the coding spec's own §14 checklist - flagged to the
+    # user, not silently added there). Randomized property test with a fixed
+    # seed, same style as INV-2's test_inv2_llm_monotonicity_randomized_fixed_seed
+    # above: score must always fall inside the band its own verdict maps to.
+    #
+    # SECURITY (review 2026-07-25, Task 3): each trial randomly picks which of
+    # decide()'s 3 score-returning branches to exercise (normal path /
+    # required-engine-missing fail-closed / hard-gate hit) - a fixed
+    # default_policy() shared across all 200 trials would only ever reach the
+    # normal path (found live: the original version of this test structurally
+    # never exercised the other two, despite 200 trials).
+    def test_score_always_within_the_verdict_band_randomized_fixed_seed(self) -> None:
+        band = {Verdict.BLOCK: (0, 39), Verdict.REVIEW: (40, 74), Verdict.PASS: (75, 100)}
+        rng = random.Random(20260725)
+        severities = [Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL]
+        modes = ["normal", "missing_engine", "hard_gate"]
+
+        for trial in range(200):
+            mode = rng.choice(modes)
+            if mode == "missing_engine":
+                policy = default_policy(
+                    required_engines=frozenset({"static-keyword", "missing-engine"})
+                )
+            elif mode == "hard_gate":
+                policy = default_policy(hard_gate_rules=frozenset({f"gate-{trial}"}))
+            else:
+                policy = default_policy()
+
+            if mode == "hard_gate":
+                # Guarantee at least one finding actually matches the
+                # trial's hard-gate rule, so this mode reliably reaches
+                # decide()'s hard-gate branch rather than only sometimes.
+                findings = [
+                    make_finding(
+                        rule_id=f"gate-{trial}" if i == 0 else f"f-{trial}-{i}",
+                        severity=rng.choice(severities),
+                        confidence=rng.random(),
+                    )
+                    for i in range(rng.randint(1, 6))
+                ]
+            else:
+                findings = [
+                    make_finding(
+                        rule_id=f"f-{trial}-{i}",
+                        severity=rng.choice(severities),
+                        confidence=rng.random(),
+                    )
+                    for i in range(rng.randint(0, 6))
+                ]
+
+            scan_result = scan_result_from_findings(findings, policy)
+            verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+            band_min, band_max = band[verdict_result.verdict]
+            with self.subTest(trial=trial, mode=mode):
+                self.assertGreaterEqual(verdict_result.score, band_min)
+                self.assertLessEqual(verdict_result.score, band_max)
+
+
 if __name__ == "__main__":
     unittest.main()

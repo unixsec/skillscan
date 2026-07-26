@@ -18,9 +18,12 @@ from __future__ import annotations
 import datetime
 
 import jwt as pyjwt
+from schemas.findings import deserialize_finding
+from skillscan_core import CategoryWeights, Verdict
+from skillscan_core.scoring import security_score
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from monolith.modules.orchestration.models import ScanJob
+from monolith.modules.orchestration.models import ScanJob, ScanResultRow
 
 from .models import AuditIntentInsertOnly, GateOutboxRow, VerdictRow
 from .service import SignerPort
@@ -94,17 +97,60 @@ async def submit_review_decision(
     new_verdict = _DECISION_TO_VERDICT[decision]
     new_reasons = [*verdict_row.reasons, f"manual review by {reviewer}: {decision} - {reason}"]
 
+    # SECURITY (score/verdict consistency, 2026-07-26 final-review fix): a
+    # manual review decision changes the verdict's band, so score must be
+    # recomputed against the NEW band - otherwise a REVIEW-band score (e.g.
+    # 57) would survive into a PASS/BLOCK verdict, violating the "score never
+    # contradicts verdict" invariant (2026-07-24 scoring design doc) on every
+    # normal review-queue decision, not just an edge case.
+    #
+    # hard_gate_triggered=False below depends on gate.decide()'s hard-gate
+    # branch (gate.py's `combined_hard_gate` check) always forcing BLOCK
+    # unconditionally - true today, and this function's own REVIEW-only
+    # precondition (checked above) means that branch can be ruled out. It
+    # does NOT rule out the separate required-engine fail-closed branch
+    # (gate.py, `not scan_result.required_ok`), whose verdict is
+    # policy.fail_closed_verdict - GatePolicy only forbids that being PASS
+    # (models.py), so a future policy change setting it to REVIEW (every
+    # deployed policy sets it to BLOCK today, incl. policies/gate/v1.yaml)
+    # could reach this function with an unrecorded hard-gate hit. The score
+    # would still land in-band regardless (security_score's own clamp), so
+    # this is a documentation/robustness note, not a live gap - flagged by
+    # the fix's own code review (2026-07-26), not fixed further since no
+    # policy in this codebase configures fail_closed_verdict=REVIEW.
+    result_row = await orchestration_session.get(ScanResultRow, scan_id)
+    if result_row is None:
+        # Not fully unreachable (see note above) but still expected to be
+        # rare/never under every policy configuration this codebase actually
+        # ships: every path that can produce a REVIEW verdict under the
+        # standard flow (orchestration.service._try_score_and_decide) writes
+        # ScanResultRow before ever calling decide_and_record; the only
+        # verdict-producing path that skips it (_dead_letter_and_decide)
+        # forces BLOCK under every policy shipped in this codebase today.
+        # Fail loudly rather than silently scoring against zero findings if
+        # this invariant is ever violated.
+        raise RuntimeError(
+            f"scan {scan_id!r} has a REVIEW verdict but no recorded ScanResultRow "
+            "- cannot recompute score for the review decision"
+        )
+    findings = [deserialize_finding(f) for f in result_row.findings]
+    new_score = security_score(
+        Verdict[new_verdict], findings, hard_gate_triggered=False, weights=CategoryWeights()
+    )
+
     jws = await signer.sign_verdict(
         {
             "content_hash": verdict_row.content_hash,
             "verdict": new_verdict,
             "policy_version": verdict_row.policy_version,
             "effective_severity": verdict_row.effective_severity,
+            "score": new_score,
         }
     )
     unverified_claims = pyjwt.decode(jws, options={"verify_signature": False})
 
     verdict_row.verdict = new_verdict
+    verdict_row.score = new_score
     verdict_row.jti = unverified_claims["jti"]
     verdict_row.jws_signature = jws
     verdict_row.reasons = new_reasons

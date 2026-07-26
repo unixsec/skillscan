@@ -117,6 +117,7 @@ const zh: Dict = {
   'scans.colSkillId': 'Skill ID',
   'scans.colState': '状态',
   'scans.colVerdict': '结论',
+  'scans.colScore': '安全评分',
   'scans.colSubmitter': '提交者',
   'scans.colContentHash': '内容哈希',
   'scans.noSkillId': '未登记',
@@ -125,6 +126,7 @@ const zh: Dict = {
   'scanDetail.title': '扫描 {scanId}',
   'scanDetail.state': '状态',
   'scanDetail.verdict': '判定',
+  'scanDetail.score': '安全评分',
   'scanDetail.submitter': '提交者',
   'scanDetail.requiredEngineWarning': '警告：并非所有必需引擎都已成功完成本次扫描（结果可能不完整）',
   'scanDetail.neverScoredNotice':
@@ -610,6 +612,7 @@ const en: Dict = {
   'scans.colSkillId': 'Skill ID',
   'scans.colState': 'State',
   'scans.colVerdict': 'Verdict',
+  'scans.colScore': 'Security score',
   'scans.colSubmitter': 'Submitter',
   'scans.colContentHash': 'Content hash',
   'scans.noSkillId': 'not registered',
@@ -618,6 +621,7 @@ const en: Dict = {
   'scanDetail.title': 'Scan {scanId}',
   'scanDetail.state': 'state',
   'scanDetail.verdict': 'verdict',
+  'scanDetail.score': 'security score',
   'scanDetail.submitter': 'submitter',
   'scanDetail.requiredEngineWarning':
     'Warning: not every required engine completed for this scan (results may be incomplete)',
