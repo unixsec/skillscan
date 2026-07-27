@@ -4,8 +4,8 @@
 引擎 vendoring。部署/运维/日常使用见同目录下的另外三份指南（文末索引）。
 
 M1–M8 全部里程碑均已实现，**2026-07-06 完整规格合规审计发现的 18 项差距也已全部修复**
-（详见 `docs/stories/BACKLOG.md` 与本文档各处的"审计修复"标注）——本指南描述的是当前
-真实、可运行的构建流程，不是设计目标。
+（详见本文档各处的"审计修复"标注）——本指南描述的是当前真实、可运行的构建流程，
+不是设计目标。
 
 ---
 
@@ -77,10 +77,10 @@ uv run python3 scripts/vendor_engines.py status
 ```
 
 5 个引擎已 vendor（skillspector/aig/bandit/osv_scanner/yara）。4 个适配器（bandit/osv/yara/
-skillspector）已实现，AIG 因真实接口是网络服务扫描器而**有意不做适配器**（详见
-`docs/stories/BACKLOG.md` S5）。Cisco skill-scanner 从未 vendor（官方仓库地址从未确认），其
-候选能力缺口（多语言/非英文提示词注入检测）已由自研中文 floor 检测器填补，见
-`docs/superpowers/specs/2026-07-22-chinese-prompt-injection-detectors-design.md`。
+skillspector）已实现，AIG 的顶层 CLI 是网络服务扫描器（`--target http://host:port`），不扫本地文件包，
+因此顶层能力**有意不做适配器**；其 `mcp-scan` 子系统确实接受本地目录，已单独适配。Cisco skill-scanner 从未 vendor（官方仓库地址从未确认），其
+候选能力缺口（多语言/非英文提示词注入检测）已由自研中文 floor 检测器填补
+（`services/engine_runner/detectors/prompt_injection_zh.py`、`jailbreak_inducement_zh.py`）。
 
 `scripts/vendor_engines.py` **有意不**自动化 `git submodule add` 本身——拉入新的第三方源码
 是一次性、需要人工确认的网络操作，不应被脚本静默执行。
@@ -123,4 +123,3 @@ shellcheck dr/backup.sh scripts/one_click_dev.sh scripts/one_click_deploy_docker
 - [`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md) — 部署指南（一键本地开发部署 + 一键容器化部署 + K8s）
 - [`USAGE_GUIDE.md`](USAGE_GUIDE.md) — 操作指南（按角色的日常使用）
 - [`MAINTENANCE_GUIDE.md`](MAINTENANCE_GUIDE.md) — 运维指南（日常维护 + 故障排查）
-- [`stories/BACKLOG.md`](stories/BACKLOG.md) — 里程碑实现状态与验收细节

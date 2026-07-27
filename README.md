@@ -8,32 +8,52 @@ and produces a `PASS` / `REVIEW` / `BLOCK` verdict. Internal tool, on-prem, zero
 external network connectivity.
 
 The project is built against a layered spec set (requirements → architecture →
-coding spec), a milestone-by-milestone story backlog with per-story status
-notes, a set of operational guides split by concern (build/deploy/usage/
-maintenance), and a dedicated kernel threat model — maintained separately from
-this repository's public snapshot.
+coding spec) and a milestone-by-milestone story backlog with per-story status
+notes, both maintained separately from this repository's public snapshot. The
+operational guides and the kernel threat model ship here, under `docs/`.
 
 ## Status
 
-**M1-M8 all implemented**, and a full requirement-by-requirement audit against
-the coding spec (2026-07-06, 6 independent verification passes against live
-code/tests) found 18 real gaps — **all 18 are now fixed**, including a critical
+**M1-M8 all implemented.** A full requirement-by-requirement audit against the
+coding spec (2026-07-06) found 18 real gaps — all 18 fixed, including a critical
 kernel defect where a dedup collision in `gate.decide()` could silently drop a
-trifecta-completing finding (fixed with dedicated regression tests), a missing
-CSRF check on `POST /v1/reeval/{skill_id}`, and — the most consequential
-structural gap — a real OIDC/SAML login callback now exists
-(`/v1/auth/oidc/*`, `/v1/auth/saml/*`); break-glass is no longer the only
-working session path. The one big known gap that remains: the scan-decision
-worker loop still isn't invoked by any live process.
+trifecta-completing finding, a missing CSRF check on
+`POST /v1/reeval/{skill_id}`, and a real OIDC/SAML login callback
+(`/v1/auth/oidc/*`, `/v1/auth/saml/*`), so break-glass is no longer the only
+working session path. The scan-decision worker loop — the biggest structural gap
+that audit surfaced — was closed the same evening by `apps/monolith/worker.py`.
 
-706 backend tests passing against real local MySQL/Redis (no mocking of systems
-under test), `mypy --strict`/ruff/ruff-format all clean across 171 files; frontend
-(`web/`, React 19 + Vite SPA, 13 pages + login, Chinese/English i18n) `tsc`/`vite
-build`/`oxlint` clean. One-click deployment now exists both for local dev
-(`scripts/one_click_dev.sh`, verified end-to-end including a real break-glass
-login) and production-shaped Docker Compose (`docker-compose.yml` +
-`scripts/one_click_deploy_docker.sh`, not build-verified here — no Docker daemon
-in this environment, same posture as every other Dockerfile in this repo).
+Since then:
+
+- **Local accounts + RBAC** — a deployment can bootstrap an admin without an
+  IdP, alongside the existing SSO path.
+- **Chinese prompt-injection floor detectors** (PROMPT-01/04) — matching on
+  same-line co-occurrence rather than single keywords. The upstream
+  prompt-injection regexes are English-only, so this content passed cleanly
+  before.
+- **Per-rule security risk descriptions** across all 14 engines — every finding
+  explains *why* it is a risk, rather than restating the rule name.
+- **0-100 security score** alongside the PASS/REVIEW/BLOCK verdict, as a *pure
+  downstream function* of an already-decided verdict: the verdict selects a band
+  (BLOCK `[0,39]` / REVIEW `[40,74]` / PASS `[75,100]`) and findings modulate
+  within it. The score is never an input to `decide()`, which is what makes
+  "BLOCK with a high score" structurally impossible rather than merely
+  tested-for.
+
+**951 backend tests** pass against real MySQL/Redis (no mocking of the systems
+under test), plus **117 kernel tests** (`tests/`, pure `skillscan_core`, stdlib
+only). `ruff check` / `ruff format --check` / `mypy --strict` are clean across
+the tree, and `scripts/check_import_boundaries.py` guards the cross-module ORM
+boundary — each module owns its own tables and its own least-privilege database
+user, and this keeps the code side of that boundary from eroding. Frontend
+(`web/`, React 19 + Vite SPA, 15 pages + login, Chinese/English i18n)
+`tsc`/`vite build`/`oxlint` clean.
+
+One-click deployment exists for local dev (`scripts/one_click_dev.sh`, verified
+end-to-end including a real break-glass login) and as production-shaped Docker
+Compose (`docker-compose.yml` + `scripts/one_click_deploy_docker.sh`). Note the
+Compose path deliberately excludes `services/engine-runner`, so it runs the
+floor engines only; see `docs/DEPLOYMENT_GUIDE.md` for the full topology.
 
 ## Development
 
@@ -42,9 +62,12 @@ Node/npm.
 
 ```bash
 uv sync                    # install all deps (backend + dev tools) into .venv
-uv run pytest -q           # full backend suite against local MySQL/Redis (706 tests)
+uv run pytest -q           # backend suite against local MySQL/Redis (951 tests)
+uv run pytest tests/ -q    # kernel suite, no external dependencies (117 tests)
 uv run mypy                # strict type-check
 uv run ruff check .        # lint
+uv run ruff format --check .
+python3 scripts/check_import_boundaries.py   # cross-module ORM boundary
 
 cd web && npm install && npm run build && npm run lint   # frontend
 ```
@@ -52,9 +75,14 @@ cd web && npm install && npm run build && npm run lint   # frontend
 Or just run `./scripts/one_click_dev.sh` — brings up MySQL/Redis, migrates, builds
 the frontend, and starts the backend with a working (dev-only) break-glass login in
 one command, for local dev; a production-shaped Docker Compose path is also
-available via `docker-compose.yml` + `scripts/one_click_deploy_docker.sh`. Local
-MySQL/Redis setup detail, per-role usage notes, and known footguns are covered in
-the project's internal operational documentation.
+available via `docker-compose.yml` + `scripts/one_click_deploy_docker.sh`.
+
+The operational guides under `docs/` cover the rest: `BUILD_GUIDE.md` (toolchain,
+container images, OSS engine vendoring), `DEPLOYMENT_GUIDE.md` (local, Compose,
+Kubernetes, real OIDC/SAML setup), `USAGE_GUIDE.md` (full API list, per-role
+workflows), `MAINTENANCE_GUIDE.md` (routine maintenance, **the honest list of
+what remains open**, troubleshooting), and `THREAT_MODEL.md` (kernel threat
+model).
 
 `libs/skillscan_core` itself still has **zero runtime dependencies** by design
 (coding spec §2) — it must remain testable with nothing but the stdlib, independent

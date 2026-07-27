@@ -131,4 +131,3 @@ Vault、真实企业 IdP、真实 Skill 市场——均无法在本开发环境�
 - [`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md) — 部署指南
 - [`USAGE_GUIDE.md`](USAGE_GUIDE.md) — 操作指南
 - [`THREAT_MODEL.md`](THREAT_MODEL.md) — 内核威胁模型
-- [`stories/BACKLOG.md`](stories/BACKLOG.md) — 里程碑实现状态权威来源

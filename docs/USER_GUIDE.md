@@ -15,4 +15,3 @@
 以及：
 
 - [`THREAT_MODEL.md`](THREAT_MODEL.md) — 内核威胁模型（M1 交付物，2026-07-06 补齐）。
-- [`stories/BACKLOG.md`](stories/BACKLOG.md) — 里程碑实现状态权威来源（比以上指南更细粒度）。
