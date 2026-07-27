@@ -89,11 +89,17 @@ reeval 触发的重扫真正执行（worker 的队列补投递把 DB-only scan_j
    如需显式状态需要扩状态机+迁移，属规格层决策，不在代码层擅自发明。
 6. **~~worker 的引擎执行仍是进程内 floor 引擎~~（2026-07-28 已关闭）**——sandbox 层引擎
    （bandit / yara / skillspector / osv-scanner）现在真正参与裁决：裁决前会等待它们的结果，
-   最长 300 秒，超时后以已到结果裁决并在 `reasons` 里记录哪些引擎没赶上。等待是
-   advisory 的——sandbox 引擎缺席只降级为"未赶上"，不触发 fail-closed BLOCK，避免单个
-   引擎故障造成批量误判。真实提交验证：同一份判定里同时含 floor 层与 bandit/skillspector
-   的 finding。**注意由此产生的体验落差**：扫描从毫秒级变为分钟级，而扫描详情页目前
-   无自动轮询也无刷新按钮，提交后需手动刷新才能看到最终判定。
+   最长 300 秒，另加 30 秒 sweep 宽限（让引擎自己的 TIMEOUT 结果有机会先落盘——"我超时了"
+   比"它没来"对运维更有信息量）。超时后以已到结果裁决，并在 `reasons` 里记录哪些引擎
+   没赶上。等待是 advisory 的——sandbox 引擎缺席只降级为"未赶上"，不触发 fail-closed
+   BLOCK，避免单个引擎故障造成批量误判。
+   **等待时长从"开始等待"起算，而非从提交起算**（`scan_job.sandbox_wait_started_at`，
+   迁移 `b7c41f9d2e08`）：否则 worker 停机后积压的扫描会在 floor 结果刚落盘的同一个
+   tick 里因"提交时间已很旧"被强制裁决，整个 sandbox 层被跳过——方向是把本应 REVIEW
+   的包判成 PASS，比误报危险得多。
+   真实提交验证：同一份判定里同时含 floor 层与 bandit/skillspector 的 finding。
+   **注意由此产生的体验落差**：扫描从毫秒级变为分钟级，而扫描详情页目前无自动轮询
+   也无刷新按钮，提交后需手动刷新才能看到最终判定。
 
 ## 4. 故障排查
 
