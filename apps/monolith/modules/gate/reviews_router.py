@@ -63,23 +63,21 @@ async def list_reviews(
     submitters_by_scan: dict[str, str] = {}
     if scan_ids:
         async with runtime.orchestration_session_factory() as orch_session:
-            rows = (
-                await orch_session.execute(
-                    select(ScanJob.scan_id, ScanJob.submitter).where(ScanJob.scan_id.in_(scan_ids))
-                )
-            ).all()
+            result = await orch_session.execute(
+                select(ScanJob.scan_id, ScanJob.submitter).where(ScanJob.scan_id.in_(scan_ids))
+            )
+            rows = result.tuples().all()
         submitters_by_scan = dict(rows)
 
     skill_ids_by_hash: dict[str, str] = {}
     if content_hashes and runtime.inventory_session_factory is not None:
         async with runtime.inventory_session_factory() as inv_session:
-            rows = (
-                await inv_session.execute(
-                    select(SkillVersionRow.content_hash, SkillVersionRow.skill_id).where(
-                        SkillVersionRow.content_hash.in_(content_hashes)
-                    )
+            result = await inv_session.execute(
+                select(SkillVersionRow.content_hash, SkillVersionRow.skill_id).where(
+                    SkillVersionRow.content_hash.in_(content_hashes)
                 )
-            ).all()
+            )
+            rows = result.tuples().all()
         skill_ids_by_hash = dict(rows)
 
     return {

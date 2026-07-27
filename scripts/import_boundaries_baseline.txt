@@ -1,0 +1,14 @@
+# Cross-module ORM imports recorded as a baseline by
+# scripts/check_import_boundaries.py. This list must only ever shrink.
+# Regenerate with: uv run python scripts/check_import_boundaries.py --update
+apps/monolith/modules/admin/router.py::gate
+apps/monolith/modules/gate/reviews.py::orchestration
+apps/monolith/modules/gate/reviews_router.py::inventory
+apps/monolith/modules/gate/reviews_router.py::orchestration
+apps/monolith/modules/gate/router.py::inventory
+apps/monolith/modules/gate/router.py::orchestration
+apps/monolith/modules/gateway/router.py::gate
+apps/monolith/modules/gateway/router.py::inventory
+apps/monolith/modules/gateway/router.py::orchestration
+apps/monolith/modules/reeval/router.py::inventory
+apps/monolith/modules/reeval/router.py::orchestration

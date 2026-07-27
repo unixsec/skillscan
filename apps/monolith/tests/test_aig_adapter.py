@@ -295,6 +295,10 @@ class TestSpecializedLlmRolesRoutedInternally:
             api_key="sk-test-not-a-real-key",
         )
         env_fn = adapter._env  # noqa: SLF001 - white-box test
+        # `SubprocessEngineAdapter.env` accepts a static dict OR a callable; aig
+        # deliberately passes the callable `_build_env` so the env is rebuilt on
+        # every subprocess spawn. Assert that shape before calling it.
+        assert callable(env_fn)
         env = env_fn()
         assert env is not None
         for role in ("THINKING", "CODING", "FAST"):
@@ -316,6 +320,10 @@ class TestSpecializedLlmRolesRoutedInternally:
             version="v4.1.15",
         )
         env_fn = adapter._env  # noqa: SLF001 - white-box test
+        # `SubprocessEngineAdapter.env` accepts a static dict OR a callable; aig
+        # deliberately passes the callable `_build_env` so the env is rebuilt on
+        # every subprocess spawn. Assert that shape before calling it.
+        assert callable(env_fn)
         env = env_fn()
         assert env is not None
         for role in ("THINKING", "CODING", "FAST"):

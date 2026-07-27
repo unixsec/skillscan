@@ -120,8 +120,8 @@ class TestSandboxEngineTickConsumesIndependently:
             redis_client, blobstore, files=[("skill.py", 0o644, b"print('hi')\n")]
         )
         engines_by_name: dict[str, DetectionEngine] = {
-            "fixed-a": _FixedEngine("fixed-a"),  # type: ignore[dict-item]
-            "fixed-b": _FixedEngine("fixed-b"),  # type: ignore[dict-item]
+            "fixed-a": _FixedEngine("fixed-a"),
+            "fixed-b": _FixedEngine("fixed-b"),
         }
 
         processed = await sandbox_engine_tick(
@@ -170,8 +170,8 @@ class TestSandboxEngineTickConsumesIndependently:
                 redis_client, blobstore, files=[("skill.py", 0o644, b"print('hi')\n")]
             )
             engines_by_name: dict[str, DetectionEngine] = {
-                "fixed-disabled": _FixedEngine("fixed-disabled"),  # type: ignore[dict-item]
-                "fixed-enabled": _FixedEngine("fixed-enabled"),  # type: ignore[dict-item]
+                "fixed-disabled": _FixedEngine("fixed-disabled"),
+                "fixed-enabled": _FixedEngine("fixed-enabled"),
             }
 
             processed = await sandbox_engine_tick(

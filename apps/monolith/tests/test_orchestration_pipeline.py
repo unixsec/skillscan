@@ -282,7 +282,7 @@ class TestSkillNameParsing:
             pytest.param(b"---\nname: [this is not valid: yaml\n---\n", id="malformed-yaml"),
             pytest.param(b"---\ndescription: no name key\n---\n", id="no-name-key"),
             pytest.param(b"---\nname: 12345\n---\n", id="name-not-a-string"),
-            pytest.param(b"---\nname: \"   \"\n---\n", id="name-blank"),
+            pytest.param(b'---\nname: "   "\n---\n', id="name-blank"),
         ],
     )
     @pytest.mark.asyncio

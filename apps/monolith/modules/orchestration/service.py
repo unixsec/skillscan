@@ -79,7 +79,12 @@ def _naive_utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
 
 
-class _NoAliasSafeLoader(yaml.SafeLoader):
+# `type: ignore[misc]`: PyYAML ships no type information and is declared
+# `ignore_missing_imports` in pyproject.toml, so `yaml.SafeLoader` resolves to
+# `Any` and mypy --strict rejects subclassing it. The ignore is about the
+# missing upstream stub, not about this class - drop it if PyYAML (or a
+# types-PyYAML dev dependency) ever provides real types.
+class _NoAliasSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
     """SECURITY: a SafeLoader that refuses YAML aliases. `yaml.safe_load`
     blocks code execution but still expands anchors/aliases, so a tiny
     (<1 KiB) nested-alias "billion laughs" payload can expand exponentially and
@@ -92,7 +97,7 @@ class _NoAliasSafeLoader(yaml.SafeLoader):
         event = self.peek_event()
         if isinstance(event, yaml.events.AliasEvent):
             raise yaml.YAMLError("YAML aliases are not permitted in SKILL.md frontmatter")
-        return super().compose_node(parent, index)  # type: ignore[arg-type]
+        return super().compose_node(parent, index)
 
 
 def _parse_skill_name(files: Sequence[tuple[str, int, bytes]]) -> str | None:

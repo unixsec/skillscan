@@ -52,7 +52,7 @@ _ADMIN_DB_URL = os.environ.get(
 )
 
 
-async def _admin_exec(sql: str, params: dict | None = None) -> None:
+async def _admin_exec(sql: str, params: dict[str, object] | None = None) -> None:
     engine = make_engine(_ADMIN_DB_URL)
     try:
         async with engine.begin() as conn:

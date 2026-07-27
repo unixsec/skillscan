@@ -279,13 +279,12 @@ async def list_scans(
     skill_ids_by_hash: dict[str, str] = {}
     if content_hashes and runtime.inventory_session_factory is not None:
         async with runtime.inventory_session_factory() as inv_session:
-            hash_rows = (
-                await inv_session.execute(
-                    select(SkillVersionRow.content_hash, SkillVersionRow.skill_id).where(
-                        SkillVersionRow.content_hash.in_(content_hashes)
-                    )
+            hash_result = await inv_session.execute(
+                select(SkillVersionRow.content_hash, SkillVersionRow.skill_id).where(
+                    SkillVersionRow.content_hash.in_(content_hashes)
                 )
-            ).all()
+            )
+            hash_rows = hash_result.tuples().all()
         skill_ids_by_hash = dict(hash_rows)
 
     return {

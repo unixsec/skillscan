@@ -118,7 +118,8 @@ def sandbox_engines(
             skillspector.make_adapter(
                 openai_base_url=vllm_base_url,
                 ruleset_digest=_RULESET_DIGEST,
-                version="2.3.9",  # vendor/skillspector/pyproject.toml's own version; pinned commit is dde36f2
+                # vendor/skillspector/pyproject.toml's own version; pinned commit is dde36f2
+                version="2.3.9",
                 use_llm=True,
                 api_key=llm_api_key,
             )
@@ -128,7 +129,8 @@ def sandbox_engines(
             skillspector.make_adapter(
                 openai_base_url="http://127.0.0.1:0",  # never dialed, use_llm=False
                 ruleset_digest=_RULESET_DIGEST,
-                version="2.3.9",  # vendor/skillspector/pyproject.toml's own version; pinned commit is dde36f2
+                # vendor/skillspector/pyproject.toml's own version; pinned commit is dde36f2
+                version="2.3.9",
                 use_llm=False,
             )
         )

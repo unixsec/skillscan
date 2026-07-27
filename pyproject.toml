@@ -77,6 +77,12 @@ select = ["E", "F", "I", "UP", "B"]
 # call as an argument default is required, not a mutable-default-argument bug.
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Cookie"]
 
+# NOTE: cross-module ORM-import boundaries are checked by
+# scripts/check_import_boundaries.py, not by ruff. flake8-tidy-imports'
+# banned-api resolves relative imports to their absolute path before matching,
+# so it cannot express "another module's models are banned, your own are fine" -
+# it flagged all 74 `*.models` imports, including every module importing itself.
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

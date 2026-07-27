@@ -122,7 +122,10 @@ class TestParseOutput:
         # distinct from "0 vulnerabilities in packages that WERE scanned"
         # (returncode 0) and must not be conflated with a clean result.
         completed = subprocess.CompletedProcess(
-            args=["osv-scanner"], returncode=128, stdout=json.dumps({"results": []}).encode(), stderr=b""
+            args=["osv-scanner"],
+            returncode=128,
+            stdout=json.dumps({"results": []}).encode(),
+            stderr=b"",
         )
         with pytest.raises(ValueError, match="128"):
             osv.parse_output(completed, Path("."), {})

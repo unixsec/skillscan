@@ -51,7 +51,8 @@ def upgrade() -> None:
           status          VARCHAR(16) NOT NULL DEFAULT 'active',
           created_by      VARCHAR(255) NOT NULL,
           created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-          updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+          updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                            ON UPDATE CURRENT_TIMESTAMP(6),
           UNIQUE KEY uq_local_account_username (username)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
     """)
@@ -60,7 +61,8 @@ def upgrade() -> None:
           group_name      VARCHAR(255) NOT NULL PRIMARY KEY,
           role            VARCHAR(32) NOT NULL,
           updated_by      VARCHAR(255) NOT NULL,
-          updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+          updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                            ON UPDATE CURRENT_TIMESTAMP(6)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
     """)
 

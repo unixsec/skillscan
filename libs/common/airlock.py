@@ -149,11 +149,15 @@ def _parse_scan_jobs(response: list[Any]) -> list[ScanJobMessage]:
     return jobs
 
 
-async def ack_scan_job(redis: aioredis.Redis, message_id: str, *, group: str = WORKERS_GROUP) -> None:
+async def ack_scan_job(
+    redis: aioredis.Redis, message_id: str, *, group: str = WORKERS_GROUP
+) -> None:
     await redis.xack(SCANS_STREAM, group, message_id)
 
 
-async def delivery_count(redis: aioredis.Redis, message_id: str, *, group: str = WORKERS_GROUP) -> int:
+async def delivery_count(
+    redis: aioredis.Redis, message_id: str, *, group: str = WORKERS_GROUP
+) -> int:
     pending = await redis.xpending_range(
         SCANS_STREAM, group, min=message_id, max=message_id, count=1
     )

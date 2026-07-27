@@ -1,6 +1,5 @@
 #!/bin/bash
-# Push feat/m2-m8-platform (currently at commit 7b9c14d, includes the
-# code-review fix batch) to the dev VM, rebuild+redeploy all 3 images
+# Push the current working tree to the dev VM, rebuild+redeploy all 3 images
 # (monolith/engine-runner/web), then run the full backend test suite
 # against a fresh throwaway MySQL/Redis pair on the VM.
 #
@@ -17,7 +16,21 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 VM=parallels@10.211.55.10
 VM_PATH=/home/parallels/skillscan
 
-echo "=== [1/6] rsync working tree to VM ($VM_PATH) ==="
+echo "=== [1/7] static gates: ruff + mypy (the same three .ci/pipeline.yml runs) ==="
+# Deliberately run these HERE, on the Mac, before anything is shipped anywhere:
+# they need no MySQL/Redis/k3s, so CLAUDE.md's VM-only rule (which covers
+# deployment and integration testing) does not apply - and running them FIRST
+# means a lint/type regression fails in seconds instead of after a multi-minute
+# rsync plus three Docker builds. `set -e` aborts the whole script on any
+# failure, so a red gate can never reach the VM.
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+# Architecture boundary: no NEW cross-module ORM imports (stdlib-only, see the
+# script's docstring for why ruff's banned-api cannot express this rule).
+python3 scripts/check_import_boundaries.py
+
+echo "=== [2/7] rsync working tree to VM ($VM_PATH) ==="
 rsync -az --delete \
   --exclude='.git' \
   --exclude='.venv' \
@@ -34,7 +47,7 @@ rsync -az --delete \
   --exclude='deploy_and_test_vm.sh' \
   ./ "$VM:$VM_PATH/"
 
-echo "=== [2/6] rebuild all 3 images on the VM ==="
+echo "=== [3/7] rebuild all 3 images on the VM ==="
 ssh "$VM" bash -s <<'REMOTE_BUILD'
 set -euo pipefail
 cd /home/parallels/skillscan
@@ -46,7 +59,7 @@ echo "--- web ---"
 docker build -f web/Dockerfile -t skillscan/web:dev .
 REMOTE_BUILD
 
-echo "=== [3/6] import images into k3s containerd + rollout restart ==="
+echo "=== [4/7] import images into k3s containerd + rollout restart ==="
 ssh "$VM" bash -s <<'REMOTE_IMPORT'
 set -euo pipefail
 for img in monolith engine-runner web; do
@@ -78,7 +91,7 @@ echo "--- pods after rollout ---"
 kubectl get pods -n skillscan -o wide
 REMOTE_IMPORT
 
-echo "=== [4/6] health check ==="
+echo "=== [5/7] health check ==="
 ssh "$VM" bash -s <<'REMOTE_HEALTH'
 set -euo pipefail
 # --field-selector=status.phase=Running: right after `rollout restart`, the
@@ -98,10 +111,10 @@ for path in ('/healthz', '/readyz'):
 "
 REMOTE_HEALTH
 
-echo "=== [5/6] sweep for stray dev processes that could race the test suite ==="
+echo "=== [6/7] sweep for stray dev processes that could race the test suite ==="
 ssh "$VM" "ps aux | grep -E 'run_local\.py|uvicorn' | grep -v grep || echo '(none found)'"
 
-echo "=== [6/6] fresh throwaway MySQL/Redis + full pytest suite ==="
+echo "=== [7/7] fresh throwaway MySQL/Redis + full pytest suite ==="
 ssh "$VM" bash -s <<'REMOTE_TEST'
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -109,6 +122,13 @@ cd /home/parallels/skillscan
 
 echo "--- recreating throwaway test MySQL/Redis (host network) ---"
 docker rm -f skillscan-test-mysql skillscan-test-redis >/dev/null 2>&1 || true
+# Tear these down on ANY exit, not just the happy path: with `set -e` a failing
+# pytest run used to skip the cleanup at the bottom entirely and leave both
+# containers listening on the host network, where they silently became the
+# "throwaway" pair the NEXT run reused - carrying over mutated schema/data.
+# Same class of cross-run contamination the stray-process sweep in step 6 exists
+# to catch.
+trap 'docker rm -f skillscan-test-mysql skillscan-test-redis >/dev/null 2>&1 || true' EXIT
 docker run -d --name skillscan-test-mysql --network host \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=yes mysql:8 >/dev/null
 docker run -d --name skillscan-test-redis --network host redis:7 >/dev/null
@@ -133,10 +153,37 @@ SKILLSCAN_MIGRATION_DB_URL="mysql+aiomysql://root@localhost/skillscan" uv run al
 SKILLSCAN_ADMIN_DB_DSN="mysql://root@localhost/skillscan" uv run python3 db/setup_grants.py
 
 echo "--- full pytest suite ---"
-uv run pytest apps/monolith/tests/ -q 2>&1 | tail -100
+# Capture rather than pipe: `... | tail` reports tail's exit code, not pytest's,
+# which historically made a failing suite look successful. Capturing also lets
+# the known-failure filter below inspect the actual FAILED lines.
+set +e
+pytest_out=$(uv run pytest apps/monolith/tests/ -q 2>&1)
+pytest_rc=$?
+set -e
+echo "$pytest_out" | tail -100
 
-echo "--- cleanup throwaway test containers ---"
-docker rm -f skillscan-test-mysql skillscan-test-redis >/dev/null 2>&1 || true
+# test_vendor_engines.py's pin checks compare each vendored submodule against
+# its recorded commit via `git -C vendor/<x> rev-parse HEAD`. This VM's checkout
+# arrives by rsync with `--exclude=.git`, so those three tests can NEVER pass
+# here - they are an environment fact, not a regression.
+#
+# Filtering them out is what makes this script's exit code a TRUSTWORTHY signal:
+# leaving them in meant every single run exited non-zero, so a red exit code
+# carried no information and got ignored - exactly the failure mode that let the
+# old `| tee` exit-code bug hide for as long as it did. Any OTHER failure still
+# fails the run.
+if [ "$pytest_rc" -ne 0 ]; then
+  unexpected=$(echo "$pytest_out" | grep '^FAILED' | grep -v 'test_vendor_engines\.py' || true)
+  if [ -n "$unexpected" ]; then
+    echo "!!! UNEXPECTED test failures (not the known vendor-pin ones):"
+    echo "$unexpected"
+    exit 1
+  fi
+  known=$(echo "$pytest_out" | grep -c '^FAILED apps/monolith/tests/test_vendor_engines\.py' || true)
+  echo "--- $known known environment-only vendor-pin failure(s) (VM checkout has no .git) - not a regression"
+fi
+
+echo "--- cleanup throwaway test containers (also runs via the EXIT trap above) ---"
 REMOTE_TEST
 
 echo "=== DONE - paste the pytest summary (and anything marked !!! or FAILED above) back to Claude ==="

@@ -38,7 +38,9 @@ _logger = get_logger("skillscan.engine_runner.main")
 def _settings_from_env() -> dict[str, str]:
     return {
         "redis_url": os.environ.get("SKILLSCAN_REDIS_URL", "redis://localhost:6379/0"),
-        "blobstore_root": os.environ.get("SKILLSCAN_BLOBSTORE_ROOT", "/var/lib/skillscan/blobstore"),
+        "blobstore_root": os.environ.get(
+            "SKILLSCAN_BLOBSTORE_ROOT", "/var/lib/skillscan/blobstore"
+        ),
         "vllm_base_url": os.environ.get("SKILLSCAN_VLLM_BASE_URL", ""),
         "tick_interval_s": os.environ.get("SKILLSCAN_ENGINE_RUNNER_INTERVAL_S", "1.0"),
         # SKILLSCAN_VLLM_BASE_URL must resolve internally regardless (INV-14,
@@ -85,7 +87,13 @@ async def _ensure_sandbox_group_with_retry(redis: aioredis.Redis) -> None:
             last_exc = exc
             _logger.warning(
                 "engine-runner startup: sandbox consumer group not ready yet, retrying",
-                extra={"context": {"attempt": attempt, "max_attempts": _STARTUP_RETRY_ATTEMPTS, "error": str(exc)}},
+                extra={
+                    "context": {
+                        "attempt": attempt,
+                        "max_attempts": _STARTUP_RETRY_ATTEMPTS,
+                        "error": str(exc),
+                    }
+                },
             )
             await asyncio.sleep(_STARTUP_RETRY_DELAY_S)
     assert last_exc is not None
@@ -129,7 +137,9 @@ async def run() -> None:
                 redis, blobstore, engines_by_name=engines_by_name, consumer=consumer
             )
             if processed:
-                _logger.info("engine-runner tick processed jobs", extra={"context": {"count": processed}})
+                _logger.info(
+                    "engine-runner tick processed jobs", extra={"context": {"count": processed}}
+                )
         except Exception:
             _logger.exception("engine-runner tick failed - continuing")
         try:
