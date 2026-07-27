@@ -198,6 +198,52 @@ async def claim_results(
     return results
 
 
+async def reclaim_stale_results(
+    redis: aioredis.Redis,
+    *,
+    consumer: str,
+    min_idle_ms: int = STALE_CLAIM_IDLE_MS,
+) -> list[ResultMessage]:
+    """SECURITY (2026-07-28, VM re-review N-2): the results stream had NO
+    reclaim path, unlike the scans stream (`reclaim_stale_scan_jobs`).
+    `claim_results` reads `">"` only - new messages - so a collector that
+    crashed between `XREADGROUP` and `ack_result` left that message pending
+    forever, and nothing would ever re-trigger `_try_score_and_decide` for
+    that scan_id even though its findings blob was already durably on disk.
+    The scan then sits in `running` for good: `sweep_queued_jobs_to_airlock`
+    only handles `queued`, and `sweep_sandbox_wait_timeouts` cannot see it
+    either, because the collector never got far enough to set
+    `sandbox_wait_started_at`. Fail-stuck rather than fail-open - no verdict is
+    invented - but the submitter never gets an answer, which is a real outage.
+
+    (Before the F-2 fix this was masked by accident: the sweep selected on
+    `created_at`, so it happened to pick these scans up as a side effect of a
+    clock that was wrong for other reasons.)
+
+    Redelivery is safe here: `run_result_collector_tick` never accumulates
+    findings FROM the messages - it only uses them to learn which scan_ids to
+    look at, then reads each engine's blob from the blob store by name. A
+    duplicate message re-runs a decide attempt that the `scan_job.state`
+    single-flight guard turns into a no-op.
+    """
+    _cursor, messages, _deleted = await redis.xautoclaim(
+        RESULTS_STREAM, ORCHESTRATORS_GROUP, consumer, min_idle_time=min_idle_ms, start_id="0"
+    )
+    results: list[ResultMessage] = []
+    for message_id, fields in messages:
+        decoded = _decode_fields(fields)
+        results.append(
+            ResultMessage(
+                message_id=_decode(message_id),
+                scan_id=decoded["scan_id"],
+                findings_key=decoded["findings_key"],
+                engine=decoded["engine"],
+                status=decoded["status"],
+            )
+        )
+    return results
+
+
 async def ack_result(redis: aioredis.Redis, message_id: str) -> None:
     await redis.xack(RESULTS_STREAM, ORCHESTRATORS_GROUP, message_id)
 

@@ -8,7 +8,17 @@ from __future__ import annotations
 
 import unittest
 
-from skillscan_core import AllowlistEntry, EngineStatus, Severity, TrustTier, Verdict
+from skillscan_core import (
+    AllowlistEntry,
+    DetectionCategory,
+    EngineCapability,
+    EngineStatus,
+    Finding,
+    ScanResult,
+    Severity,
+    TrustTier,
+    Verdict,
+)
 from skillscan_core.gate import decide
 
 from tests._helpers import default_policy, make_finding, scan_result_from_findings
@@ -170,12 +180,17 @@ class TestGateScore(unittest.TestCase):
         self.assertEqual(verdict_result.score, 0)
 
     def test_required_engine_missing_scores_within_block_band(self) -> None:
+        # Pins to exactly 0, not merely "somewhere in [0, 39]": a fail-closed
+        # verdict means the scan couldn't be completed at all, so we know LESS
+        # about this package than about any package with real findings - it
+        # must pin to the band floor, never float up toward the band's top.
+        # (A loose 0<=score<=39 assertion here is exactly the kind of weak
+        # assertion that let the old top-of-band-39 inversion go unnoticed.)
         policy = default_policy(required_engines=frozenset({"static-keyword", "missing-engine"}))
         scan_result = scan_result_from_findings([], policy)
         verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
         self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
-        self.assertGreaterEqual(verdict_result.score, 0)
-        self.assertLessEqual(verdict_result.score, 39)
+        self.assertEqual(verdict_result.score, 0)
 
     def test_review_verdict_scores_within_review_band(self) -> None:
         policy = default_policy(
@@ -201,6 +216,63 @@ class TestGateScore(unittest.TestCase):
         finding = make_finding(rule_id="gate.hit", severity=Severity.LOW, confidence=1.0)
         scan_result = scan_result_from_findings([finding], policy)
         verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
+        self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
+        self.assertEqual(verdict_result.score, 0)
+
+    def test_dedup_restored_block_with_fully_waived_effective_set_scores_zero(self) -> None:
+        # Third band-floor path (2026-07-27 review finding): the dedup-signal-
+        # restoration block above can push verdict to BLOCK/REVIEW purely from
+        # scan_result.severity (pre-dedup, authoritative per INV-4/INV-5) while
+        # `effective` - the post-waiver set actually passed to security_score -
+        # ends up EMPTY, because the one surviving (non-collided) finding is
+        # itself legitimately waived. Scoring an empty `effective` under the
+        # ordinary formula lands at the band's TOP (39 for BLOCK) - the same
+        # "empty findings score highest" inversion the fail-closed/hard-gate
+        # branches were fixed for, reached through a third, previously-missed
+        # path. Constructed via a direct ScanResult (not scan_result_from_findings)
+        # because dedup_collision_rule_ids and the pre-dedup severity must be
+        # set independently of `findings`, exactly like a real dedup collision
+        # would leave them.
+        survivor = Finding(
+            rule_id="rule.x",
+            test_item_id="T",
+            category=DetectionCategory.CODE,
+            title="t",
+            severity=Severity.LOW,
+            confidence=1.0,
+            source_engine="e",
+            source_capability=EngineCapability.STATIC,
+            file_path="a.py",
+            start_line=1,
+            evidence_redacted="e",
+        )
+        scan_result = ScanResult(
+            content_hash="h" * 64,
+            severity=Severity.CRITICAL,
+            confidence_at_max=1.0,
+            trifecta_present=False,
+            hard_gate_hits=(),
+            findings=(survivor,),
+            engine_provenance=(),
+            findings_capped=False,
+            required_ok=True,
+            missing_or_failed_required=(),
+            dedup_collision_rule_ids=frozenset({"rule.y"}),
+        )
+        policy = default_policy(allowlistable_max_severity=Severity.HIGH)
+        allowlist = [
+            AllowlistEntry(
+                rule_id="rule.x",
+                scope_type="rule_global",
+                scope_value="",
+                expires_at=10_000.0,
+                requested_by="a",
+                approved_by="b",
+            )
+        ]
+        verdict_result = decide(
+            scan_result, policy, TrustTier.INTERNAL, allowlist=allowlist, now=0.0
+        )
         self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
         self.assertEqual(verdict_result.score, 0)
 

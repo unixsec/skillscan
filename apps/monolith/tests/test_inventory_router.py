@@ -252,7 +252,7 @@ class TestSetBaseline:
     # SECURITY (regression, was BUG): `inventory.service.set_baseline` had NO
     # HTTP-reachable caller anywhere - none of the mounted routers called it -
     # so a drift-detection baseline could never be established in any real
-    # deployment, and worker.py's rug-pull auto-quarantine logic (SUP-05)
+    # deployment, and worker.py's rug-pull auto-quarantine logic (SUPPLY-06)
     # could never fire. `POST /v1/inventory/{skill_id}/baseline` is the fix.
 
     @pytest.mark.asyncio

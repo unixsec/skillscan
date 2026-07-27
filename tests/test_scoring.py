@@ -223,14 +223,46 @@ class TestSecurityScore(unittest.TestCase):
         self.assertGreaterEqual(score, 0)
         self.assertLessEqual(score, 39)
 
-    def test_hard_gate_triggered_pins_score_to_the_band_floor(self) -> None:
+    def test_pin_to_floor_pins_score_to_the_band_floor_with_real_findings(self) -> None:
         # A single LOW-severity finding would ordinarily land well above 0 in
-        # the BLOCK band - hard-gate must override that, since INV-3 makes it
-        # the unwaivable, most-severe class regardless of the finding's own
-        # severity field.
+        # the BLOCK band - pin_to_floor must override that, since INV-3 makes
+        # a hard-gate hit the unwaivable, most-severe class regardless of the
+        # finding's own severity field.
         findings = [make_finding(rule_id="gate.hit", severity=Severity.LOW, confidence=1.0)]
-        score = security_score(Verdict.BLOCK, findings, hard_gate_triggered=True)
+        score = security_score(Verdict.BLOCK, findings, pin_to_floor=True)
         self.assertEqual(score, 0)
+
+    def test_pin_to_floor_puts_the_score_at_the_band_floor(self) -> None:
+        # Renamed from hard_gate_triggered: the behaviour is "pin to floor",
+        # and a hard-gate hit is only one of the reasons to ask for it.
+        self.assertEqual(security_score(Verdict.BLOCK, [], pin_to_floor=True), 0)
+        self.assertEqual(security_score(Verdict.REVIEW, [], pin_to_floor=True), 40)
+
+    def test_penalty_never_bottoms_out_so_the_band_keeps_discriminating(self) -> None:
+        # Before 2026-07-27 the penalty was a linear sum, so PASS bottomed out
+        # at 9 LOW findings and stayed at 75 forever after - 9 and 100 scored
+        # identically, exactly where discrimination matters most.
+        nine = [make_finding(rule_id=f"test.rule{i}", severity=Severity.LOW) for i in range(9)]
+        hundred = [make_finding(rule_id=f"test.rule{i}", severity=Severity.LOW) for i in range(100)]
+        score_nine = security_score(Verdict.PASS, nine)
+        score_hundred = security_score(Verdict.PASS, hundred)
+        self.assertGreater(score_nine, score_hundred)
+        self.assertGreater(score_nine, 75)
+        self.assertGreaterEqual(score_hundred, 75)
+
+    def test_two_versus_many_high_findings_differ_in_the_review_band(self) -> None:
+        two = [make_finding(rule_id=f"test.rule{i}", severity=Severity.HIGH) for i in range(2)]
+        ten = [make_finding(rule_id=f"test.rule{i}", severity=Severity.HIGH) for i in range(10)]
+        self.assertGreater(security_score(Verdict.REVIEW, two), security_score(Verdict.REVIEW, ten))
+
+    def test_a_more_severe_set_scores_lower_within_the_same_band(self) -> None:
+        # Directionality: the existing suite only ever asserted "inside the
+        # band", which is why the dead-letter inversion went unnoticed.
+        lows = [make_finding(rule_id=f"test.rule{i}", severity=Severity.LOW) for i in range(3)]
+        highs = [make_finding(rule_id=f"test.rule{i}", severity=Severity.HIGH) for i in range(3)]
+        self.assertGreater(
+            security_score(Verdict.REVIEW, lows), security_score(Verdict.REVIEW, highs)
+        )
 
     def test_more_findings_never_increase_the_score(self) -> None:
         one = [make_finding(rule_id="a", severity=Severity.MEDIUM, confidence=0.8)]

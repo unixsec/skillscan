@@ -33,7 +33,7 @@ users:
     tables:
       scan_job: ALL
       scan_result: ALL
-      baseline: [SELECT]  # SECURITY: drift.py (M4, SUP-05) reads the approved baseline only
+      baseline: [SELECT]  # SECURITY: drift.py (M4, SUPPLY-06) reads the approved baseline only
     database_privileges: [LOCK TABLES]  # scan_job SELECT ... FOR UPDATE (single-flight decide)
   svc_gate:
     password_env: SKILLSCAN_DB_PASSWORD_GATE

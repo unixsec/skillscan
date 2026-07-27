@@ -1,6 +1,7 @@
 """In-house zero-coverage detectors (coding spec §11.4, SRS Appendix A):
-DATA-06 (pii.py), FILE-06 (file_type.py), CODE-12 (crypto_weak.py),
-FILE-04 (toctou.py).
+CRED-06 (pii.py), FILE-01/FILE-02 (file_type.py), CODE-10 (crypto_weak.py),
+FILE-06 (toctou.py). (2026-07-27: corrected from the previously mislabelled
+DATA-06/FILE-06/CODE-12/FILE-04 - see each module's own docstring/D7 note.)
 
 SUP-06 (provenance.py, publisher-provenance/signature attestation) was
 removed 2026-07-24: in this deployment `ProvenanceDetector` was never

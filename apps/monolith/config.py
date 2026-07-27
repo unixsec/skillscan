@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     # backend (see services/engine_runner/adapters/aig.py's make_adapter()
     # docstring for why raising only one of the two does nothing).
     scan_deadline_s: float = 300.0
+    # How long the gate waits for the sandbox engines before deciding without
+    # them (D2, 2026-07-27). Deliberately equal to scan_deadline_s: the sandbox
+    # subprocesses are bounded by that same budget, so waiting longer cannot
+    # produce more results. sweep_sandbox_wait_timeouts adds its own small
+    # grace on top so an engine's own TIMEOUT report wins the race.
+    sandbox_wait_timeout_s: float = 300.0
     breakglass_enabled: bool = False
     # 2026-07-13 local-auth addition - same "disabled by default" posture as
     # breakglass_enabled (INV-17).

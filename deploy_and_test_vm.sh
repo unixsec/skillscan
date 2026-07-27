@@ -16,7 +16,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 VM=parallels@10.211.55.10
 VM_PATH=/home/parallels/skillscan
 
-echo "=== [1/7] static gates: ruff + mypy (the same three .ci/pipeline.yml runs) ==="
+echo "=== [1/8] static gates: ruff + mypy (the same three .ci/pipeline.yml runs) ==="
 # Deliberately run these HERE, on the Mac, before anything is shipped anywhere:
 # they need no MySQL/Redis/k3s, so CLAUDE.md's VM-only rule (which covers
 # deployment and integration testing) does not apply - and running them FIRST
@@ -30,7 +30,7 @@ uv run mypy
 # script's docstring for why ruff's banned-api cannot express this rule).
 python3 scripts/check_import_boundaries.py
 
-echo "=== [2/7] rsync working tree to VM ($VM_PATH) ==="
+echo "=== [2/8] rsync working tree to VM ($VM_PATH) ==="
 rsync -az --delete \
   --exclude='.git' \
   --exclude='.venv' \
@@ -47,7 +47,7 @@ rsync -az --delete \
   --exclude='deploy_and_test_vm.sh' \
   ./ "$VM:$VM_PATH/"
 
-echo "=== [3/7] rebuild all 3 images on the VM ==="
+echo "=== [3/8] rebuild all 3 images on the VM ==="
 ssh "$VM" bash -s <<'REMOTE_BUILD'
 set -euo pipefail
 cd /home/parallels/skillscan
@@ -59,7 +59,7 @@ echo "--- web ---"
 docker build -f web/Dockerfile -t skillscan/web:dev .
 REMOTE_BUILD
 
-echo "=== [4/7] import images into k3s containerd + rollout restart ==="
+echo "=== [4/8] import images into k3s containerd + rollout restart ==="
 ssh "$VM" bash -s <<'REMOTE_IMPORT'
 set -euo pipefail
 for img in monolith engine-runner web; do
@@ -91,7 +91,46 @@ echo "--- pods after rollout ---"
 kubectl get pods -n skillscan -o wide
 REMOTE_IMPORT
 
-echo "=== [5/7] health check ==="
+echo "=== [5/8] migrate the REAL k3s database (NOT the throwaway test pair) ==="
+# Added 2026-07-28 after a schema change shipped without this. Step 8 migrates a
+# THROWAWAY database it creates itself, so the suite went 1103-green while the
+# deployed monolith logged 88 "Unknown column 'sandbox_wait_started_at'" errors
+# against the real one. The test DB and the deployed DB had no consistency check
+# between them at all - green tests actively hid the broken deployment.
+#
+# Runs the real `alembic upgrade head` (never hand-stamped DDL) through a
+# port-forward, then VERIFIES the recorded revision advanced to the repo's head
+# and fails the whole script if it did not. An earlier hand-rolled version of
+# this step piped alembic into `tail` and swallowed the failure into a warning -
+# same class of bug as `| tee` masking pytest's exit code (see step 8).
+ssh "$VM" bash -s <<'REMOTE_MIGRATE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+cd /home/parallels/skillscan
+kubectl port-forward -n skillscan svc/mysql 13306:3306 >/tmp/pf-migrate.log 2>&1 &
+PF_PID=$!
+trap 'kill $PF_PID 2>/dev/null || true' EXIT
+for _ in $(seq 1 20); do
+  mysql -uroot -h 127.0.0.1 -P 13306 -e "SELECT 1" >/dev/null 2>&1 && break
+  sleep 1
+done
+mysql -uroot -h 127.0.0.1 -P 13306 -e "SELECT 1" >/dev/null 2>&1 || {
+  echo "!!! port-forward to the k3s MySQL never came up"; cat /tmp/pf-migrate.log; exit 1; }
+
+before=$(mysql -uroot -h 127.0.0.1 -P 13306 -N -e "SELECT version_num FROM skillscan.alembic_version;")
+echo "--- k3s DB revision before: $before"
+SKILLSCAN_MIGRATION_DB_URL="mysql+aiomysql://root@127.0.0.1:13306/skillscan" uv run alembic upgrade head
+after=$(mysql -uroot -h 127.0.0.1 -P 13306 -N -e "SELECT version_num FROM skillscan.alembic_version;")
+expected=$(uv run alembic heads | awk '{print $1}' | head -1)
+echo "--- k3s DB revision after:  $after   (repo head: $expected)"
+if [ "$after" != "$expected" ]; then
+  echo "!!! the k3s database is NOT at the repo's head revision - the deployed code"
+  echo "!!! expects a schema this database does not have. Refusing to continue."
+  exit 1
+fi
+REMOTE_MIGRATE
+
+echo "=== [6/8] health check ==="
 ssh "$VM" bash -s <<'REMOTE_HEALTH'
 set -euo pipefail
 # --field-selector=status.phase=Running: right after `rollout restart`, the
@@ -111,10 +150,10 @@ for path in ('/healthz', '/readyz'):
 "
 REMOTE_HEALTH
 
-echo "=== [6/7] sweep for stray dev processes that could race the test suite ==="
+echo "=== [7/8] sweep for stray dev processes that could race the test suite ==="
 ssh "$VM" "ps aux | grep -E 'run_local\.py|uvicorn' | grep -v grep || echo '(none found)'"
 
-echo "=== [7/7] fresh throwaway MySQL/Redis + full pytest suite ==="
+echo "=== [8/8] fresh throwaway MySQL/Redis + full pytest suite ==="
 ssh "$VM" bash -s <<'REMOTE_TEST'
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -126,7 +165,7 @@ docker rm -f skillscan-test-mysql skillscan-test-redis >/dev/null 2>&1 || true
 # pytest run used to skip the cleanup at the bottom entirely and leave both
 # containers listening on the host network, where they silently became the
 # "throwaway" pair the NEXT run reused - carrying over mutated schema/data.
-# Same class of cross-run contamination the stray-process sweep in step 6 exists
+# Same class of cross-run contamination the stray-process sweep in step 7 exists
 # to catch.
 trap 'docker rm -f skillscan-test-mysql skillscan-test-redis >/dev/null 2>&1 || true' EXIT
 docker run -d --name skillscan-test-mysql --network host \

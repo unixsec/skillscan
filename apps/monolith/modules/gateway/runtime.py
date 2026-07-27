@@ -81,3 +81,10 @@ class ScanRuntime:
     # raise both together via SKILLSCAN_SCAN_DEADLINE_S - raising only one of
     # the two does nothing, see aig.py's make_adapter() docstring.
     scan_deadline_s: float = 300.0
+    # orchestration.service.sweep_sandbox_wait_timeouts' own `wait_timeout_s`
+    # (D2, 2026-07-27) - how long the gate waits for the sandbox engines
+    # (bandit/osv-scanner/yara/skillspector) before deciding without them.
+    # Deliberately defaults to the same value as `scan_deadline_s`: the
+    # sandbox subprocesses are themselves bounded by that budget, so waiting
+    # longer than it cannot produce more results.
+    sandbox_wait_timeout_s: float = 300.0

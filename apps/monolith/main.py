@@ -449,6 +449,7 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
         signer=_build_signer(settings),
         default_trust_tier=TrustTier.INTERNAL,
         scan_deadline_s=settings.scan_deadline_s,
+        sandbox_wait_timeout_s=settings.sandbox_wait_timeout_s,
         reeval_session_factory=make_session_factory(reeval_engine),
         marketplace=_build_marketplace(),
         siem_notifier=_build_siem_notifier(settings),

@@ -1,5 +1,10 @@
-"""IOC matcher (coding spec §11.4 NET-06/07/08, SRS Cat-4 "恶意域名/恶意IP/恶意
+"""IOC matcher (coding spec §11.4 INTEL-01/02/03, SRS Cat-4 "恶意域名/恶意IP/恶意
 文件MD5").
+
+2026-07-27：原标签 NET-06/07/08 与检测目录不符——NET-06/07/08 在检测目录里分别是
+「SSRF」「下载并执行」「下载行为」，都不是威胁情报匹配；本模块实际对应的是
+D1 威胁情报匹配 INTEL-01（恶意文件命中情报）/INTEL-02（恶意域名）/INTEL-03（恶意
+IP），已修正。
 
 SECURITY: matches Skill content against the LOCAL `threat_indicator` table
 only - no outbound lookup, no live threat-intel API call (coding spec: "无出
@@ -51,7 +56,10 @@ _EXTRACTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("md5", _MD5_RE),
 )
 
-_TEST_ITEM_ID_BY_IOC_TYPE = {"domain": "NET-06", "ip": "NET-07", "md5": "NET-08"}
+# 2026-07-27：原标签与检测目录不符（NET-06/07/08 实际是 SSRF/下载并执行/下载行为），
+# 修正为 D1 威胁情报匹配条目：domain→INTEL-02（恶意域名），ip→INTEL-03（恶意IP），
+# md5→INTEL-01（恶意文件命中情报）。
+_TEST_ITEM_ID_BY_IOC_TYPE = {"domain": "INTEL-02", "ip": "INTEL-03", "md5": "INTEL-01"}
 
 # i18n + 安全风险描述（2026-07-24）：BUG 修复——这两处此前一直是未翻译的英文
 # 占位文本（2026-07-23 的中文化提交遗漏了本文件）。IOC 具体值受 INV-9 约束不能

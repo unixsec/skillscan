@@ -122,6 +122,73 @@ class TestParseSarif:
         findings = skillspector.parse_sarif(_sarif(results=[_sarif_result(ruleId=rule_id)]))
         assert findings[0].category is expected
 
+    @pytest.mark.parametrize(
+        ("rule_id", "expected_item"),
+        [
+            # 2026-07-27 (D7): a handful of skillspector's real, fixed ruleIds
+            # spot-checking _TEST_ITEM_ID_BY_RULE_ID against the catalog.
+            ("P1", "PROMPT-01"),  # 指令覆盖 - 直接提示词注入
+            ("P2", "PROMPT-03"),  # 隐藏指令 - 隐藏/带外指令
+            ("PE4", "PERM-03"),  # 访问 Docker Socket - 沙箱逃逸
+            ("SSRF1", "NET-06"),  # 访问云元数据服务 - SSRF
+            ("SC1", "SUPPLY-04"),  # 依赖未锁定版本 - 依赖锁定与混淆依赖
+            # 2026-07-27 (review correction): E5 (cloud-storage exfil via
+            # boto3/gsutil/Azure blob) is NET-04 "数据外传" (allowlist-exempt
+            # enterprise storage calls), NOT NET-03 "数据外传给风险平台"
+            # (untrusted platforms like free hosting/dnslog) - the original
+            # mapping would have misreported normal cloud-storage calls as
+            # Critical exfil to an untrusted platform.
+            ("E5", "NET-04"),
+        ],
+    )
+    def test_known_rule_id_maps_to_catalog_item(self, rule_id: str, expected_item: str) -> None:
+        findings = skillspector.parse_sarif(_sarif(results=[_sarif_result(ruleId=rule_id)]))
+        assert findings[0].test_item_id == expected_item
+
+    @pytest.mark.parametrize("rule_id", ["TP1", "TP2", "TP3", "TP4"])
+    def test_tool_poisoning_rule_ids_map_to_mcp_01(self, rule_id: str) -> None:
+        # 2026-07-27 (review follow-up): TP1-4 had no mapping at all and were
+        # silently falling to the GEN-01 fallback - unlike a raw-id
+        # passthrough, GEN-01 doesn't even preserve which ruleId produced the
+        # finding, so this was a real information loss, not just a label gap.
+        # mcp_tool_poisoning.py confirms all four are tool-description-
+        # poisoning checks (hidden instructions/Unicode deception/parameter
+        # injection/LLM description-behavior mismatch) - MCP-01 in the xlsx,
+        # whose detection means column explicitly lists both static_regex
+        # (TP1-3) and semantic_llm (TP4) as in-scope mechanisms for this one
+        # catalog item.
+        findings = skillspector.parse_sarif(_sarif(results=[_sarif_result(ruleId=rule_id)]))
+        assert findings[0].test_item_id == "MCP-01"
+
+    @pytest.mark.parametrize(
+        "rule_id",
+        [
+            # 2026-07-27 (review correction): both of these were originally
+            # mapped to a syntactically-valid but semantically-mismatched
+            # catalog item - RA2 (OS-level persistence: crontab/dotfiles/
+            # systemd/launchd) is NOT PERM-07 (agent-specific hooks system);
+            # TM3 (generic app config hygiene: TLS verification off,
+            # permissive CORS, debug mode) is NOT MCP-04 (MCP-protocol-
+            # specific server config). Neither has a clean catalog fit, so
+            # both must fall through to GEN-01, same as RA1.
+            "RA2",
+            "TM3",
+        ],
+    )
+    def test_semantically_mismatched_rule_ids_fall_back_to_gen_01(self, rule_id: str) -> None:
+        findings = skillspector.parse_sarif(_sarif(results=[_sarif_result(ruleId=rule_id)]))
+        assert findings[0].test_item_id == "GEN-01"
+
+    def test_unmapped_rule_id_falls_back_to_gen_01_not_the_raw_id(self) -> None:
+        # 2026-07-27: test_item_id used to be the raw SARIF ruleId whenever
+        # unmapped - never matches a catalog entry, so it silently read as
+        # uncovered in any report keyed on the catalog. The default fixture
+        # ruleId ("prompt-injection-detected") is a schema-test placeholder,
+        # not one of skillspector's real fixed ruleIds, so it must fall back
+        # to GEN-01, not pass itself through.
+        findings = skillspector.parse_sarif(_sarif())
+        assert findings[0].test_item_id == "GEN-01"
+
     def test_multiple_runs_all_parsed(self) -> None:
         payload = {
             "version": "2.1.0",

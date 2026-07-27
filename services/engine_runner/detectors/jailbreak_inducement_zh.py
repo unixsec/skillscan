@@ -30,12 +30,11 @@ from skillscan_core import (
     EngineCapability,
     EngineMetadata,
     EngineResult,
-    EngineStatus,
     Finding,
-    ScanMode,
     Severity,
 )
 
+from engine_runner.detectors._engine_base import run_with_deadline
 from engine_runner.detectors._text_utils import looks_binary
 
 _CATEGORY = DetectionCategory.INSTRUCTION
@@ -63,6 +62,28 @@ _A2 = r"(?:不受限制|无限制|越狱|无审查|无道德|没有(?:任何)?�
 # M2: persona/role noun
 _M2 = r"(?:AI|助手|角色|人工智能)"
 
+# confidence (D6, 2026-07-27 + follow-up review): single source of truth for
+# both scan()'s Finding.confidence and _metadata()'s digest input - see
+# prompt_injection_zh.py's _CONFIDENCE for the full rationale (this module
+# has the same "rules inline in scan(), no rule table" shape). All three
+# rules get the same value: each requires a two- or three-way co-occurrence,
+# stronger evidence than a single StaticKeywordEngine substring.
+_CONFIDENCE = 0.75
+
+# severity (2026-07-27 final review, F-3): single source of truth for both
+# scan()'s Finding.severity and _metadata()'s digest input, same reason as
+# _CONFIDENCE - severity drives the gate's block/review thresholds AND the
+# 0-100 score, so a severity-only rule edit must bust ruleset_digest/
+# toolchain_digest/cache_key or the corrected rule is served a stale cached
+# verdict. Note the three rules do NOT share one value (bypass_review and
+# roleplay_induction are HIGH, constraint_release MEDIUM), which is precisely
+# why a per-rule table rather than one module constant.
+_SEVERITIES: dict[str, Severity] = {
+    "jailbreak_zh.constraint_release": Severity.MEDIUM,
+    "jailbreak_zh.bypass_review": Severity.HIGH,
+    "jailbreak_zh.roleplay_induction": Severity.HIGH,
+}
+
 # 安全风险描述（2026-07-24）：受 INV-9 约束不能展示命中的原文行，这里给出每
 # 类规则固定的攻击手法说明（BUG 修复：此前这三条 evidence 一直是未翻译的英文
 # 占位文本，2026-07-23 的中文化提交遗漏了本文件）。
@@ -84,13 +105,25 @@ _ROLEPLAY_INDUCTION_RISK = (
 
 
 def _metadata() -> EngineMetadata:
+    # SECURITY (INV-7, D6 2026-07-27 follow-up review): confidence must be
+    # part of this hash - see _CONFIDENCE's docstring above for why a second,
+    # disconnected copy is exactly the bug being fixed here.
+    #
+    # SEVERITY too (2026-07-27 final review, F-3): that follow-up added
+    # confidence but left severity out, so changing a rule's severity left
+    # ruleset_digest -> toolchain_digest -> cache_key unchanged and every
+    # already-scanned package kept its old verdict.
     hasher = hashlib.sha256()
+    hasher.update(f"category:{_CATEGORY.value}\n".encode())
     for rule_id, pattern in (
         ("jailbreak_zh.constraint_release", _V2 + _N2A + _Q1),
         ("jailbreak_zh.bypass_review", _V2 + _N2B),
         ("jailbreak_zh.roleplay_induction", _P2 + _A2 + _M2),
     ):
-        hasher.update(f"{rule_id}:{pattern}\n".encode())
+        hasher.update(
+            f"{rule_id}:{pattern}:{_SEVERITIES[rule_id].value}:"
+            f"{_CONFIDENCE}:{_TEST_ITEM_ID}\n".encode()
+        )
     return EngineMetadata(
         name="inhouse-jailbreak-inducement-zh",
         version="1.0.0",
@@ -120,8 +153,12 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         test_item_id=_TEST_ITEM_ID,
                         category=_CATEGORY,
                         title="诱导提示：中文约束解除话术",
-                        severity=Severity.MEDIUM,
-                        confidence=0.7,
+                        severity=_SEVERITIES["jailbreak_zh.constraint_release"],
+                        # a three-way co-occurrence (release/evasion verb +
+                        # instruction-noun + source/temporal qualifier) is
+                        # stronger evidence than a single StaticKeywordEngine
+                        # substring - see _CONFIDENCE for the single-source note.
+                        confidence=_CONFIDENCE,
                         source_engine="inhouse-jailbreak-inducement-zh",
                         source_capability=EngineCapability.STATIC,
                         file_path=path,
@@ -137,8 +174,14 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         test_item_id=_TEST_ITEM_ID,
                         category=_CATEGORY,
                         title="诱导提示：中文绕过安全审查话术",
-                        severity=Severity.HIGH,
-                        confidence=0.7,
+                        severity=_SEVERITIES["jailbreak_zh.bypass_review"],
+                        # a two-way co-occurrence, but the noun half
+                        # ("安全审查"/"安全检测"/"内容过滤") is a specific enough
+                        # compound that it essentially never appears in
+                        # ordinary benign writing - as strong as the
+                        # three-way co-occurrence rules above. See
+                        # _CONFIDENCE for the single-source note.
+                        confidence=_CONFIDENCE,
                         source_engine="inhouse-jailbreak-inducement-zh",
                         source_capability=EngineCapability.STATIC,
                         file_path=path,
@@ -154,8 +197,12 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         test_item_id=_TEST_ITEM_ID,
                         category=_CATEGORY,
                         title="诱导提示：中文角色扮演越狱话术",
-                        severity=Severity.HIGH,
-                        confidence=0.7,
+                        severity=_SEVERITIES["jailbreak_zh.roleplay_induction"],
+                        # a three-way co-occurrence (roleplay-inducement verb
+                        # + unrestricted adjective + persona/role noun) is
+                        # stronger evidence than a single StaticKeywordEngine
+                        # substring - see _CONFIDENCE for the single-source note.
+                        confidence=_CONFIDENCE,
                         source_engine="inhouse-jailbreak-inducement-zh",
                         source_capability=EngineCapability.STATIC,
                         file_path=path,
@@ -175,10 +222,4 @@ class JailbreakInducementZhDetector:
         return _metadata()
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
-        return EngineResult(
-            engine=self.metadata,
-            findings=scan(files),
-            status=EngineStatus.OK,
-            scan_mode=ScanMode.STATIC,
-            llm_used=False,
-        )
+        return run_with_deadline(self.metadata, scan, files, deadline)

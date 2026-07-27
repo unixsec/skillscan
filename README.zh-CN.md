@@ -33,9 +33,26 @@ break-glass 不再是唯一可用的会话登录方式。那轮审计暴露的�
   PASS `[75,100]`），findings 再在档内调制。评分永远不作为 `decide()` 的输入
   ——正是这个数据流方向让「BLOCK 却拿高分」在结构上不可能发生，而不只是靠测试
   去堵。
+- **sandbox 层引擎真正参与裁决**。bandit / yara / skillspector / osv-scanner
+  此前只有恰好赶在裁决之前跑完才会被计入；现在裁决会等待它们，最长 300 秒。
+  等待是 advisory 的——某个 sandbox 引擎缺席只会记进 `reasons`，裁决照常进行，
+  单个引擎劣化不会 fail-close 掉整批扫描。代价是时延：扫描从毫秒级变为分钟级，
+  而扫描详情页尚无自动刷新。
+- **两个新增 floor 检测器**，`required_engines` 由 7 增至 9：随包 `.mcp.json`
+  （server 定义中的命令注入、非本机端点、疑似凭据的环境变量透传）与 `SKILL.md`
+  frontmatter 权限声明（过度授权组合、未声明权限）。两者都是纯静态分析——
+  `.mcp.json` 检测器从不连接它读到的那些端点。声明的权限现已按 skill 版本持久化。
+- **逐规则置信度**取代此前"每引擎一个常数"，按证据强度分档：结构化验证的匹配
+  约 0.9，特征明确的 API 调用形态 0.7-0.8，裸子串 0.4-0.5。这让一条此前不可达的
+  门禁策略分支重新生效——因为过去 floor 层从未产出低于其阈值的置信度。对 836 条
+  真实历史判定实测，该改动使 2.3% 的扫描由 PASS 变为 REVIEW。
+- **检测目录编号的正确性**。每条 finding 都带一个来自检测目录的 `test_item_id`；
+  此前有若干引擎写出的是自己的内部规则名、或是目录里根本不存在的编号，导致按目录
+  统计的合规报表把真实运行着的能力误判为未覆盖。现已加测试断言：凡引擎可能发出的
+  编号必须是目录中的真实条目——**形状检查抓不住一个形状完全合法的错误编号**。
 
-**951 个后端测试**针对真实 MySQL/Redis 全部通过（不 mock 被测系统），另有
-**117 个内核测试**（`tests/`，纯 `skillscan_core`，仅依赖标准库）。
+**1103 个后端测试**针对真实 MySQL/Redis 全部通过（不 mock 被测系统），另有
+**182 个内核测试**（`tests/`，纯 `skillscan_core`，仅依赖标准库）。
 `ruff check` / `ruff format --check` / `mypy --strict` 全部干净，
 `scripts/check_import_boundaries.py` 守住跨模块 ORM 边界——每个模块拥有自己的
 表和自己的最小权限数据库账号，这个检查防止代码侧的边界被侵蚀。前端（`web/`，
@@ -55,8 +72,8 @@ Node/npm。
 
 ```bash
 uv sync                    # 安装全部依赖（后端 + 开发工具）到 .venv
-uv run pytest -q           # 针对本地 MySQL/Redis 跑后端测试套件（951 个测试）
-uv run pytest tests/ -q    # 内核测试套件，无外部依赖（117 个测试）
+uv run pytest -q           # 针对本地 MySQL/Redis 跑后端测试套件（1103 个测试）
+uv run pytest tests/ -q    # 内核测试套件，无外部依赖（182 个测试）
 uv run mypy                # 严格类型检查
 uv run ruff check .        # lint
 uv run ruff format --check .

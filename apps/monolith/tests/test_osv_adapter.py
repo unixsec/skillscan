@@ -1,4 +1,4 @@
-"""Tests for `engine_runner.adapters.osv` (coding spec §10) → SUP-01.
+"""Tests for `engine_runner.adapters.osv` (coding spec §10) → SUPPLY-02.
 
 Exercises `parse_output` against representative JSON payloads shaped like the
 real schema (confirmed by reading `vendor/osv-scanner/pkg/models/results.go`
@@ -76,7 +76,16 @@ class TestParseOutput:
         findings = osv.parse_output(_completed(_payload()), Path("."), {})
         assert len(findings) == 1
         assert "requests@2.25.0" in findings[0].title
-        assert findings[0].test_item_id == "SUP-01"
+        # 2026-07-27 (final review, F-1): this assertion previously read
+        # `== "SUP-01"`, i.e. it locked the defect in - "SUP-01" is not a row
+        # of 企业Skill安全评估测试维度清单.xlsx at all (D8 is SUPPLY-01…
+        # SUPPLY-06). A test that asserts the buggy value is worse than no
+        # test: it converts the bug into a documented contract. The real
+        # catalog item for known-CVE dependency findings is SUPPLY-02
+        # (使用已知脆弱组件, 检测手段 sca_osv), the same item skillspector's
+        # SC4/SC5 map to. tests/test_test_item_catalog.py is the cross-registry
+        # guard that would have caught this class of error in the first place.
+        assert findings[0].test_item_id == "SUPPLY-02"
         assert findings[0].category is DetectionCategory.SUPPLY_CHAIN
 
     def test_source_path_set_as_file_path(self) -> None:

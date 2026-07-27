@@ -47,6 +47,7 @@ async def decide_and_record(
     signer: SignerPort,
     operator: str,
     now: float,
+    extra_reasons: Sequence[str] = (),
 ) -> VerdictResult:
     """SECURITY: caller must invoke this within `async with session.begin():` (or
     equivalent) - the atomicity guarantee is the caller's transaction boundary,
@@ -54,8 +55,18 @@ async def decide_and_record(
     with whatever else the calling request handler needs in the same transaction.
     `scan_id` is the orchestration-assigned UUID for this scan (coding spec §7.1
     scan_job.scan_id) - always supplied by the caller, never derived here.
+
+    `extra_reasons` (D2, 2026-07-27): appended to the recorded `VerdictRow.reasons`
+    (and the audit intent's mirrored `reasons`) alongside whatever `gate.decide()`
+    itself produced - orchestration's sandbox-wait sweep uses this to record
+    `sandbox_wait_timeout:<engines>` when a verdict is forced through without
+    every sandbox engine reporting. Deliberately NOT threaded into `decide()`'s
+    own pure-function signature (that would pollute the kernel with an
+    orchestration-layer concern); NOT part of the signed JWS payload either -
+    only `reasons` gains it, exactly like any other post-decide bookkeeping.
     """
     verdict_result = decide(scan_result, policy, trust_tier, allowlist, now=now)
+    reasons = list(verdict_result.reasons) + list(extra_reasons)
 
     jws = await signer.sign_verdict(
         {
@@ -82,7 +93,7 @@ async def decide_and_record(
             jws_signature=jws,
             effective_severity=int(verdict_result.effective_severity),
             score=verdict_result.score,
-            reasons=list(verdict_result.reasons),
+            reasons=reasons,
             issued_at=_naive_utcnow(),
         )
     )
@@ -114,7 +125,7 @@ async def decide_and_record(
                 "content_hash": scan_result.content_hash,
                 "verdict": verdict_result.verdict.name,
                 "policy_version": verdict_result.policy_version,
-                "reasons": list(verdict_result.reasons),
+                "reasons": reasons,
             },
         )
     )

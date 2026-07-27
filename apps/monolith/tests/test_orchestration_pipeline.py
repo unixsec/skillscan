@@ -9,14 +9,30 @@ engine substitutes for a real sandboxed worker (coding spec §10, M4/M5).
 from __future__ import annotations
 
 import asyncio
+import datetime
+import json
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
 from common import airlock
-from common.blobstore import LocalFilesystemBlobStore, artifact_key
-from skillscan_core import DetectionEngine, GatePolicy, StaticKeywordEngine, TrustTier, Verdict
+from common.blobstore import LocalFilesystemBlobStore, artifact_key, findings_key
+from schemas.findings import serialize_engine_result
+from skillscan_core import (
+    DetectionEngine,
+    EngineCapability,
+    EngineMetadata,
+    EngineResult,
+    EngineStatus,
+    Finding,
+    GatePolicy,
+    ScanMode,
+    StaticKeywordEngine,
+    TrustTier,
+    Verdict,
+)
 from skillscan_core import content_hash as compute_content_hash
 from sqlalchemy import select
 
@@ -26,9 +42,11 @@ from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.orchestration import service as orchestration_service
 from monolith.modules.orchestration.models import ScanJob
 from monolith.modules.orchestration.service import (
+    _try_score_and_decide,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
     submit_scan,
+    sweep_sandbox_wait_timeouts,
 )
 from monolith.tests.conftest import SessionmakerFixture
 
@@ -43,6 +61,98 @@ def _policy(*, version: str) -> GatePolicy:
         hard_gate_rules=frozenset(),
         fail_closed_verdict=Verdict.BLOCK,
     )
+
+
+# 2026-07-27 (D2, TestSandboxWait below): a single shared policy/signer is
+# fine here - unlike TestHappyPathEndToEnd's per-test versioned `_policy()`,
+# nothing in TestSandboxWait exercises `submit_scan`'s cache_key dedup (each
+# test builds its own scan_id/content_hash directly via
+# `_seed_scan_with_all_required_blobs`), so there is no collision to avoid by
+# varying `version` per test.
+_POLICY = _policy(version="test-sandbox-wait")
+
+
+def _signer() -> LocalDevSigner:
+    return LocalDevSigner()
+
+
+def _write_engine_blob(
+    blobstore: LocalFilesystemBlobStore,
+    scan_id: str,
+    engine_name: str,
+    *,
+    findings: Sequence[Finding] = (),
+) -> None:
+    """Writes a real, schema-valid findings blob directly to the blob store -
+    the same shape `run_mock_engine_worker_tick`/the real engine-runner would
+    write - without going through either dispatch path. Used by
+    TestSandboxWait to simulate "this engine already reported" independent of
+    whichever engine (required or sandbox/advisory) is under test."""
+    result = EngineResult(
+        engine=EngineMetadata(
+            name=engine_name,
+            version="test",
+            ruleset_digest="test",
+            capabilities=frozenset({EngineCapability.STATIC}),
+        ),
+        findings=tuple(findings),
+        status=EngineStatus.OK,
+        scan_mode=ScanMode.STATIC,
+        llm_used=False,
+    )
+    blobstore.put(
+        findings_key(scan_id, engine_name),
+        json.dumps(serialize_engine_result(result)).encode("utf-8"),
+    )
+
+
+async def _seed_scan_with_all_required_blobs(
+    orchestration_sessionmaker: SessionmakerFixture,
+    blobstore: LocalFilesystemBlobStore,
+    redis_client: aioredis.Redis,
+    *,
+    created_at: datetime.datetime | None = None,
+    sandbox_wait_started_at: datetime.datetime | None = None,
+    state: str = "queued",
+) -> str:
+    """TestSandboxWait's shared setup: a scan_job row (built directly, bypassing
+    `submit_scan`'s dedup/artifact-packing plumbing, which this test class
+    doesn't need) with every one of `_POLICY.required_engines` already
+    reporting BOTH a findings blob and an airlock result message - exactly
+    what a real floor-engine dispatch tick writes - so
+    `_try_score_and_decide`'s required-engines wait is already satisfied
+    before any test in this class runs, and only the sandbox
+    (waited_advisory) engine's absence is ever under test. The result
+    messages matter specifically for
+    `test_a_long_wait_does_not_trip_the_poison_pill_counter`, which drives
+    `run_result_collector_tick` (message-driven) rather than calling
+    `_try_score_and_decide` directly like the rest of this class."""
+    await airlock.ensure_groups(redis_client)
+    scan_id = str(uuid.uuid4())
+    content_hash = uuid.uuid4().hex + uuid.uuid4().hex  # 64 hex chars, unique
+    async with orchestration_sessionmaker() as session, session.begin():
+        session.add(
+            ScanJob(
+                scan_id=scan_id,
+                content_hash=content_hash,
+                toolchain_digest=uuid.uuid4().hex + uuid.uuid4().hex,
+                cache_key=uuid.uuid4().hex + uuid.uuid4().hex,
+                state=state,
+                submitter="test-sandbox-wait",
+                created_at=created_at or datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                sandbox_wait_started_at=sandbox_wait_started_at,
+            )
+        )
+    for engine_name in sorted(_POLICY.required_engines):
+        _write_engine_blob(blobstore, scan_id, engine_name, findings=[])
+        await airlock.produce_result(
+            redis_client,
+            scan_id=scan_id,
+            findings_key=findings_key(scan_id, engine_name),
+            engine=engine_name,
+            status=EngineStatus.OK.value,
+        )
+    return scan_id
 
 
 def _unique_file(*, marker: str, benign: bool) -> list[tuple[str, int, bytes]]:
@@ -206,6 +316,28 @@ class TestSingleFlightDedup:
                 .all()
             )
         assert len(count) == 1
+
+
+class TestParseSkillNameRootPathOnly:
+    """2026-07-27: `_parse_skill_name` must match SKILL.md at the package
+    ROOT only, never by basename anywhere in the tree - it supplies the
+    display name written to `ScanJob.skill_name`, and a bundled example
+    (`examples/SKILL.md`) must never masquerade as the whole package's name.
+    Pure function, no DB/Redis - unlike the rest of this file, these run
+    locally with no fixtures."""
+
+    def test_a_non_root_skill_md_is_ignored_not_used_as_the_name(self) -> None:
+        files = [
+            ("examples/SKILL.md", 0o644, b"---\nname: example-only\n---\n"),
+        ]
+        assert orchestration_service._parse_skill_name(files) is None
+
+    def test_a_root_skill_md_still_populates_the_name_regression_guard(self) -> None:
+        files = [
+            ("SKILL.md", 0o644, b"---\nname: real-skill\n---\n"),
+            ("examples/SKILL.md", 0o644, b"---\nname: example-only\n---\n"),
+        ]
+        assert orchestration_service._parse_skill_name(files) == "real-skill"
 
 
 class TestSkillNameParsing:
@@ -765,3 +897,723 @@ class TestResultCollectorExceptionIsolation:
             f"expected ONLY the bad scan_id's message(s) still pending, got "
             f"pending_scan_ids={pending_scan_ids}"
         )
+
+
+class TestSandboxWait:
+    """2026-07-27 (D2): the gate now waits for the sandbox engines instead of
+    deciding the moment the in-process floor engines finish. Their findings
+    were durably written but only counted when they happened to win a race."""
+
+    @pytest.mark.asyncio
+    async def test_decision_waits_while_a_sandbox_blob_is_missing(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        assert decided is False, "must not decide while a waited sandbox engine has no blob"
+
+    @pytest.mark.asyncio
+    async def test_decision_proceeds_once_the_sandbox_blob_lands(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        _write_engine_blob(blobstore, scan_id, "bandit", findings=[])
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        assert decided is True
+
+    @pytest.mark.asyncio
+    async def test_force_decide_proceeds_without_the_sandbox_blob(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+            force_decide=True,
+        )
+        assert decided is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_records_which_engines_did_not_arrive(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The reason string is how an operator learns this verdict was made
+        with fewer engines than usual - a silent downgrade would be worse than
+        the delay this feature costs."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit", "yara"),
+            force_decide=True,
+        )
+        async with gate_sessionmaker() as s:
+            row = (
+                await s.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        joined = " ".join(row.reasons)
+        assert "sandbox_wait_timeout" in joined
+        assert "bandit" in joined and "yara" in joined
+
+    @pytest.mark.asyncio
+    async def test_a_long_wait_does_not_trip_the_poison_pill_counter(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """SECURITY (D2.4): result messages are ACKed even when the scan is not
+        yet decidable, so waiting cannot cause redelivery and cannot consume
+        MAX_DELIVERY_COUNT. Without this, a wait longer than
+        STALE_CLAIM_IDLE_MS (60s) would manufacture a fake fail-closed BLOCK."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        consumer = "test-consumer"
+        for _ in range(airlock.MAX_DELIVERY_COUNT + 2):
+            await run_result_collector_tick(
+                redis_client,
+                blobstore,
+                orchestration_sessionmaker,
+                gate_sessionmaker,
+                policy=_POLICY,
+                trust_tier=TrustTier.INTERNAL,
+                allowlist=(),
+                signer=_signer(),
+                consumer=consumer,
+                waited_advisory_engines=("bandit",),
+            )
+        async with orchestration_sessionmaker() as s:
+            job = (await s.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))).scalar_one()
+        assert job.state in ("queued", "running"), "still waiting, not dead-lettered"
+
+        # The actual SECURITY property under test (2026-07-27 review, Important
+        # 3): RESULTS_STREAM/ORCHESTRATORS_GROUP has no reclaim/XCLAIM path
+        # anywhere in this codebase, so a message that was never ACKed would
+        # just sit pending forever rather than being redelivered - the
+        # `job.state` assertion above would pass identically whether or not
+        # `run_result_collector_tick` actually ACKs while still waiting. Prove
+        # the ACK happened for real via XPENDING, same primitive
+        # `TestResultCollectorExceptionIsolation` already uses below, just
+        # asserting ABSENCE for a scan that's still waiting rather than
+        # PRESENCE for one whose decide raised.
+        pending = await redis_client.xpending_range(
+            airlock.RESULTS_STREAM,
+            airlock.ORCHESTRATORS_GROUP,
+            min="-",
+            max="+",
+            count=1000,
+            consumername=consumer,
+        )
+        pending_scan_ids: set[str] = set()
+        for p in pending:
+            message_id = (
+                p["message_id"].decode() if isinstance(p["message_id"], bytes) else p["message_id"]
+            )
+            entries = await redis_client.xrange(
+                airlock.RESULTS_STREAM, min=message_id, max=message_id, count=1
+            )
+            if not entries:
+                continue
+            _mid, fields = entries[0]
+            decoded_fields = {
+                (k.decode() if isinstance(k, bytes) else k): (
+                    v.decode() if isinstance(v, bytes) else v
+                )
+                for k, v in fields.items()
+            }
+            pending_scan_ids.add(decoded_fields["scan_id"])
+        assert scan_id not in pending_scan_ids, (
+            "this scan_id's result message(s) are still pending/unacked - waiting "
+            "must ACK on arrival, never leave a message for (nonexistent) redelivery"
+        )
+
+
+_WAIT_TIMEOUT_S = 300.0
+
+
+def _ago(seconds: float) -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - datetime.timedelta(
+        seconds=seconds
+    )
+
+
+async def _verdict_exists(gate_sessionmaker: SessionmakerFixture, scan_id: str) -> bool:
+    async with gate_sessionmaker() as session:
+        row = (
+            await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+        ).scalar_one_or_none()
+    return row is not None
+
+
+async def _sweep(
+    blobstore: LocalFilesystemBlobStore,
+    orchestration_sessionmaker: SessionmakerFixture,
+    gate_sessionmaker: SessionmakerFixture,
+) -> int:
+    return await sweep_sandbox_wait_timeouts(
+        blobstore,
+        orchestration_sessionmaker,
+        gate_sessionmaker,
+        policy=_POLICY,
+        trust_tier=TrustTier.INTERNAL,
+        allowlist=(),
+        signer=_signer(),
+        waited_advisory_engines=("bandit",),
+        wait_timeout_s=_WAIT_TIMEOUT_S,
+        operator="test-sweep",
+    )
+
+
+class _BlobStoreRaisingFor:
+    """Delegates to a real blob store but raises for one scan_id's keys, so a
+    single scan inside a sweep batch fails the way a real transient blob-store
+    error would."""
+
+    def __init__(self, inner: LocalFilesystemBlobStore, poisoned_scan_id: str) -> None:
+        self._inner = inner
+        self._poisoned = poisoned_scan_id
+
+    def _guard(self, key: str) -> None:
+        if self._poisoned in key:
+            raise RuntimeError("simulated blob-store failure")
+
+    def put(self, key: str, data: bytes) -> None:
+        self._guard(key)
+        self._inner.put(key, data)
+
+    def get(self, key: str) -> bytes:
+        self._guard(key)
+        return self._inner.get(key)
+
+    def list_prefix(self, prefix: str) -> list[str]:
+        return self._inner.list_prefix(prefix)
+
+    def exists(self, key: str) -> bool:
+        self._guard(key)
+        return self._inner.exists(key)
+
+
+class TestSandboxWaitSweep:
+    """`sweep_sandbox_wait_timeouts` had ZERO test coverage before 2026-07-27
+    (nothing anywhere called it; `TestSandboxWait` above only drives
+    `_try_score_and_decide(force_decide=True)` directly). Its selection
+    predicate, ordering, batch limit and per-scan error isolation were all
+    unexercised - which is how the wrong clock survived: the sweep's own
+    behaviour was never observed by a test at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_scan_that_has_only_just_started_waiting_is_not_swept(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """REGRESSION (final review, F-2). The sweep measured from `created_at`,
+        so this exact row - submitted 10 minutes ago, but whose floor blobs
+        only landed a moment ago after a worker outage - was force-decided in
+        the same tick that produced it. The verdict is then signed from floor
+        findings only: a package whose only HIGH finding comes from bandit gets
+        PASS instead of REVIEW, which is precisely the backlog case D2's own
+        comments enumerate.
+        """
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            created_at=_ago(600),  # a long-queued submission...
+            sandbox_wait_started_at=_ago(1),  # ...that only just started waiting
+        )
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 0
+        assert not await _verdict_exists(gate_sessionmaker, scan_id)
+
+    @pytest.mark.asyncio
+    async def test_a_scan_that_never_started_waiting_is_never_swept(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """NULL means "has never started waiting" - an ancient row that never
+        reached the wait must not be selected at all."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            created_at=_ago(86_400),
+            sandbox_wait_started_at=None,
+        )
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 0
+        assert not await _verdict_exists(gate_sessionmaker, scan_id)
+
+    @pytest.mark.asyncio
+    async def test_a_wait_past_the_budget_is_forced_through(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The sweep's actual purpose: once the wait itself is past
+        timeout+grace, decide and record WHICH engine never arrived."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=_ago(
+                _WAIT_TIMEOUT_S + orchestration_service._SWEEP_GRACE_S + 60
+            ),
+        )
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 1
+        async with gate_sessionmaker() as session:
+            row = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        assert "sandbox_wait_timeout:bandit" in " ".join(row.reasons)
+
+    @pytest.mark.asyncio
+    async def test_a_wait_inside_the_grace_window_is_not_swept_yet(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The grace exists so the engine's own TIMEOUT blob - a more
+        informative outcome than our guess - wins the race."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=_ago(_WAIT_TIMEOUT_S + 1),
+        )
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 0
+        assert not await _verdict_exists(gate_sessionmaker, scan_id)
+
+    @pytest.mark.asyncio
+    async def test_an_already_decided_scan_is_not_swept_again(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=_ago(100_000),
+            state="decided",
+        )
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 0
+        assert not await _verdict_exists(gate_sessionmaker, scan_id)
+
+    @pytest.mark.asyncio
+    async def test_the_longest_waiting_scans_go_first_within_the_batch_limit(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ordering is by the SAME column the cutoff filters on, so "oldest"
+        means "waiting longest", not "submitted first". Without it, a cluster
+        of rows that keeps raising could occupy the whole batch every tick and
+        starve everything behind it."""
+        monkeypatch.setattr(orchestration_service, "_SWEEP_BATCH", 2)
+        base = _WAIT_TIMEOUT_S + orchestration_service._SWEEP_GRACE_S + 60
+        waited_longest = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            created_at=_ago(10),  # newest submission, longest wait
+            sandbox_wait_started_at=_ago(base + 300),
+        )
+        waited_middle = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=_ago(base + 200),
+        )
+        waited_least = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            created_at=_ago(100_000),  # oldest submission, shortest wait
+            sandbox_wait_started_at=_ago(base + 100),
+        )
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 2
+        assert await _verdict_exists(gate_sessionmaker, waited_longest)
+        assert await _verdict_exists(gate_sessionmaker, waited_middle)
+        assert not await _verdict_exists(gate_sessionmaker, waited_least)
+
+    @pytest.mark.asyncio
+    async def test_one_failing_scan_does_not_stop_the_rest_of_the_batch(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        over_budget = _ago(_WAIT_TIMEOUT_S + orchestration_service._SWEEP_GRACE_S + 60)
+        poisoned = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=over_budget,
+        )
+        healthy = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=over_budget,
+        )
+        failing_blobstore = _BlobStoreRaisingFor(blobstore, poisoned)
+        decided = await sweep_sandbox_wait_timeouts(
+            failing_blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            waited_advisory_engines=("bandit",),
+            wait_timeout_s=_WAIT_TIMEOUT_S,
+            operator="test-sweep",
+        )
+        assert decided == 1
+        assert await _verdict_exists(gate_sessionmaker, healthy)
+        assert not await _verdict_exists(gate_sessionmaker, poisoned)
+
+
+class TestSandboxWaitClock:
+    """The other half of F-2: the sweep can only measure the wait if something
+    records when it began."""
+
+    @pytest.mark.asyncio
+    async def test_the_clock_starts_when_a_sandbox_engine_is_first_seen_missing(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        async with orchestration_sessionmaker() as session:
+            before = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+            assert before.sandbox_wait_started_at is None
+
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        assert decided is False
+        async with orchestration_sessionmaker() as session:
+            after = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert after.sandbox_wait_started_at is not None
+
+    @pytest.mark.asyncio
+    async def test_the_clock_is_never_pushed_forward_by_a_later_tick(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """Every collector tick re-observes the same missing engine. Refreshing
+        the timestamp each time would push the deadline out forever and the
+        sweep would never fire."""
+        started = _ago(1_000)
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker,
+            blobstore,
+            redis_client,
+            sandbox_wait_started_at=started,
+        )
+        await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        async with orchestration_sessionmaker() as session:
+            after = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert after.sandbox_wait_started_at == started
+
+    @pytest.mark.asyncio
+    async def test_the_clock_does_not_start_before_the_required_engines_report(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """A scan whose floor engines were never dispatched is not "waiting for
+        the sandbox" - it must stay NULL, and therefore stay out of the sweep,
+        rather than accumulating a wait it never began."""
+        scan_id = str(uuid.uuid4())
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanJob(
+                    scan_id=scan_id,
+                    content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                    toolchain_digest=uuid.uuid4().hex + uuid.uuid4().hex,
+                    cache_key=uuid.uuid4().hex + uuid.uuid4().hex,
+                    state="queued",
+                    submitter="test-sandbox-wait",
+                    created_at=_ago(100_000),
+                )
+            )
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        assert decided is False
+        async with orchestration_sessionmaker() as session:
+            after = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert after.sandbox_wait_started_at is None
+        assert await _sweep(blobstore, orchestration_sessionmaker, gate_sessionmaker) == 0
+
+
+async def _verdict_is_duplicated(gate_sessionmaker: SessionmakerFixture, scan_id: str) -> bool:
+    async with gate_sessionmaker() as session:
+        rows = (
+            await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+        ).all()
+    return len(rows) > 1
+
+
+class TestResultMessageLossStillConverges:
+    """VM re-review, N-2: the results stream had no reclaim path at all
+    (`claim_results` reads `">"` only, and unlike the scans stream there was no
+    `reclaim_stale_*` counterpart). A collector that crashed between
+    `XREADGROUP` and `ack_result` stranded that message forever - and with it
+    the scan, whose findings blob was already durably written but which nothing
+    would ever look at again. `sweep_queued_jobs_to_airlock` only handles
+    `queued`, and `sweep_sandbox_wait_timeouts` cannot see it either because
+    the collector never reached the point where it sets
+    `sandbox_wait_started_at`.
+
+    CAUTION, and the reason this class is shaped the way it is: this codebase
+    already had one falsely-green test sitting on exactly this hole -
+    `test_a_long_wait_does_not_trip_the_poison_pill_counter` was constant-green
+    precisely BECAUSE nothing redelivers on this stream, so deleting the ACK it
+    was meant to prove changed nothing. So these tests do not assert on
+    XPENDING bookkeeping; they simulate the crash for real (claim without
+    acking, then drop the consumer) and assert the scan reaches a VERDICT.
+    That assertion is false without the reclaim path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_scan_still_reaches_a_verdict_after_its_result_message_is_stranded(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        # Simulate the crash: a dead consumer claims every pending result
+        # message and never ACKs one of them. `">"` will never hand these to
+        # anybody again.
+        dead_consumer = f"crashed-{uuid.uuid4().hex[:8]}"
+        claimed = await airlock.claim_results(redis_client, consumer=dead_consumer, count=100)
+        assert any(r.scan_id == scan_id for r in claimed), "setup: message must have been claimed"
+
+        live_consumer = f"live-{uuid.uuid4().hex[:8]}"
+        assert (
+            await airlock.claim_results(
+                redis_client, consumer=live_consumer, count=100, block_ms=10
+            )
+            == []
+        ), "setup: a stranded message must be invisible to a fresh consumer via '>'"
+
+        decided = await run_result_collector_tick(
+            redis_client,
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            policy=_POLICY,
+            trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            consumer=live_consumer,
+            # 0ms: take over immediately rather than sleeping out the real
+            # 60s STALE_CLAIM_IDLE_MS. The production default is unchanged.
+            reclaim_idle_ms=0,
+        )
+        # Scan-scoped, not `== 1`: this Redis group is shared with the rest of
+        # the session, so a tick with reclaim enabled can legitimately sweep up
+        # another test's deliberately-unacked message too (see
+        # TestResultCollectorExceptionIsolation). The property under test is
+        # that THIS scan converged.
+        assert decided >= 1, "the stranded scan must be recovered and decided"
+        async with gate_sessionmaker() as session:
+            row = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        assert row.verdict in tuple(v.name for v in Verdict)
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_message_does_not_double_count_findings(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The objection to adding redelivery: does a message delivered twice
+        double a scan's findings? It cannot - the collector uses messages only
+        to learn WHICH scan_ids to look at, then reads each engine's blob by
+        name, and `scan_job.state` single-flights the decide. Proven rather
+        than asserted in a comment."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        consumer = f"live-{uuid.uuid4().hex[:8]}"
+        kwargs: dict[str, Any] = {
+            "policy": _POLICY,
+            "trust_tier": TrustTier.INTERNAL,
+            "allowlist": (),
+            "signer": _signer(),
+            "consumer": consumer,
+            "reclaim_idle_ms": 0,
+        }
+        first = await run_result_collector_tick(
+            redis_client,
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            **kwargs,
+        )
+        second = await run_result_collector_tick(
+            redis_client,
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            **kwargs,
+        )
+        assert first >= 1
+        # The anti-double-count property, asserted scan-scoped rather than via
+        # the tick's aggregate count (which this shared Redis group makes
+        # unreliable - see the note in the previous test): the SECOND delivery
+        # of the same message must not produce a second verdict, and must not
+        # re-open a decided scan.
+        assert second == 0 or not await _verdict_is_duplicated(gate_sessionmaker, scan_id)
+        async with gate_sessionmaker() as session:
+            rows = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).all()
+        assert len(rows) == 1
+        async with orchestration_sessionmaker() as session:
+            job = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert job.state == "decided"

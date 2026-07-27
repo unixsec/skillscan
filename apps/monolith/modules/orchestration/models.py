@@ -35,6 +35,24 @@ class ScanJob(Base):
     # skill_id/skill_version: most ad-hoc scans never register a skill_id at
     # all, but should still show something to distinguish them in the list.
     skill_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When this scan first started WAITING for a sandbox-tier engine: set once
+    # by `_try_score_and_decide` the first time it observes every required
+    # engine reported but a waited-advisory (sandbox) engine still missing.
+    #
+    # SECURITY (2026-07-27 final review, F-2): `sweep_sandbox_wait_timeouts`
+    # used to measure the wait from `created_at`, the only timestamp this table
+    # had - i.e. "how old is this submission", not "how long have we been
+    # waiting for the sandbox". Those differ by the whole queue backlog. After
+    # a worker outage longer than the wait budget, a scan's floor blobs land
+    # and the sweep immediately force-decides it in the SAME tick, because its
+    # `created_at` is already ~10 minutes old - so the verdict is signed from
+    # floor findings only and a package whose only HIGH finding comes from
+    # bandit gets PASS instead of REVIEW. NULL means "has never started
+    # waiting" and is never swept, which is also what keeps a never-dispatched
+    # scan out of the sweep entirely.
+    sandbox_wait_started_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True
+    )
 
 
 class ScanResultRow(Base):

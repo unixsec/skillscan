@@ -189,6 +189,8 @@ const zh: Dict = {
   'engine.inhouse-prompt-injection-zh': '提示词注入检测（中文）',
   'engine.inhouse-jailbreak-inducement-zh': '越狱诱导检测（中文）',
   'engine.inhouse-intel-matcher': '威胁情报匹配',
+  'engine.inhouse-mcp-config': '随包 MCP 配置检测',
+  'engine.inhouse-skill-permissions': '权限声明检测',
 
   'reviews.title': '复核',
   'reviews.description': '待复核的扫描。职责分离由后端强制：不能复核自己提交的扫描。',
@@ -681,6 +683,8 @@ const en: Dict = {
   'engine.inhouse-prompt-injection-zh': 'Prompt injection detection (Chinese)',
   'engine.inhouse-jailbreak-inducement-zh': 'Jailbreak inducement detection (Chinese)',
   'engine.inhouse-intel-matcher': 'Threat intel matching',
+  'engine.inhouse-mcp-config': 'Bundled MCP config detection',
+  'engine.inhouse-skill-permissions': 'Declared permission detection',
 
   'reviews.title': 'Reviews',
   'reviews.description':

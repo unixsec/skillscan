@@ -16,6 +16,14 @@ required_engines:
   - inhouse-toctou
   - inhouse-prompt-injection-zh
   - inhouse-jailbreak-inducement-zh
+  # 2026-07-27: 随包 .mcp.json 是 Agent Skill 最直接的横向攻击面之一，
+  # 此前完全无检测（FR-PAR-010/FR-DET-080 未实现）。与其余 floor 引擎同级：
+  # 缺失即 fail-closed。检测器对畸形输入返回 Finding 而非抛异常。
+  - inhouse-mcp-config
+  # 2026-07-27: SKILL.md frontmatter 声明的 allowed-tools 此前从未被读取用于
+  # 安全判定（唯一解析点只取 name 做展示，FR-PAR-013/FR-DET-050 未实现）。
+  # 与其余 floor 引擎同级：缺失即 fail-closed，畸形输入返回 Finding 而非异常。
+  - inhouse-skill-permissions
 
 # hard_gate_rules: rule_ids that are unwaivable (INV-3/INV-8: allowlist can never
 # suppress these, regardless of scope_type) - the PII/credential detectors'

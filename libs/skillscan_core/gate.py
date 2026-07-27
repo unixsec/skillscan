@@ -63,7 +63,11 @@ def decide(
             score=security_score(
                 verdict,
                 scan_result.findings,
-                hard_gate_triggered=bool(scan_result.hard_gate_hits),
+                # Fail-closed: the scan could not be completed, so we know less
+                # about this package than about any package with real findings.
+                # (Passing bool(hard_gate_hits) here was also meaningless - those
+                # hits were computed from an incomplete finding set.)
+                pin_to_floor=True,
                 weights=weights,
             ),
         )
@@ -84,7 +88,7 @@ def decide(
             trifecta_present=scan_result.trifecta_present,
             hard_gate_hits=tuple(sorted(combined_hard_gate)),
             score=security_score(
-                Verdict.BLOCK, scan_result.findings, hard_gate_triggered=True, weights=weights
+                Verdict.BLOCK, scan_result.findings, pin_to_floor=True, weights=weights
             ),
         )
 
@@ -191,6 +195,19 @@ def decide(
         verdict = Verdict.REVIEW
         reasons.append("findings_capped_forces_review")
 
+    # SECURITY: verdict can be pushed to REVIEW/BLOCK by something outside
+    # `effective` - dedup-collision signal restoration (dedup_signal_restored
+    # above, INV-4/INV-5) or the flood cap (INV-5) - so `effective` can end up
+    # EMPTY (every visible finding legitimately waived) while the verdict says
+    # otherwise. Scoring that empty set with the ordinary per-finding formula
+    # would land at the band's TOP (39 for BLOCK) - the same "empty findings
+    # score highest" inversion the fail-closed/hard-gate branches above exist
+    # to prevent, reached through this third path instead. Same fix: pin to
+    # the floor, because the score has nothing in `effective` to price the
+    # severity that actually produced this verdict. PASS is unaffected - an
+    # empty finding set under a PASS verdict is genuinely clean and must still
+    # score 100.
+    pin_to_floor = verdict != Verdict.PASS and not effective
     return VerdictResult(
         verdict=verdict,
         reasons=tuple(reasons),
@@ -198,5 +215,5 @@ def decide(
         effective_severity=sev_all,
         trifecta_present=trif_all,
         hard_gate_hits=(),
-        score=security_score(verdict, effective, hard_gate_triggered=False, weights=weights),
+        score=security_score(verdict, effective, pin_to_floor=pin_to_floor, weights=weights),
     )

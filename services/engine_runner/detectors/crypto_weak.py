@@ -1,4 +1,7 @@
-"""Weak-cryptography detector (coding spec §11.4 CODE-12, SRS Cat-2 "弱加密").
+"""Weak-cryptography detector (coding spec §11.4 CODE-10, SRS Cat-2 "弱加密").
+
+2026-07-27：原标签 CODE-12 与检测目录不符——CODE-12 在检测目录里是「进程创建」，
+不是弱加密；本检测器实际对应的是 CODE-10「弱加密」，已修正。
 
 Self-built rules (coding spec explicitly allows "bandit B303/304/305/311 或
 自研规则" - bandit's rule IDs OR self-built rules): the real subprocess-wrapped
@@ -18,52 +21,67 @@ from skillscan_core import (
     EngineCapability,
     EngineMetadata,
     EngineResult,
-    EngineStatus,
     Finding,
-    ScanMode,
     Severity,
 )
 
+from engine_runner.detectors._engine_base import run_with_deadline
+
 _CATEGORY = DetectionCategory.CODE
 
-# (rule_id, pattern, title, severity, bandit-equivalent) - patterns match
-# CONTENT being scanned for weak-crypto usage; nothing here is executed.
-_PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
+# (rule_id, pattern, title, severity, bandit-equivalent, confidence) - patterns
+# match CONTENT being scanned for weak-crypto usage; nothing here is executed.
+#
+# confidence is per-rule (D6, 2026-07-27):
+#   0.8  a specific, unambiguous API-call shape for an algorithm/mode with
+#        essentially no legitimate non-security use.
+#   0.7  same call-shape specificity, but md5/sha1 are also legitimately used
+#        for non-security purposes (checksums/dedup), so a match is good but
+#        not conclusive evidence of an actual security bug.
+#   0.5  `random.` is overwhelmingly used for non-security purposes (sampling,
+#        games, jitter) - weakest signal in this detector.
+_PATTERNS: tuple[tuple[str, str, str, Severity, float], ...] = (
     (
         "crypto.weak_hash_md5",
         r"\bhashlib\.md5\s*\(",
         "使用了不安全的 MD5 哈希算法",
         Severity.MEDIUM,
+        0.7,
     ),
     (
         "crypto.weak_hash_sha1",
         r"\bhashlib\.sha1\s*\(",
         "使用了不安全的 SHA1 哈希算法",
         Severity.MEDIUM,
+        0.7,
     ),
     (
         "crypto.weak_cipher_des",
         r"\b(?:DES|TripleDES|Crypto\.Cipher\.DES)\.new\s*\(",
         "使用了不安全的 DES/3DES 加密算法",
         Severity.HIGH,
+        0.8,
     ),
     (
         "crypto.weak_cipher_rc4",
         r"\b(?:ARC4|RC4|Crypto\.Cipher\.ARC4)\.new\s*\(",
         "使用了不安全的 RC4 流加密算法",
         Severity.HIGH,
+        0.8,
     ),
     (
         "crypto.weak_cipher_mode_ecb",
         r"MODE_ECB\b",
         "使用了不安全的 ECB 加密模式",
         Severity.HIGH,
+        0.8,
     ),
     (
         "crypto.non_cryptographic_random",
         r"\brandom\.(?:random|randint|choice|randrange|getrandbits)\s*\(",
         "在可能需要密码学安全随机数的场景使用了非密码学随机数 random()",
         Severity.LOW,
+        0.5,
     ),
 )
 
@@ -103,9 +121,18 @@ _RISK_DESCRIPTIONS: dict[str, str] = {
 
 
 def _metadata() -> EngineMetadata:
+    # SECURITY (INV-7, D6 2026-07-27 review): see pii.py's _metadata for the
+    # full rationale - severity and confidence must be part of this hash, not
+    # just rule_id/pattern, or a scoring-relevant rule edit leaves
+    # toolchain_digest/cache_key unchanged.
+    #
+    # `_CATEGORY` too (2026-07-27 final review, F-3 guard): category is a real
+    # scoring input - scoring.py weights every finding by
+    # `weights.for_category` - so a category change must bust the digest.
     hasher = hashlib.sha256()
-    for rule_id, pattern, *_rest in _PATTERNS:
-        hasher.update(f"{rule_id}:{pattern}\n".encode())
+    hasher.update(f"category:{_CATEGORY.value}\n".encode())
+    for rule_id, pattern, _title, severity, confidence in _PATTERNS:
+        hasher.update(f"{rule_id}:{pattern}:{severity.value}:{confidence}\n".encode())
     return EngineMetadata(
         name="inhouse-crypto-weak",
         version="1.0.0",
@@ -119,16 +146,19 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
     for path, data in files.items():
         text = data.decode("utf-8", errors="replace")
         for line_no, line in enumerate(text.splitlines(), start=1):
-            for rule_id, pattern, title, severity in _PATTERNS:
+            for rule_id, pattern, title, severity, confidence in _PATTERNS:
                 if re.search(pattern, line):
                     findings.append(
                         Finding(
                             rule_id=rule_id,
-                            test_item_id="CODE-12",
+                            # 2026-07-27：原标签与检测目录不符，修正为 CODE-10
+                            # （弱加密，企业Skill安全评估测试维度清单 D2；CODE-12
+                            # 实际是「进程创建」）。
+                            test_item_id="CODE-10",
                             category=_CATEGORY,
                             title=title,
                             severity=severity,
-                            confidence=0.7,
+                            confidence=confidence,
                             source_engine="inhouse-crypto-weak",
                             source_capability=EngineCapability.STATIC,
                             file_path=path,
@@ -148,10 +178,4 @@ class CryptoWeakDetector:
         return _metadata()
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
-        return EngineResult(
-            engine=self.metadata,
-            findings=scan(files),
-            status=EngineStatus.OK,
-            scan_mode=ScanMode.STATIC,
-            llm_used=False,
-        )
+        return run_with_deadline(self.metadata, scan, files, deadline)

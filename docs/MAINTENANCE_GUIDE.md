@@ -87,9 +87,13 @@ reeval 触发的重扫真正执行（worker 的队列补投递把 DB-only scan_j
 5. **BLOCK 判定没有对应的生命周期状态**——§16.2 状态机没有 `blocked` 态，被 BLOCK 的
    skill 停留在 `scanning`（其签名 BLOCK verdict 在扫描页可见，市场发布永远不会发生）；
    如需显式状态需要扩状态机+迁移，属规格层决策，不在代码层擅自发明。
-6. **worker 的引擎执行仍是进程内 floor 引擎**——真实 gVisor 沙箱化 OSS 引擎 adapter
-   （M5 已实现 adapter 本身）接入 worker 属部署形态问题（需要容器/沙箱运行时），与
-   §4.4 的环境受限清单同源。
+6. **~~worker 的引擎执行仍是进程内 floor 引擎~~（2026-07-28 已关闭）**——sandbox 层引擎
+   （bandit / yara / skillspector / osv-scanner）现在真正参与裁决：裁决前会等待它们的结果，
+   最长 300 秒，超时后以已到结果裁决并在 `reasons` 里记录哪些引擎没赶上。等待是
+   advisory 的——sandbox 引擎缺席只降级为"未赶上"，不触发 fail-closed BLOCK，避免单个
+   引擎故障造成批量误判。真实提交验证：同一份判定里同时含 floor 层与 bandit/skillspector
+   的 finding。**注意由此产生的体验落差**：扫描从毫秒级变为分钟级，而扫描详情页目前
+   无自动轮询也无刷新按钮，提交后需手动刷新才能看到最终判定。
 
 ## 4. 故障排查
 

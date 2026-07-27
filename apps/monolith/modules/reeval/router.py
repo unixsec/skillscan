@@ -31,6 +31,15 @@ router = APIRouter(prefix="/v1")
 # worker.py) writes into skill_lifecycle_event.reason on a real drift-triggered
 # quarantine - used below to find genuine historical drift events, never a
 # guess/heuristic over free-text reason strings.
+#
+# The `SUP-05` inside this string is FROZEN and must not be "corrected" to the
+# catalog's current `SUPPLY-06` (2026-07-28). It is a persisted token, not a
+# spec citation: every skill_lifecycle_event row ever written by
+# `_quarantine_if_drifted` contains this exact prefix, and this constant is
+# matched against them with `.startswith()`. Renaming it would silently drop
+# every historical drift event from the reeval page - the rows would still be
+# there, just invisible. Surrounding prose/comments were renumbered to
+# SUPPLY-06; this value deliberately was not.
 _DRIFT_REASON_PREFIX = "drift detected (SUP-05):"
 
 _reeval_reader = require_role("approver", "admin")
@@ -79,7 +88,7 @@ async def list_reeval_status(
 
 
 async def _drift_summary(runtime: ScanRuntime) -> dict[str, Any]:
-    """Content-drift monitoring (coding spec SUP-05 "拔地毯") - deliberately
+    """Content-drift monitoring (coding spec SUPPLY-06 "拔地毯") - deliberately
     SEPARATE from the toolchain-staleness data above, which compares scanner/
     policy VERSION, not skill CONTENT (see reeval.router module docstring's
     2026-07-14 addition for why conflating the two was the actual point of

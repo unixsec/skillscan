@@ -1,10 +1,17 @@
-"""File-type allowlist + magic-byte detector (coding spec §11.4 FILE-06,
+"""File-type allowlist + magic-byte detector (coding spec §11.4 FILE-01/FILE-02,
 SRS Cat-6: "可执行文件存在"/"非常见文件类型").
 
 SECURITY: extension checks alone are trivially spoofed (rename `payload.elf` to
 `payload.txt`) - every file's actual leading bytes are checked against known
 executable/archive magic signatures regardless of its claimed extension, so a
 disguised binary is still caught.
+
+2026-07-27：原标签统一是 FILE-06（临时文件与符号链接风险），与本检测器毫不相关，
+现按检测目录（企业Skill安全评估测试维度清单 D7）拆分为两个正确的条目：
+- FILE-01「存在可执行文件」（检测要点："包体内部含可执行文件"）→ 魔数签名规则
+  （`_MAGIC_SIGNATURES`，按文件头字节判断是否为 ELF/PE/Mach-O 等可执行文件）。
+- FILE-02「非常见SKILL文件类型」（检测要点："包体含非常见类型文件（pdf/office
+  文档等）"）→ 扩展名不在允许清单规则（`file.unexpected_extension`）。
 """
 
 from __future__ import annotations
@@ -16,11 +23,11 @@ from skillscan_core import (
     EngineCapability,
     EngineMetadata,
     EngineResult,
-    EngineStatus,
     Finding,
-    ScanMode,
     Severity,
 )
+
+from engine_runner.detectors._engine_base import run_with_deadline
 
 _CATEGORY = DetectionCategory.FILE_PACKAGE
 
@@ -133,6 +140,32 @@ _MAGIC_SIGNATURE_RISK = (
     "任意代码执行、后门植入等严重后果，建议人工核查该文件的真实来源与用途。"
 )
 
+# Explicit rule_id -> detection-catalog id, same convention as the other
+# in-house detectors: never derive a catalog id from the rule name. Hoisted
+# out of `scan()` 2026-07-27 (final review, F-1/F-3) so that (a) the digest
+# below can hash it and (b) tests/test_test_item_catalog.py can read the real
+# values instead of a hardcoded copy.
+_TEST_ITEM_IDS: dict[str, str] = {
+    # 魔数签名规则 -> FILE-01「存在可执行文件」（检测要点："包体内部含可执行文件"）
+    "file.elf_binary": "FILE-01",
+    "file.pe_binary": "FILE-01",
+    "file.macho_binary": "FILE-01",
+    "file.macho_or_java_class": "FILE-01",
+    "file.shebang_script": "FILE-01",
+    # 扩展名不在允许清单 -> FILE-02「非常见SKILL文件类型」
+    "file.unexpected_extension": "FILE-02",
+}
+
+# 每条规则的 severity/confidence（2026-07-27 最终评审 F-3）：此前这些值直接写死
+# 在 scan() 的 Finding() 里，_metadata() 完全看不到它们，于是改一条规则的
+# severity/confidence 不会改 ruleset_digest → toolchain_digest → cache_key 不变
+# → 修正后的规则被旧的缓存判定悄悄覆盖。提到模块级常量而不是在 _metadata() 里
+# 再抄一份，是为了保证 digest 输入与 Finding 实际记录的值永远是同一个值——重复
+# 一份副本正是 prompt_injection_zh.py 的 _CONFIDENCE 注释里记下的那个坑。
+_MAGIC_SIGNATURE_CONFIDENCE = 0.95
+_UNEXPECTED_EXTENSION_SEVERITY = Severity.LOW
+_UNEXPECTED_EXTENSION_CONFIDENCE = 0.6
+
 # (rule_id, magic bytes, severity, description) - checked regardless of extension.
 _MAGIC_SIGNATURES: tuple[tuple[str, bytes, Severity, str], ...] = (
     ("file.elf_binary", b"\x7fELF", Severity.CRITICAL, "ELF 可执行文件/库"),
@@ -162,9 +195,32 @@ _MAGIC_SIGNATURES: tuple[tuple[str, bytes, Severity, str], ...] = (
 
 
 def _metadata() -> EngineMetadata:
+    # SECURITY (INV-7, 2026-07-27 final review F-3): this hash must change if
+    # ANY field that affects what is detected, how severe it is, how confident
+    # we are, or which catalog item it maps to changes - not just
+    # rule_id/magic. It previously discarded `severity` into `_sev` and never
+    # saw `confidence`/`test_item_id` at all, so downgrading e.g.
+    # file.shebang_script from MEDIUM to LOW left ruleset_digest ->
+    # toolchain_digest -> cache_key completely unchanged and every
+    # already-scanned package kept its old verdict. Same shape (and same
+    # reason) as pii.py / crypto_weak.py / toctou.py, which Task 6's review
+    # already fixed; this detector was simply outside that pass's scope.
     hasher = hashlib.sha256()
-    for rule_id, magic, _sev, _desc in _MAGIC_SIGNATURES:
-        hasher.update(rule_id.encode() + b":" + magic + b"\n")
+    # category is a real scoring input - scoring.py weights every finding by
+    # `weights.for_category` - so it belongs in the digest too.
+    hasher.update(f"category:{_CATEGORY.value}\n".encode())
+    for rule_id, magic, severity, _desc in _MAGIC_SIGNATURES:
+        suffix = (
+            f":{severity.value}:{_MAGIC_SIGNATURE_CONFIDENCE}:{_TEST_ITEM_IDS[rule_id]}\n"
+        ).encode()
+        hasher.update(rule_id.encode() + b":" + magic + suffix)
+    hasher.update(
+        (
+            f"file.unexpected_extension:{_UNEXPECTED_EXTENSION_SEVERITY.value}"
+            f":{_UNEXPECTED_EXTENSION_CONFIDENCE}"
+            f":{_TEST_ITEM_IDS['file.unexpected_extension']}\n"
+        ).encode()
+    )
     hasher.update(",".join(sorted(_ALLOWED_EXTENSIONS)).encode())
     return EngineMetadata(
         name="inhouse-file-type",
@@ -189,11 +245,14 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
             findings.append(
                 Finding(
                     rule_id="file.unexpected_extension",
-                    test_item_id="FILE-06",
+                    # 2026-07-27：原标签 FILE-06 与检测目录不符，修正为 FILE-02
+                    # （非常见SKILL文件类型 - 检测扩展名是否在允许清单内）。
+                    # 三个值都来自模块级常量，_metadata() 用的是同一份 - 见其注释。
+                    test_item_id=_TEST_ITEM_IDS["file.unexpected_extension"],
                     category=_CATEGORY,
                     title=f"非预期的文件类型：{ext or '（无扩展名）'}",
-                    severity=Severity.LOW,
-                    confidence=0.6,
+                    severity=_UNEXPECTED_EXTENSION_SEVERITY,
+                    confidence=_UNEXPECTED_EXTENSION_CONFIDENCE,
                     source_engine="inhouse-file-type",
                     source_capability=EngineCapability.STATIC,
                     file_path=path,
@@ -209,11 +268,13 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                 findings.append(
                     Finding(
                         rule_id=rule_id,
-                        test_item_id="FILE-06",
+                        # 2026-07-27：原标签 FILE-06 与检测目录不符，修正为 FILE-01
+                        # （存在可执行文件 - 按文件头魔数判断是否为可执行文件）。
+                        test_item_id=_TEST_ITEM_IDS[rule_id],
                         category=_CATEGORY,
                         title=f"通过文件头魔数识别出：{description}",
                         severity=severity,
-                        confidence=0.95,
+                        confidence=_MAGIC_SIGNATURE_CONFIDENCE,
                         source_engine="inhouse-file-type",
                         source_capability=EngineCapability.STATIC,
                         file_path=path,
@@ -236,10 +297,4 @@ class FileTypeDetector:
         return _metadata()
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
-        return EngineResult(
-            engine=self.metadata,
-            findings=scan(files),
-            status=EngineStatus.OK,
-            scan_mode=ScanMode.STATIC,
-            llm_used=False,
-        )
+        return run_with_deadline(self.metadata, scan, files, deadline)

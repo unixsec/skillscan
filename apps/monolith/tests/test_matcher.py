@@ -1,4 +1,5 @@
-"""Tests for `intel.matcher` (coding spec §11.4 NET-06/07/08) against the real
+"""Tests for `intel.matcher` (coding spec §11.4 INTEL-01/02/03, corrected
+2026-07-27 from the previously mislabelled NET-06/07/08) against the real
 local MySQL instance (`threat_indicator`, svc_intel's own table)."""
 
 from __future__ import annotations
@@ -112,3 +113,40 @@ class TestIntelMatcher:
         )
         assert result.findings == ()
         assert result.status.value == "ok"
+
+    # SECURITY (2026-07-27 review follow-up): the D7 catalog-id fix to
+    # `_TEST_ITEM_ID_BY_IOC_TYPE` (matcher.py) had NO regression protection -
+    # every existing matcher test asserted only `rule_id`, never
+    # `test_item_id`, so a future accidental revert back to NET-06/07/08
+    # would pass the entire suite. These three don't need a DB fixture at all
+    # (unlike TestIntelMatcher's domain/ip/md5 tests above) - `known_iocs` is
+    # just a plain frozenset `IntelMatcher.__init__` takes directly, so they
+    # run locally without MySQL.
+    @pytest.mark.parametrize(
+        ("ioc_type", "ioc_value", "content", "expected_item"),
+        [
+            # INTEL-02「恶意域名」(企业Skill安全评估测试维度清单 D1).
+            (
+                "domain",
+                "evil.example.com",
+                b'requests.get("http://evil.example.com")\n',
+                "INTEL-02",
+            ),
+            # INTEL-03「恶意IP」(D1).
+            ("ip", "203.0.113.5", b'sock.connect(("203.0.113.5", 4444))\n', "INTEL-03"),
+            # INTEL-01「恶意文件命中情报」(D1, MD5 hash hit).
+            (
+                "md5",
+                "d41d8cd98f00b204e9800998ecf8427e",
+                b"checksum: d41d8cd98f00b204e9800998ecf8427e\n",
+                "INTEL-01",
+            ),
+        ],
+    )
+    def test_test_item_id_matches_the_catalog_entry_for_each_ioc_type(
+        self, ioc_type: str, ioc_value: str, content: bytes, expected_item: str
+    ) -> None:
+        matcher = IntelMatcher(known_iocs=frozenset({(ioc_type, ioc_value)}))
+        result = matcher.analyze({"skill.py": content})
+        assert result.findings, f"fixture should have matched the seeded {ioc_type} IOC"
+        assert all(f.test_item_id == expected_item for f in result.findings)

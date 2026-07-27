@@ -23,10 +23,11 @@ import uuid
 from collections.abc import Callable, Sequence
 
 import redis.asyncio as aioredis
-import yaml
 from common import airlock
 from common.blobstore import BlobNotFoundError, BlobStorePort, artifact_key, findings_key
+from common.frontmatter import parse_frontmatter
 from common.log import get_logger
+from common.skill_package import root_skill_md_path
 from engine_runner.normalizer import UnpackRejected, unpack_hardened
 from schemas.findings import serialize_engine_result, serialize_finding
 from skillscan_core import (
@@ -72,6 +73,11 @@ _POISON_PILL_ENGINE_MARKER = "__poison_pill__"
 _UNPACK_REJECTED_ENGINE_MARKER = "__unpack_rejected__"
 _TERMINAL_STATUSES = frozenset({POISON_PILL_STATUS, UNPACK_REJECTED_STATUS})
 
+# Grace on top of the configured wait before the sweep forces a decision - see
+# sweep_sandbox_wait_timeouts' docstring for why it is not zero.
+_SWEEP_GRACE_S = 30.0
+_SWEEP_BATCH = 50
+
 _logger = get_logger("skillscan.orchestration.worker")
 
 
@@ -79,73 +85,34 @@ def _naive_utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
 
 
-# `type: ignore[misc]`: PyYAML ships no type information and is declared
-# `ignore_missing_imports` in pyproject.toml, so `yaml.SafeLoader` resolves to
-# `Any` and mypy --strict rejects subclassing it. The ignore is about the
-# missing upstream stub, not about this class - drop it if PyYAML (or a
-# types-PyYAML dev dependency) ever provides real types.
-class _NoAliasSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
-    """SECURITY: a SafeLoader that refuses YAML aliases. `yaml.safe_load`
-    blocks code execution but still expands anchors/aliases, so a tiny
-    (<1 KiB) nested-alias "billion laughs" payload can expand exponentially and
-    OOM the process. A length cap does NOT stop this (the payload is small by
-    design), so aliases are rejected outright at compose time - before any
-    expansion - which a SKILL.md name-bearing frontmatter never legitimately
-    needs. The raised error is caught as a normal parse failure -> no name."""
-
-    def compose_node(self, parent: object, index: object) -> object:
-        event = self.peek_event()
-        if isinstance(event, yaml.events.AliasEvent):
-            raise yaml.YAMLError("YAML aliases are not permitted in SKILL.md frontmatter")
-        return super().compose_node(parent, index)
-
-
 def _parse_skill_name(files: Sequence[tuple[str, int, bytes]]) -> str | None:
-    """Best-effort extraction of the human-readable name from SKILL.md's YAML
-    frontmatter (---\\nname: ...\\n---), the same format skillspector's own
-    fixtures already use (vendor/skillspector/tests/fixtures/*/SKILL.md).
-    Never raises - a missing/malformed SKILL.md just means no name to show,
-    not a reason to fail the whole submission. yaml.safe_load only: this is
-    untrusted upload content, never yaml.load/unsafe_load."""
+    """Best-effort display name from SKILL.md's frontmatter. Parsing is shared
+    with the permissions detector - see `common.frontmatter`.
+
+    SECURITY/CORRECTNESS: root path only, never basename-anywhere. This name
+    is written to `ScanJob.skill_name` and shown on the scan list - an
+    Agent Skill's manifest is the one SKILL.md at the package root, so a
+    bundled example (`examples/SKILL.md`) must never supply the displayed
+    name for the whole package.
+
+    2026-07-27 (final review, F-5): "root" is not the literal string
+    "SKILL.md" - a conventionally packed `tar czf skill.tgz my-skill/` wraps
+    every member in a directory the normalizer does not strip, which left the
+    scan list showing "not registered" for such packages. Resolved through
+    `common.skill_package.root_skill_md_path`, the one shared implementation
+    (also used by the permissions detector and by gateway's declared_perms
+    write) - do not add a fourth spelling."""
+    root_skill_md = root_skill_md_path(path for path, _mode, _data in files)
     for path, _mode, data in files:
-        if path != "SKILL.md":
+        if path != root_skill_md:
             continue
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-        if not text.startswith("---"):
-            return None
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            return None
-        # SECURITY (BE-5): length-cap first (cheap ceiling on any oversized
-        # frontmatter), then parse via the alias-refusing loader that actually
-        # defuses billion-laughs (see _NoAliasSafeLoader). We drive the loader
-        # through its low-level API rather than `yaml.load(..., Loader=...)`
-        # deliberately: _NoAliasSafeLoader is a SafeLoader SUBCLASS (no custom
-        # constructors, so no arbitrary-type construction - identical safety to
-        # yaml.safe_load, plus alias rejection), and this form keeps static
-        # "no yaml.load" scanners satisfied.
-        loader = _NoAliasSafeLoader(parts[1][:8192])
-        try:
-            frontmatter = loader.get_single_data()
-        except yaml.YAMLError:
-            return None
-        finally:
-            loader.dispose()
-        if not isinstance(frontmatter, dict):
+        frontmatter = parse_frontmatter(data)
+        if frontmatter is None:
             return None
         name = frontmatter.get("name")
-        if not isinstance(name, str):
-            return None
-        stripped = name.strip()
-        # SECURITY (BE-1): cap to the DB column width (skill_name is
-        # String(255)). An over-long name parses fine here but otherwise aborts
-        # the ENTIRE scan submission at INSERT on strict MySQL ("Data too
-        # long"), violating this function's own "never fail the submission"
-        # contract. The sibling parser in aig.py caps identically.
-        return stripped[:255] if stripped else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()[:255]
+        return None
     return None
 
 
@@ -410,14 +377,24 @@ async def run_result_collector_tick(
     count: int = 20,
     operator: str = "system:orchestrator",
     additional_engines: Sequence[str] = (),
+    waited_advisory_engines: Sequence[str] = (),
+    reclaim_idle_ms: int = airlock.STALE_CLAIM_IDLE_MS,
 ) -> int:
     """Claims pending result messages and, for every scan_id that now has all
     `policy.required_engines` reported (or was reported as a poison-pill),
     records a verdict. Returns how many scans were newly decided this tick.
 
-    `additional_engines` (e.g. the intel matcher, coding spec NET-06/07/08):
-    read into aggregation when they happen to have reported, never gated on
+    `additional_engines` (e.g. the intel matcher, coding spec INTEL-01/02/03,
+    corrected 2026-07-27 from the previously mislabelled NET-06/07/08): read
+    into aggregation when they happen to have reported, never gated on
     - see `_try_score_and_decide`'s own docstring for the full reasoning.
+
+    `waited_advisory_engines` (D2, 2026-07-27 - the sandbox engines) differ
+    from `additional_engines` in exactly one way: they ARE waited for (a scan
+    isn't decided here until they've reported too, same as `required_engines`),
+    just never fail-closed BLOCK on absence the way `required_engines` does.
+    A wait that times out is forced through by `sweep_sandbox_wait_timeouts`
+    instead - this function alone never forces one.
 
     SECURITY: `scan_job.state` (checked+transitioned under `SELECT ... FOR
     UPDATE`) is the single-flight guard against two collector ticks (e.g. two
@@ -430,6 +407,16 @@ async def run_result_collector_tick(
     implemented here.
     """
     results = await airlock.claim_results(redis, consumer=consumer, count=count, block_ms=200)
+    # SECURITY (2026-07-28, VM re-review N-2): also take over messages an
+    # earlier collector claimed and never ACKed. Without this the results
+    # stream has no recovery path at all - a crash between XREADGROUP and
+    # ack_result strands that message forever, and with it the scan, because
+    # nothing else ever re-triggers `_try_score_and_decide` for a scan whose
+    # blobs are already written. See `airlock.reclaim_stale_results` for why
+    # redelivery is idempotent here.
+    results += await airlock.reclaim_stale_results(
+        redis, consumer=consumer, min_idle_ms=reclaim_idle_ms
+    )
     required = tuple(sorted(policy.required_engines))
     by_scan_id: dict[str, list[str]] = {}
     for r in results:
@@ -474,6 +461,7 @@ async def run_result_collector_tick(
                     signer=signer,
                     operator=operator,
                     additional_engines=additional_engines,
+                    waited_advisory_engines=waited_advisory_engines,
                 )
         except Exception:
             # SECURITY: one scan_id's failure (e.g. an IntegrityError from two
@@ -500,6 +488,110 @@ async def run_result_collector_tick(
         if r.scan_id in failed_scan_ids:
             continue
         await airlock.ack_result(redis, r.message_id)
+    return decided
+
+
+async def sweep_sandbox_wait_timeouts(
+    blobstore: BlobStorePort,
+    orchestration_session_factory: SessionFactory,
+    gate_session_factory: SessionFactory,
+    *,
+    policy: GatePolicy,
+    trust_tier: TrustTier,
+    allowlist: Sequence[AllowlistEntry],
+    signer: SignerPort,
+    waited_advisory_engines: Sequence[str],
+    wait_timeout_s: float,
+    operator: str = "system:orchestrator",
+    additional_engines: Sequence[str] = (),
+) -> int:
+    """Decide scans that have waited past `wait_timeout_s` for a sandbox engine.
+
+    WHY THIS EXISTS: `run_result_collector_tick` is message-driven - it only
+    tries to decide a scan when a result message arrives. The moment a wait
+    times out is precisely the moment no further message will arrive, so
+    without this sweep a timed-out scan sits in queued/running forever. Same
+    shape as `sweep_queued_jobs_to_airlock`: read the DB for stuck rows, push
+    them forward.
+
+    The cutoff adds `_SWEEP_GRACE_S` on top of `wait_timeout_s` because the
+    sandbox subprocesses are themselves bounded by `deadline_epoch`
+    (created_at + scan_deadline_s, 300s by default - the SAME value as the
+    wait timeout). Sweeping exactly at the timeout would race the engine's own
+    TIMEOUT blob write and discard the more informative outcome: an engine
+    that reports "I timed out" tells an operator more than our guess that it
+    never arrived.
+
+    SECURITY (Critical, 2026-07-27 final review F-2): the cutoff is measured
+    against `sandbox_wait_started_at`, NOT `created_at`. `created_at` answers
+    "how old is this submission"; this sweep needs "how long have we been
+    waiting for the sandbox", and the two differ by the entire queue backlog.
+    With `created_at`, the failure fits inside a single `worker_tick`: after a
+    worker outage longer than the wait budget (a rolling restart, a deploy,
+    SKILLSCAN_WORKER_ENABLED=false) `sweep_queued_jobs_to_airlock` re-produces
+    the backlog, the floor engines run and write all 9 required blobs, the
+    collector declines to decide because the sandbox blobs have not landed yet
+    - and then THIS sweep selected those same scans, because their `created_at`
+    was already ~10 minutes old, and force-decided them from floor findings
+    alone. A package whose only HIGH finding comes from bandit got PASS instead
+    of REVIEW. The `sandbox_wait_timeout:` reason made it auditable, but D2's
+    entire purpose was defeated for exactly the backlog case it exists for.
+
+    NULL `sandbox_wait_started_at` means "has never started waiting" and is
+    never swept. That also keeps scans whose required engines were never
+    dispatched at all out of this sweep entirely, rather than relying on
+    `_try_score_and_decide`'s required-engines check to reject them afterwards.
+    """
+    cutoff = _naive_utcnow() - datetime.timedelta(seconds=wait_timeout_s + _SWEEP_GRACE_S)
+    async with orchestration_session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(ScanJob.scan_id)
+                    .where(ScanJob.state.in_(("queued", "running")))
+                    .where(ScanJob.sandbox_wait_started_at.is_not(None))
+                    .where(ScanJob.sandbox_wait_started_at < cutoff)
+                    # SECURITY/Minor (2026-07-27 review): oldest-first, not
+                    # unordered - an unordered LIMIT window means a cluster of
+                    # rows that keeps raising (caught below, per-scan isolated)
+                    # could occupy the whole batch every tick and starve
+                    # everything behind it. Same ordering `sweep_queued_jobs_
+                    # to_airlock` gets implicitly (it has no LIMIT at all).
+                    # Ordered by the same column the cutoff filters on, so
+                    # "oldest" means "waiting longest", not "submitted first".
+                    .order_by(ScanJob.sandbox_wait_started_at)
+                    .limit(_SWEEP_BATCH)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    decided = 0
+    for scan_id in rows:
+        try:
+            if await _try_score_and_decide(
+                blobstore,
+                orchestration_session_factory,
+                gate_session_factory,
+                scan_id=str(scan_id),
+                required_engines=tuple(sorted(policy.required_engines)),
+                policy=policy,
+                trust_tier=trust_tier,
+                allowlist=allowlist,
+                signer=signer,
+                operator=operator,
+                additional_engines=additional_engines,
+                waited_advisory_engines=waited_advisory_engines,
+                force_decide=True,
+            ):
+                decided += 1
+        except Exception:
+            # Same per-scan isolation as run_result_collector_tick: one stuck
+            # scan must not stop the rest of the batch.
+            _logger.exception(
+                "sandbox-wait sweep failed for a scan", extra={"context": {"scan_id": str(scan_id)}}
+            )
     return decided
 
 
@@ -581,18 +673,31 @@ async def _try_score_and_decide(
     signer: SignerPort,
     operator: str,
     additional_engines: Sequence[str] = (),
+    waited_advisory_engines: Sequence[str] = (),
+    force_decide: bool = False,
 ) -> bool:
-    """`additional_engines` (e.g. the intel matcher): read into aggregation
-    WHEN PRESENT, but never gate on - the "all required engines reported"
-    wait below deliberately checks only `required_engines`, so a scan is
-    never blocked waiting on an advisory engine, and `load_and_aggregate`
-    below reads `required_engines` union `additional_engines` so an advisory
-    engine's findings still count toward severity/trifecta when it DID
-    report in time (its own `findings_key` blob simply won't exist yet if it
-    hasn't - `load_engine_result`'s existing BlobNotFoundError handling
-    covers that the exact same way a slow required engine would be
-    handled, except it never blocks the wait)."""
+    """`waited_advisory_engines` (the sandbox engines) ARE waited for, but are
+    NOT in `required_engines`: a missing one degrades to an advisory absence
+    (load_and_aggregate's existing BlobNotFoundError -> EngineStatus.ERROR
+    path) rather than a fail-closed BLOCK, so one crashed engine cannot block
+    every scan. `force_decide` is what the wait-timeout sweep passes to stop
+    waiting - see `sweep_sandbox_wait_timeouts`.
+
+    `force_decide` ONLY ever bypasses the `waited_advisory_engines` wait - it
+    NEVER bypasses the `required_engines` presence check. `required_engines`
+    is checked unconditionally, before `force_decide` is even consulted: the
+    sweep that passes `force_decide=True` cannot distinguish "waited 330s for
+    a sandbox engine" from "sat in queued/running 330s because a required
+    floor engine was never dispatched at all" (worker outage, Redis
+    interruption, a reeval batch bigger than one dispatch tick's claim count)
+    - skipping the required-engines check under `force_decide` would let the
+    sweep force a signed, unrevisable fail-closed BLOCK on scans that were
+    never actually stuck on a sandbox engine.
+
+    `additional_engines` (e.g. the intel matcher) remain read-when-present and
+    never waited for."""
     scan_result: ScanResult | None = None
+    extra_reasons: tuple[str, ...] = ()
     async with orchestration_session_factory() as session, session.begin():
         job = (
             await session.execute(
@@ -601,6 +706,27 @@ async def _try_score_and_decide(
         ).scalar_one_or_none()
         if job is None or job.state not in ("queued", "running"):
             return False  # unknown, or already scored/decided/failed elsewhere
+
+        # SECURITY (Critical, 2026-07-27 review): this check is UNCONDITIONAL -
+        # never skipped by `force_decide`. If it were skipped, a forced decide
+        # would take a scan whose FLOOR engines never ran straight to
+        # `load_and_aggregate` with zero required blobs -> `required_ok=False`
+        # -> `policy.fail_closed_verdict` (BLOCK), signed and unrevisable, on a
+        # scan that was never actually stuck waiting on anything
+        # sandbox-related (worker outage, Redis interruption, or a
+        # `reeval.controller.trigger_rescans` batch bigger than one dispatch
+        # tick's claim count).
+        #
+        # 2026-07-28: the ORIGINAL wording of this comment justified the check
+        # by saying the sweep "selects rows purely by `state in
+        # ('queued','running') AND created_at < cutoff`" and therefore could
+        # not tell the two cases apart. That is no longer true - F-2 moved the
+        # sweep onto `sandbox_wait_started_at`, which is NULL for exactly those
+        # never-dispatched scans, so they are not selected in the first place.
+        # The check stays regardless: it is the last line of defence, and it
+        # must not depend on the sweep being the only caller that can pass
+        # `force_decide`.
+        # `force_decide` only ever bypasses the sandbox-advisory wait below.
         all_reported = all(
             [
                 await asyncio.to_thread(blobstore.exists, findings_key(scan_id, e))
@@ -610,8 +736,68 @@ async def _try_score_and_decide(
         if not all_reported:
             return False  # not all required engines have reported yet
 
-        engine_names = tuple(required_engines) + tuple(
-            e for e in additional_engines if e not in required_engines
+        missing_advisory: tuple[str, ...] = ()
+        if not force_decide:
+            waited_missing = [
+                e
+                for e in waited_advisory_engines
+                if not await asyncio.to_thread(blobstore.exists, findings_key(scan_id, e))
+            ]
+            if waited_missing:
+                # SECURITY (2026-07-27 final review, F-2): THIS is the moment
+                # the wait actually begins - every required engine has
+                # reported and only a sandbox engine is outstanding. Recording
+                # it here is what lets `sweep_sandbox_wait_timeouts` measure
+                # the wait instead of the submission's age; see that
+                # function's docstring for the PASS-instead-of-REVIEW failure
+                # the old `created_at` clock produced after a worker outage.
+                #
+                # Set once and never refreshed: a later tick that finds the
+                # same engine still missing must not push the deadline out
+                # forever. The row is already held under `SELECT ... FOR
+                # UPDATE` above, so the read-modify-write is safe against a
+                # second collector.
+                if job.sandbox_wait_started_at is None:
+                    job.sandbox_wait_started_at = _naive_utcnow()
+                return False  # sandbox engines still running; the sweep will force us on
+        else:
+            # NOTE: list comprehension, not a bare generator expression - a
+            # generator expression containing `await` inside an `async def`
+            # becomes an async generator per PEP 530, which `tuple()` cannot
+            # consume synchronously (mypy catches this as an arg-type error;
+            # at runtime it would raise, never actually calling `exists` at
+            # all). Same pattern `waited_missing`/`all_reported` above already
+            # use correctly.
+            missing_advisory = tuple(
+                [
+                    e
+                    for e in waited_advisory_engines
+                    if not await asyncio.to_thread(blobstore.exists, findings_key(scan_id, e))
+                ]
+            )
+
+        if missing_advisory:
+            # Visible in GET /v1/scans/{id}.reasons: this verdict was made
+            # with fewer engines than usual. A silent downgrade would be
+            # worse than the latency this wait costs.
+            extra_reasons = (f"sandbox_wait_timeout:{','.join(sorted(missing_advisory))}",)
+
+        # NOTE: deduplicated (dict.fromkeys, order-preserving) rather than the
+        # naive concat-then-filter-against-required_engines-only one might
+        # first reach for - `waited_advisory_engines` and `additional_engines`
+        # legitimately overlap in production (worker.py passes
+        # SANDBOX_WAITED_ENGINE_NAMES as the former and a superset including
+        # it as the latter, so aig-mcp-scan - waited-excluded but still
+        # aggregation-eligible - is reachable through additional_engines).
+        # Without dedup, an overlapping name's blob would be loaded twice by
+        # `load_and_aggregate`, doubling its findings into `core_aggregate`
+        # and manufacturing a fake dedup collision on its own rule_id(s) - the
+        # same bug class as the fixed 2026-07-06 "dedup collision silently
+        # dropped trifecta signal" incident, just self-inflicted this time.
+        engine_names = tuple(
+            dict.fromkeys(
+                tuple(required_engines) + tuple(waited_advisory_engines) + tuple(additional_engines)
+            )
         )
         scan_result = load_and_aggregate(
             blobstore,
@@ -648,6 +834,7 @@ async def _try_score_and_decide(
             signer=signer,
             operator=operator,
             now=airlock.now_epoch(),
+            extra_reasons=extra_reasons,
         )
 
     async with orchestration_session_factory() as session, session.begin():

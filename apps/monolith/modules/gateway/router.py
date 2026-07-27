@@ -19,6 +19,9 @@ import json
 import time
 from typing import Any
 
+from common.frontmatter import parse_frontmatter
+from common.skill_package import root_skill_md_path
+from engine_runner.detectors.skill_permissions import declared_tools
 from engine_runner.normalizer import UnpackRejected, unpack_hardened
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from skillscan_core import TrustTier
@@ -115,6 +118,33 @@ async def create_scan(
             raise HTTPException(status_code=503, detail="inventory module is not configured")
         c_hash = compute_content_hash(files)
         t_digest = compute_toolchain_digest(enabled_engine_metadatas, runtime.policy.version)
+        # FR-PAR-013: record the Skill's declared permissions so the gate and
+        # human reviewers can see them. skill_version.declared_perms has existed
+        # since the initial schema but every caller passed None until 2026-07-27.
+        #
+        # SECURITY/CORRECTNESS: root path ONLY, never basename-anywhere. This
+        # is persisted to skill_version.declared_perms and consumed downstream
+        # by the gate and human reviewers - it must reflect the ONE
+        # declaration the Agent actually reads (the package-root SKILL.md), or
+        # the gate ends up judging a permission profile the package doesn't
+        # really have, permanently recorded. A bundled example
+        # (examples/SKILL.md) must never populate this field.
+        #
+        # 2026-07-27 (final review, F-5): "root" is not the literal string
+        # "SKILL.md" - a conventionally packed `tar czf skill.tgz my-skill/`
+        # puts everything under a wrapper directory the normalizer does not
+        # strip, and this used to record declared_perms=None for every such
+        # package. `common.skill_package.root_skill_md_path` is the one shared
+        # implementation (also used by the permissions detector and by
+        # orchestration's skill-name parser) - do not add a fourth spelling.
+        declared: dict[str, Any] | None = None
+        root_skill_md = root_skill_md_path(f_path for f_path, _mode, _data in files)
+        for f_path, _mode, f_data in files:
+            if f_path == root_skill_md:
+                fm = parse_frontmatter(f_data)
+                if fm is not None:
+                    declared = {"tools": declared_tools(fm)}
+                break
         async with runtime.inventory_session_factory() as inv_session, inv_session.begin():
             known = await inv_session.get(SkillVersionRow, c_hash)
             if known is None:
@@ -126,7 +156,7 @@ async def create_scan(
                         trust_tier=tier.value,
                         content_hash=c_hash,
                         toolchain_digest=t_digest,
-                        declared_perms=None,
+                        declared_perms=declared,
                         operator=session.subject,
                     )
                     await transition_skill(

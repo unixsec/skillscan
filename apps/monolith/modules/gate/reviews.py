@@ -104,7 +104,7 @@ async def submit_review_decision(
     # contradicts verdict" invariant (2026-07-24 scoring design doc) on every
     # normal review-queue decision, not just an edge case.
     #
-    # hard_gate_triggered=False below depends on gate.decide()'s hard-gate
+    # pin_to_floor=False below depends on gate.decide()'s hard-gate
     # branch (gate.py's `combined_hard_gate` check) always forcing BLOCK
     # unconditionally - true today, and this function's own REVIEW-only
     # precondition (checked above) means that branch can be ruled out. It
@@ -135,7 +135,7 @@ async def submit_review_decision(
         )
     findings = [deserialize_finding(f) for f in result_row.findings]
     new_score = security_score(
-        Verdict[new_verdict], findings, hard_gate_triggered=False, weights=CategoryWeights()
+        Verdict[new_verdict], findings, pin_to_floor=False, weights=CategoryWeights()
     )
 
     jws = await signer.sign_verdict(

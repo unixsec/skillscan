@@ -1,5 +1,9 @@
-"""TOCTOU / insecure temp-file detector (coding spec §11.4 FILE-04, SRS Cat-6
+"""TOCTOU / insecure temp-file detector (coding spec §11.4 FILE-06, SRS Cat-6
 "临时文件/符号链接").
+
+2026-07-27：原标签 FILE-04 与检测目录不符——FILE-04 在检测目录里是「任意文件读
+取」，不是临时文件/符号链接风险；本检测器实际对应的是 FILE-06「临时文件与符号
+链接风险」，已修正。
 
 Self-built rules (bandit B108-equivalent: hardcoded /tmp paths) + symlink-
 creation detection. NOTE: symlink *entries inside the scanned archive itself*
@@ -19,32 +23,40 @@ from skillscan_core import (
     EngineCapability,
     EngineMetadata,
     EngineResult,
-    EngineStatus,
     Finding,
-    ScanMode,
     Severity,
 )
 
+from engine_runner.detectors._engine_base import run_with_deadline
+
 _CATEGORY = DetectionCategory.FILE_PACKAGE
 
-_PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
+# confidence is per-rule (D6, 2026-07-27):
+#   0.8  a specific, already-deprecated API - strong signal.
+#   0.6  a real API call, but legitimate (non-attack) uses are common enough
+#        to temper confidence.
+#   0.5  `/tmp/` shows up constantly in ordinary strings/paths - weak signal.
+_PATTERNS: tuple[tuple[str, str, str, Severity, float], ...] = (
     (
         "toctou.hardcoded_tmp_path",
         r"""(?:["'])(?:/tmp/|/var/tmp/|/dev/shm/)[^"']*(?:["'])""",
         "硬编码的可预测临时目录路径",
         Severity.MEDIUM,
+        0.5,
     ),
     (
         "toctou.insecure_mktemp",
         r"\btempfile\.mktemp\s*\(",
         "使用了不安全的 tempfile.mktemp()",
         Severity.HIGH,
+        0.8,
     ),
     (
         "toctou.symlink_creation",
         r"\bos\.symlink\s*\(",
         "运行时创建符号链接",
         Severity.LOW,
+        0.6,
     ),
 )
 
@@ -72,9 +84,18 @@ _RISK_DESCRIPTIONS: dict[str, str] = {
 
 
 def _metadata() -> EngineMetadata:
+    # SECURITY (INV-7, D6 2026-07-27 review): see pii.py's _metadata for the
+    # full rationale - severity and confidence must be part of this hash, not
+    # just rule_id/pattern, or a scoring-relevant rule edit leaves
+    # toolchain_digest/cache_key unchanged.
+    #
+    # `_CATEGORY` too (2026-07-27 final review, F-3 guard): category is a real
+    # scoring input - scoring.py weights every finding by
+    # `weights.for_category` - so a category change must bust the digest.
     hasher = hashlib.sha256()
-    for rule_id, pattern, *_rest in _PATTERNS:
-        hasher.update(f"{rule_id}:{pattern}\n".encode())
+    hasher.update(f"category:{_CATEGORY.value}\n".encode())
+    for rule_id, pattern, _title, severity, confidence in _PATTERNS:
+        hasher.update(f"{rule_id}:{pattern}:{severity.value}:{confidence}\n".encode())
     return EngineMetadata(
         name="inhouse-toctou",
         version="1.0.0",
@@ -88,16 +109,19 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
     for path, data in files.items():
         text = data.decode("utf-8", errors="replace")
         for line_no, line in enumerate(text.splitlines(), start=1):
-            for rule_id, pattern, title, severity in _PATTERNS:
+            for rule_id, pattern, title, severity, confidence in _PATTERNS:
                 if re.search(pattern, line):
                     findings.append(
                         Finding(
                             rule_id=rule_id,
-                            test_item_id="FILE-04",
+                            # 2026-07-27：原标签与检测目录不符，修正为 FILE-06
+                            # （临时文件与符号链接风险，企业Skill安全评估测试维度
+                            # 清单 D7；FILE-04 实际是「任意文件读取」）。
+                            test_item_id="FILE-06",
                             category=_CATEGORY,
                             title=title,
                             severity=severity,
-                            confidence=0.7,
+                            confidence=confidence,
                             source_engine="inhouse-toctou",
                             source_capability=EngineCapability.STATIC,
                             file_path=path,
@@ -117,10 +141,4 @@ class TocTouDetector:
         return _metadata()
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
-        return EngineResult(
-            engine=self.metadata,
-            findings=scan(files),
-            status=EngineStatus.OK,
-            scan_mode=ScanMode.STATIC,
-            llm_used=False,
-        )
+        return run_with_deadline(self.metadata, scan, files, deadline)

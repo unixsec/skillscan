@@ -1,5 +1,6 @@
-"""bandit adapter (coding spec §10: `bandit -f json`) → CODE-12 弱加密,
-FILE-04 TOCTOU/符号链接, 部分 CODE-08.
+"""bandit adapter (coding spec §10: `bandit -f json`) → CODE-10 弱加密,
+FILE-06 TOCTOU/符号链接, CODE-01 命令注入, CODE-08 SQL注入, CODE-02 动态执行,
+CODE-07 不安全反序列化.
 
 Real JSON schema confirmed by reading `vendor/bandit/bandit/formatters/json.py`
 directly (coding spec's own instruction - read the real vendored source,
@@ -13,6 +14,22 @@ threshold - that is NOT a crash, so `treat_nonzero_exit_as_error=False` here;
 stdout JSON-parseability is what actually determines usability (a genuine
 crash produces no valid JSON, which still fails closed via the parser
 raising).
+
+test_item_id mapping (2026-07-27 hardening, D7): this adapter used to pass
+bandit's own `test_id` (e.g. "B608") straight through to `test_item_id`
+whenever it wasn't one of the two originally-mapped groups below - a raw
+engine id never matches a detection-catalog id, so every one of those
+findings counted as UNCOVERED in any report keyed on the catalog (the
+systemic problem `doc/devfile/oss-vs-custom-report.html` documented
+2026-07-09). Fixed two ways: (1) the two pre-existing groups were themselves
+mislabelled (CODE-12 is "进程创建"/process creation in the catalog, not weak
+crypto; FILE-04 is "任意文件读取"/arbitrary file read, not TOCTOU/symlink) -
+corrected to CODE-10/FILE-06. (2) added explicit groups for the common
+still-unmapped cases (command injection, SQLi, dynamic execution, insecure
+deserialization) and changed the fallback from "pass the raw bandit id
+through" to the catalog's own explicit "detected but unclassified" marker,
+GEN-01 (企业Skill安全评估测试维度清单.xlsx, D10) - honest about the gap
+instead of silently reading as a coverage hole.
 """
 
 from __future__ import annotations
@@ -33,15 +50,35 @@ from skillscan_core import (
 from .base import SubprocessEngineAdapter
 
 # SECURITY: bandit test IDs the coding spec explicitly names as mapping to a
-# specific detection-catalog item; everything else falls back to a generic
-# CODE category with the bandit test_id itself as the traceable identifier
-# (honest about not having built a full 70+-rule mapping table).
-_FILE_04_TEST_IDS = frozenset({"B108"})  # hardcoded_tmp_directory
+# specific detection-catalog item; everything else falls back to GEN-01 (see
+# module docstring's 2026-07-27 note) - honest about not having built a full
+# 70+-rule mapping table, rather than leaking the raw bandit id through.
+#
+# 2026-07-27：原 _FILE_04_TEST_IDS 与检测目录不符——FILE-04 是「任意文件读取」，
+# 不是 TOCTOU/临时目录风险；B108 (hardcoded_tmp_directory) 实际对应 FILE-06
+# 「临时文件与符号链接风险」，已改名+改值。
+_FILE_06_TEST_IDS = frozenset({"B108"})  # hardcoded_tmp_directory
+# 2026-07-27：原 _CODE_12_TEST_IDS 与检测目录不符——CODE-12 是「进程创建」，不是
+# 弱加密；这组 test_id 实际对应 CODE-10「弱加密」，已改名+改值。
 # weak crypto/random: B303-B305/B311 are bandit's older blacklist-style IDs;
 # B324 ("hashlib") is the current AST-based plugin that actually fires for
 # `hashlib.md5(...)`/`hashlib.sha1(...)` on the installed bandit 1.9.4 CLI
 # (confirmed empirically - a live hashlib.md5() sample emits B324, not B303).
-_CODE_12_TEST_IDS = frozenset({"B303", "B304", "B305", "B311", "B324"})
+_CODE_10_TEST_IDS = frozenset({"B303", "B304", "B305", "B311", "B324"})
+# 2026-07-27（D7 新增映射，覆盖此前透传原始 bandit ID 的常见情形）：
+# command injection / system command execution - subprocess/shell family.
+_CODE_01_TEST_IDS = frozenset({"B602", "B603", "B605", "B607"})
+# SQL injection - hardcoded SQL string construction.
+_CODE_08_TEST_IDS = frozenset({"B608"})
+# dynamic code execution - eval() on a possibly-untrusted string.
+_CODE_02_TEST_IDS = frozenset({"B307"})
+# insecure deserialization - pickle/dill/shelve of untrusted data. NOTE: this
+# is intentionally separate from _CODE_02_TEST_IDS above, even though both are
+# "unsafe interpretation of data" in spirit - the catalog carries a dedicated
+# CODE-07「不安全反序列化」item (企业Skill安全评估测试维度清单 D2) distinct from
+# CODE-02「代码注入/动态代码执行」, and this file's own `_RISK_DESCRIPTIONS["B301"]`
+# already describes it in exactly those (反序列化/deserialization) terms.
+_CODE_07_TEST_IDS = frozenset({"B301"})
 
 _SEVERITY_MAP = {
     "LOW": Severity.LOW,
@@ -470,11 +507,25 @@ def _build_argv(target_dir: Path) -> list[str]:
 
 
 def _test_item_id_and_category(test_id: str) -> tuple[str, DetectionCategory]:
-    if test_id in _FILE_04_TEST_IDS:
-        return "FILE-04", DetectionCategory.FILE_PACKAGE
-    if test_id in _CODE_12_TEST_IDS:
-        return "CODE-12", DetectionCategory.CODE
-    return test_id, DetectionCategory.CODE
+    if test_id in _FILE_06_TEST_IDS:
+        return "FILE-06", DetectionCategory.FILE_PACKAGE
+    if test_id in _CODE_10_TEST_IDS:
+        return "CODE-10", DetectionCategory.CODE
+    if test_id in _CODE_01_TEST_IDS:
+        return "CODE-01", DetectionCategory.CODE
+    if test_id in _CODE_08_TEST_IDS:
+        return "CODE-08", DetectionCategory.CODE
+    if test_id in _CODE_02_TEST_IDS:
+        return "CODE-02", DetectionCategory.CODE
+    if test_id in _CODE_07_TEST_IDS:
+        return "CODE-07", DetectionCategory.CODE
+    # SECURITY (2026-07-27, D7): GEN-01 is the catalog's own explicit
+    # "detected but unclassified" marker (企业Skill安全评估测试维度清单.xlsx,
+    # D10) - NOT the raw bandit test_id. Passing the raw id through (the
+    # previous behavior) silently reads as "uncovered" to any report keyed on
+    # the catalog, which is strictly worse than an honest GEN-01: it hides a
+    # real finding instead of merely leaving it unclassified.
+    return "GEN-01", DetectionCategory.CODE
 
 
 def parse_output(

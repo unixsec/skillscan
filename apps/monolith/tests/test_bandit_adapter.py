@@ -1,11 +1,13 @@
-"""Tests for `engine_runner.adapters.bandit` (coding spec §10) → CODE-12,
-FILE-04.
+"""Tests for `engine_runner.adapters.bandit` (coding spec §10) → CODE-10,
+FILE-06, CODE-01, CODE-08, CODE-02, CODE-07 (2026-07-27: corrected/expanded
+from the previously mislabelled CODE-12/FILE-04 - see bandit.py's module
+docstring).
 
 `TestParseOutput` exercises the parsing logic against representative JSON
 payloads shaped like the real schema (confirmed by reading
 `vendor/bandit/bandit/formatters/json.py` - and by actually running the
 installed `bandit` CLI, see `TestRealEndToEnd` below, which is what caught
-the B303-vs-B324 test-ID mismatch fixed in bandit.py's `_CODE_12_TEST_IDS`).
+the B303-vs-B324 test-ID mismatch fixed in bandit.py's `_CODE_10_TEST_IDS`).
 
 `TestRealEndToEnd` runs the REAL `bandit` CLI (a lightweight, pure-Python dev
 dependency - `pyproject.toml`'s `[dependency-groups] dev`) through the full
@@ -52,23 +54,60 @@ def _result(**overrides: object) -> dict[str, object]:
 
 
 class TestParseOutput:
-    def test_weak_hash_test_id_maps_to_code_12(self) -> None:
+    def test_weak_hash_test_id_maps_to_code_10(self) -> None:
+        # 2026-07-27: corrected from CODE-12 ("进程创建"/process creation in the
+        # catalog, not weak crypto) to CODE-10 ("弱加密"/weak encryption), the
+        # actual catalog entry for bandit's weak-hash/cipher/random test IDs.
         payload = {"results": [_result(test_id="B324")], "errors": [], "metrics": {}}
         findings = bandit.parse_output(_completed(payload), Path("."), {})
         assert len(findings) == 1
-        assert findings[0].test_item_id == "CODE-12"
+        assert findings[0].test_item_id == "CODE-10"
         assert findings[0].category is DetectionCategory.CODE
 
-    def test_hardcoded_tmp_dir_maps_to_file_04(self) -> None:
+    def test_hardcoded_tmp_dir_maps_to_file_06(self) -> None:
+        # 2026-07-27: corrected from FILE-04 ("任意文件读取"/arbitrary file read
+        # in the catalog, not TOCTOU) to FILE-06 ("临时文件与符号链接风险"), the
+        # actual catalog entry for B108 (hardcoded_tmp_directory).
         payload = {"results": [_result(test_id="B108")], "errors": [], "metrics": {}}
         findings = bandit.parse_output(_completed(payload), Path("."), {})
-        assert findings[0].test_item_id == "FILE-04"
+        assert findings[0].test_item_id == "FILE-06"
         assert findings[0].category is DetectionCategory.FILE_PACKAGE
 
-    def test_unmapped_test_id_falls_back_to_itself(self) -> None:
-        payload = {"results": [_result(test_id="B602")], "errors": [], "metrics": {}}
+    @pytest.mark.parametrize(
+        ("test_id", "expected_item"),
+        [
+            # command injection / system command execution family.
+            ("B602", "CODE-01"),
+            ("B603", "CODE-01"),
+            ("B605", "CODE-01"),
+            ("B607", "CODE-01"),
+            # hardcoded SQL string construction - SQL injection.
+            ("B608", "CODE-08"),
+            # eval() on a possibly-untrusted string - dynamic code execution.
+            ("B307", "CODE-02"),
+            # pickle/dill/shelve of untrusted data - insecure deserialization,
+            # a DISTINCT catalog item from CODE-02 (see bandit.py's own
+            # _CODE_07_TEST_IDS comment for why these aren't lumped together).
+            ("B301", "CODE-07"),
+        ],
+    )
+    def test_2026_07_27_added_mappings(self, test_id: str, expected_item: str) -> None:
+        payload = {"results": [_result(test_id=test_id)], "errors": [], "metrics": {}}
         findings = bandit.parse_output(_completed(payload), Path("."), {})
-        assert findings[0].test_item_id == "B602"
+        assert findings[0].test_item_id == expected_item
+        assert findings[0].category is DetectionCategory.CODE
+
+    def test_unmapped_test_id_falls_back_to_gen_01_not_the_raw_id(self) -> None:
+        # 2026-07-27: the fallback used to pass bandit's own raw test_id
+        # straight through to test_item_id - that never matches a catalog
+        # entry, so a report keyed on the catalog silently counted it as
+        # UNCOVERED. B101 (assert_used) has no specific catalog mapping and
+        # never will (it's a code-quality lint, not a security-catalog item);
+        # the fallback must now be the catalog's own explicit "detected but
+        # unclassified" marker, GEN-01 - never the raw engine id again.
+        payload = {"results": [_result(test_id="B101")], "errors": [], "metrics": {}}
+        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        assert findings[0].test_item_id == "GEN-01"
         assert findings[0].category is DetectionCategory.CODE
 
     def test_severity_and_confidence_mapped(self) -> None:
@@ -149,7 +188,7 @@ class TestMakeAdapter:
 class TestRealEndToEnd:
     """Genuine subprocess proof against the actual installed bandit binary -
     not a hand-shaped JSON fixture. This is what caught the real B303-vs-B324
-    test-ID mismatch (see module docstring and bandit.py's _CODE_12_TEST_IDS
+    test-ID mismatch (see module docstring and bandit.py's _CODE_10_TEST_IDS
     comment)."""
 
     def test_real_bandit_finds_weak_hash_and_shell_true(self, tmp_path: Path) -> None:
@@ -171,7 +210,7 @@ class TestRealEndToEnd:
         assert result.usable
         rule_ids = {f.rule_id for f in result.findings}
         assert "bandit.B324" in rule_ids  # hashlib weak-hash plugin
-        assert any(f.test_item_id == "CODE-12" for f in result.findings)
+        assert any(f.test_item_id == "CODE-10" for f in result.findings)
         assert any("shell" in f.evidence_redacted.lower() for f in result.findings)
 
     def test_real_bandit_clean_file_yields_zero_findings(self, tmp_path: Path) -> None:

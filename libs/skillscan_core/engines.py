@@ -42,12 +42,21 @@ class DetectionEngine(Protocol):
     ) -> EngineResult: ...
 
 
-# (pattern, rule_id, category, severity, trifecta signal or None, title)
+# (pattern, rule_id, category, severity, trifecta, title, confidence)
+#
+# confidence is per-rule, not per-engine: these are plain substring matches, so
+# a hit inside a comment, a docstring or a string literal is indistinguishable
+# from a real call site. Recording 1.0 for all of them overstated the evidence
+# and, because the floor never dipped below 0.6, kept the gate's
+# review_confidence branch permanently unreachable.
+#   0.9  structurally unambiguous
+#   0.7  a distinctive call shape
+#   0.5  a bare substring that commonly appears in prose or literals
 # NOTE: these are detection-pattern strings this engine searches FOR inside untrusted
 # scanned content (e.g. "eval(" flags a call in the Skill being scanned) - nothing here
 # is ever executed, imported, or eval'd by skillscan itself.
 _STATIC_KEYWORD_PATTERNS: tuple[
-    tuple[str, str, DetectionCategory, Severity, TrifectaSignal | None, str], ...
+    tuple[str, str, DetectionCategory, Severity, TrifectaSignal | None, str, float], ...
 ] = (
     (
         "eval(",
@@ -56,6 +65,7 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         Severity.HIGH,
         None,
         "检测到 eval() 调用",
+        0.5,
     ),
     (
         "curl http",
@@ -64,6 +74,7 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         Severity.MEDIUM,
         TrifectaSignal.EXTERNAL_EGRESS,
         "通过 curl 向 http(s) 端点发起出站请求",
+        0.5,
     ),
     (
         "os.environ",
@@ -72,6 +83,7 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         Severity.MEDIUM,
         TrifectaSignal.PRIVATE_DATA_ACCESS,
         "访问环境变量",
+        0.7,
     ),
     (
         "input(",
@@ -80,8 +92,45 @@ _STATIC_KEYWORD_PATTERNS: tuple[
         Severity.LOW,
         TrifectaSignal.UNTRUSTED_INPUT,
         "交互式 input() 调用",
+        0.5,
     ),
 )
+
+# Explicit rule_id -> detection-catalog test_item_id (D9 hardening,
+# 2026-07-27): StaticKeywordEngine was the one engine Task 7's test_item_id
+# unification missed - this used to pass test_item_id=rule_id straight
+# through (see the Finding construction below before this fix), so every
+# finding here emitted its own engine-internal rule name (e.g.
+# "static.eval_call") instead of a real 企业Skill安全评估测试维度清单.xlsx id.
+# That made these findings unmappable to the catalog even though this engine
+# is in required_engines and therefore live in every scan. Same "explicit
+# dict, never derive the catalog id from the rule name" convention as
+# skill_permissions.py's _TEST_ITEM_IDS and mcp_config.py's _TEST_ITEM_IDS.
+#
+#   - static.eval_call -> CODE-02 (代码注入/动态代码执行): xlsx 检测要点明列
+#     "eval/exec 模板转执行". Matches how bandit's B307 (eval) is already
+#     mapped to CODE-02 in services/engine_runner/adapters/bandit.py's
+#     _CODE_02_TEST_IDS - kept consistent across engines.
+#   - static.curl_http -> NET-05 (未加密通信): xlsx 检测手段是
+#     static_regex/ast, and a bare "curl http" substring match is exactly
+#     that - a static_regex hit on plaintext comms. Deliberately NOT NET-01
+#     (异常外联): that item requires ast_taint/threat_intel to establish
+#     "unexpected", which a substring match cannot do.
+#   - static.os_environ -> CRED-03 (敏感凭据读取): xlsx covers "读取网关
+#     token/会话凭证/运行时凭据对象", which reading os.environ falls squarely
+#     under.
+#   - static.input_call -> GEN-01: no catalog item fits "reads stdin". GEN-01
+#     is the established honest fallback for a detection with no on-point
+#     catalog match - same convention as bandit.py's unmapped-test_id
+#     fallback and mcp_config.py's mcp.malformed_config. GEN-01's own catalog
+#     definition is LLM-output-oriented, so this is a deliberate stretch to
+#     the closest "detected but unclassified" bucket, not a claimed exact fit.
+_TEST_ITEM_IDS: dict[str, str] = {
+    "static.eval_call": "CODE-02",
+    "static.curl_http": "NET-05",
+    "static.os_environ": "CRED-03",
+    "static.input_call": "GEN-01",
+}
 
 # 安全风险描述（2026-07-24）：title 只标注命中的关键词，这里说明为什么这个
 # 关键词在 Skill 代码里值得关注。
@@ -115,12 +164,31 @@ def _static_keyword_ruleset_digest() -> str:
     # not just rule_id/pattern - otherwise toolchain_digest/cache_key stay the
     # same and a stale cached PASS survives a rule severity/category/trifecta
     # upgrade (a real gap found by the 2026-07-06 spec-compliance audit: this
-    # previously hashed only rule_id:pattern).
+    # previously hashed only rule_id:pattern). confidence is included for the
+    # same reason (D6, 2026-07-27): it now varies per rule and directly gates
+    # gate.py's review_confidence branch, so a confidence-only rule edit must
+    # also bust the digest/cache_key. test_item_id is included for the same
+    # reason again (D9, 2026-07-27): until this fix test_item_id == rule_id
+    # so it was implicitly covered by the rule_id hash; now that it is an
+    # independent value from _TEST_ITEM_IDS, a test_item_id-only correction
+    # (e.g. fixing a wrong catalog mapping) must still bust the digest/
+    # cache_key, or the fix would be silently served from a stale cached
+    # verdict.
     hasher = hashlib.sha256()
-    for pattern, rule_id, category, severity, trifecta_signal, _title in _STATIC_KEYWORD_PATTERNS:
+    for (
+        pattern,
+        rule_id,
+        category,
+        severity,
+        trifecta_signal,
+        _title,
+        confidence,
+    ) in _STATIC_KEYWORD_PATTERNS:
         trifecta_value = trifecta_signal.value if trifecta_signal is not None else ""
+        test_item_id = _TEST_ITEM_IDS[rule_id]
         hasher.update(
-            f"{rule_id}:{pattern}:{category.value}:{severity.value}:{trifecta_value}\n".encode()
+            f"{rule_id}:{test_item_id}:{pattern}:{category.value}:{severity.value}:"
+            f"{trifecta_value}:{confidence}\n".encode()
         )
     return hasher.hexdigest()
 
@@ -151,7 +219,11 @@ class StaticKeywordEngine:
         findings: list[Finding] = []
         timed_out = False
         for path, data in files.items():
-            if deadline is not None and time.monotonic() > deadline:
+            # `deadline` is a wall-clock epoch (airlock.now_epoch() = time.time()),
+            # never a monotonic value - comparing against time.monotonic() (a small
+            # uptime counter) made this condition permanently false, so the timeout
+            # never fired. Same fix as adapters/base.py:96-105.
+            if deadline is not None and time.time() > deadline:
                 timed_out = True
                 break
             text = data.decode("utf-8", errors="replace")
@@ -163,16 +235,17 @@ class StaticKeywordEngine:
                     severity,
                     trifecta,
                     title,
+                    confidence,
                 ) in _STATIC_KEYWORD_PATTERNS:
                     if pattern in line:
                         findings.append(
                             Finding(
                                 rule_id=rule_id,
-                                test_item_id=rule_id,
+                                test_item_id=_TEST_ITEM_IDS[rule_id],
                                 category=category,
                                 title=title,
                                 severity=severity,
-                                confidence=1.0,
+                                confidence=confidence,
                                 source_engine=self.metadata.name,
                                 source_capability=EngineCapability.STATIC,
                                 trifecta_signals=(

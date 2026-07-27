@@ -32,6 +32,7 @@ import redis.asyncio as aioredis
 from common.blobstore import LocalFilesystemBlobStore
 from fastapi import FastAPI
 from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
+from sqlalchemy import select
 
 from monolith.main import create_app
 from monolith.modules.gate.models import VerdictRow
@@ -39,8 +40,9 @@ from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
+from monolith.modules.inventory.models import SkillVersionRow
 from monolith.modules.inventory.service import register_skill_version, transition_skill
-from monolith.modules.orchestration.models import ScanResultRow
+from monolith.modules.orchestration.models import ScanJob, ScanResultRow
 from monolith.tests.conftest import SessionmakerFixture
 
 _ENGINE = StaticKeywordEngine()
@@ -64,6 +66,36 @@ def _make_tar_bytes_with_skill_md(content: bytes, skill_md: bytes) -> bytes:
         md_info = tarfile.TarInfo(name="SKILL.md")
         md_info.size = len(skill_md)
         tar.addfile(md_info, io.BytesIO(skill_md))
+    return buf.getvalue()
+
+
+def _make_tar_bytes_with_skill_md_at(content: bytes, path: str, skill_md: bytes) -> bytes:
+    """Like `_make_tar_bytes_with_skill_md`, but the SKILL.md lands at an
+    arbitrary (non-root) path - used to prove a bundled example never
+    supplies the package-root permission declaration."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name="skill.py")
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+        md_info = tarfile.TarInfo(name=path)
+        md_info.size = len(skill_md)
+        tar.addfile(md_info, io.BytesIO(skill_md))
+    return buf.getvalue()
+
+
+def _make_wrapped_tar_bytes(content: bytes, skill_md: bytes, *, wrapper: str) -> bytes:
+    """A conventionally packed `tar czf skill.tgz my-skill/`: EVERY member sits
+    under one wrapper directory. `normalizer._canonicalize_member_path` only
+    strips `.` segments, never a leading directory, so the members really do
+    arrive as `my-skill/SKILL.md` etc. - which is exactly why matching the
+    literal string "SKILL.md" was wrong (final review, F-5)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, data in ((f"{wrapper}/skill.py", content), (f"{wrapper}/SKILL.md", skill_md)):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
 
@@ -353,6 +385,127 @@ class TestSkillIdRegistration:
             data={"skill_id": skill_id},
         )
         assert response.status_code == 202
+
+    @pytest.mark.asyncio
+    async def test_a_non_root_skill_md_does_not_populate_declared_perms(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """2026-07-27: FR-PAR-013's declared_perms is persisted to
+        skill_version and consumed downstream by the gate and human
+        reviewers - it must reflect the ONE declaration the Agent actually
+        reads (the package-root SKILL.md). A bundled example
+        (examples/SKILL.md) declaring allowed-tools must NOT populate this
+        field when the package has no root SKILL.md at all - otherwise the
+        gate would permanently judge a permission profile the package
+        doesn't really have."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        tar_bytes = _make_tar_bytes_with_skill_md_at(
+            f"print({uuid.uuid4().hex!r})\n".encode(),
+            "examples/SKILL.md",
+            b"---\nname: example-only\nallowed-tools: [Bash, WebFetch]\n---\n",
+        )
+        response = await client.post(
+            "/v1/scans",
+            files={"package": ("skill.tar", tar_bytes, "application/x-tar")},
+            data={"skill_id": skill_id},
+        )
+        assert response.status_code == 202
+
+        async with inventory_sessionmaker() as session:
+            version = (
+                await session.execute(
+                    select(SkillVersionRow).where(SkillVersionRow.skill_id == skill_id)
+                )
+            ).scalar_one()
+        assert version.declared_perms is None
+
+    @pytest.mark.asyncio
+    async def test_a_flat_packages_root_skill_md_populates_declared_perms(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The baseline the wrapped case below must match: nothing about
+        packaging shape may change what gets persisted."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        tar_bytes = _make_tar_bytes_with_skill_md(
+            f"print({uuid.uuid4().hex!r})\n".encode(),
+            b"---\nname: flat-skill\nallowed-tools: [Read, Grep]\n---\n",
+        )
+        response = await client.post(
+            "/v1/scans",
+            files={"package": ("skill.tar", tar_bytes, "application/x-tar")},
+            data={"skill_id": skill_id},
+        )
+        assert response.status_code == 202
+
+        async with inventory_sessionmaker() as session:
+            version = (
+                await session.execute(
+                    select(SkillVersionRow).where(SkillVersionRow.skill_id == skill_id)
+                )
+            ).scalar_one()
+        assert version.declared_perms == {"tools": ["Read", "Grep"]}
+
+    @pytest.mark.asyncio
+    async def test_a_directory_wrapped_packages_skill_md_populates_declared_perms(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """2026-07-27 (final review, F-5): `tar czf skill.tgz my-skill/` - the
+        conventional way to pack a directory - wraps every member in
+        `my-skill/`, and the normalizer never strips it. This handler matched
+        the literal string "SKILL.md", so it silently recorded
+        `declared_perms=None` for a package that declares its permissions
+        perfectly well - and `declared_perms` is consumed downstream by the
+        gate and by human reviewers, so the gate ended up judging a permission
+        profile the package does not actually have, permanently recorded.
+
+        `ScanJob.skill_name` is asserted too: it is the third site that had the
+        same literal-string bug, and it is what the scans list displays."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        tar_bytes = _make_wrapped_tar_bytes(
+            f"print({uuid.uuid4().hex!r})\n".encode(),
+            b"---\nname: wrapped-skill\nallowed-tools: [Read, Grep]\n---\n",
+            wrapper="my-skill",
+        )
+        response = await client.post(
+            "/v1/scans",
+            files={"package": ("skill.tar", tar_bytes, "application/x-tar")},
+            data={"skill_id": skill_id},
+        )
+        assert response.status_code == 202
+        scan_id = response.json()["scan_id"]
+
+        async with inventory_sessionmaker() as session:
+            version = (
+                await session.execute(
+                    select(SkillVersionRow).where(SkillVersionRow.skill_id == skill_id)
+                )
+            ).scalar_one()
+        assert version.declared_perms == {"tools": ["Read", "Grep"]}
+
+        async with orchestration_sessionmaker() as session:
+            job = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert job.skill_name == "wrapped-skill"
 
     @pytest.mark.asyncio
     async def test_resubmitting_a_published_skill_id_with_new_content_is_409(

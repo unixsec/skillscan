@@ -1,4 +1,4 @@
-"""Tests for `orchestration.drift` (coding spec §11.4 SUP-05) against the real
+"""Tests for `orchestration.drift` (coding spec §11.4 SUPPLY-06) against the real
 local MySQL instance - reading `baseline` via orchestration's SELECT-only
 cross-module grant (policies/grants/manifest.yaml)."""
 

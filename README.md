@@ -39,9 +39,34 @@ Since then:
   within it. The score is never an input to `decide()`, which is what makes
   "BLOCK with a high score" structurally impossible rather than merely
   tested-for.
+- **Sandbox-tier engines now reach the verdict.** bandit / yara / skillspector /
+  osv-scanner previously landed only if they happened to finish before the
+  decision; the gate now waits for them, up to 300 seconds. The wait is
+  advisory — a missing sandbox engine is recorded in `reasons` and the verdict
+  proceeds, so one degraded engine cannot fail-close a whole batch. The
+  trade-off is latency: a scan takes minutes rather than milliseconds, and the
+  scan detail page does not yet auto-refresh.
+- **Two new floor detectors**, taking `required_engines` from 7 to 9: bundled
+  `.mcp.json` (command injection in a server definition, non-local endpoints,
+  credential-shaped environment passthrough) and `SKILL.md` frontmatter
+  permissions (over-broad tool declarations, undeclared permissions). Both are
+  static-only — the `.mcp.json` detector never connects to the endpoints it
+  reads about. Declared permissions are now persisted per skill version.
+- **Per-rule confidence** replacing one constant per engine, graded by evidence
+  strength: structurally validated matches ~0.9, distinctive API-call shapes
+  0.7-0.8, bare substrings 0.4-0.5. This revived a gate policy branch that had
+  been unreachable, since no floor engine had ever emitted below its threshold.
+  Measured against 836 real historical verdicts, the change moves 2.3% of scans
+  from PASS to REVIEW.
+- **Catalog-id correctness.** Every finding carries a `test_item_id` from the
+  detection catalog; several engines had been emitting their own internal rule
+  ids or ids that did not exist in it, which made compliance reports read as
+  uncovered for capabilities that were in fact running. A test now asserts that
+  every id any engine can emit is a real catalog entry — a shape check cannot
+  catch a wrong id that is shaped exactly like a right one.
 
-**951 backend tests** pass against real MySQL/Redis (no mocking of the systems
-under test), plus **117 kernel tests** (`tests/`, pure `skillscan_core`, stdlib
+**1103 backend tests** pass against real MySQL/Redis (no mocking of the systems
+under test), plus **182 kernel tests** (`tests/`, pure `skillscan_core`, stdlib
 only). `ruff check` / `ruff format --check` / `mypy --strict` are clean across
 the tree, and `scripts/check_import_boundaries.py` guards the cross-module ORM
 boundary — each module owns its own tables and its own least-privilege database
@@ -62,8 +87,8 @@ Node/npm.
 
 ```bash
 uv sync                    # install all deps (backend + dev tools) into .venv
-uv run pytest -q           # backend suite against local MySQL/Redis (951 tests)
-uv run pytest tests/ -q    # kernel suite, no external dependencies (117 tests)
+uv run pytest -q           # backend suite against local MySQL/Redis (1103 tests)
+uv run pytest tests/ -q    # kernel suite, no external dependencies (182 tests)
 uv run mypy                # strict type-check
 uv run ruff check .        # lint
 uv run ruff format --check .

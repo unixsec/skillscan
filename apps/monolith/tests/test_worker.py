@@ -51,6 +51,7 @@ from monolith.modules.reporting.service import (
 )
 from monolith.tests.conftest import SessionmakerFixture
 from monolith.worker import (
+    SANDBOX_WAITED_ENGINE_NAMES,
     promote_approved_policy,
     reload_policy_if_changed,
     run_due_report_schedules,
@@ -74,6 +75,42 @@ def _policy(*, version: str) -> GatePolicy:
 
 def _unique_files(marker: str) -> list[tuple[str, int, bytes]]:
     return [(f"skill_{marker}.py", 0o644, f"print('ok')  # {marker}\n".encode())]
+
+
+def _seed_sandbox_waited_engine_blobs(
+    blobstore: LocalFilesystemBlobStore, scan_id: str, *, skip: frozenset[str] = frozenset()
+) -> None:
+    """2026-07-27 (D2): `worker_tick` now waits for `SANDBOX_WAITED_ENGINE_NAMES`
+    before its collector step will decide a scan at all (see
+    apps/monolith/worker.py's own `run_result_collector_tick` call). This
+    process has no adapter for any of them - a real deployment gets these
+    blobs from the separate engine-runner service's own subprocess adapters -
+    so every end-to-end test in this file that polls `worker_tick` until a
+    scan reaches 'decided' must simulate "the engine-runner already finished"
+    the same way `test_sandbox_engine_finding_is_aggregated_but_never_
+    dispatched_here` does below, or the wait would never resolve within the
+    test's own tick budget (resolving it for real means waiting out
+    ScanRuntime.sandbox_wait_timeout_s, which none of these tests exercise -
+    that is TestSandboxWait's job, in test_orchestration_pipeline.py)."""
+    for name in SANDBOX_WAITED_ENGINE_NAMES:
+        if name in skip:
+            continue
+        result = EngineResult(
+            engine=EngineMetadata(
+                name=name,
+                version="test",
+                ruleset_digest="test",
+                capabilities=frozenset({EngineCapability.STATIC}),
+            ),
+            findings=(),
+            status=EngineStatus.OK,
+            scan_mode=ScanMode.STATIC,
+            llm_used=False,
+        )
+        blobstore.put(
+            findings_key(scan_id, name),
+            json.dumps(serialize_engine_result(result)).encode("utf-8"),
+        )
 
 
 class _RecordingNotifier:
@@ -190,6 +227,11 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
             )
+        # D2 (2026-07-27): worker_tick's collector now waits for the sandbox
+        # engines too - simulate the engine-runner having already finished
+        # (see _seed_sandbox_waited_engine_blobs' own docstring) so this test
+        # can still reach 'decided' within its own tick budget.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
 
         # A generous bound, not 20: worker_tick's internal claim counts (10
         # each) are shared, backlog-sensitive budgets across the whole suite
@@ -265,6 +307,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
             )
+        # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
 
         # A generous bound, not 20: worker_tick's internal claim counts (10
         # each) are shared, backlog-sensitive budgets across the whole suite
@@ -408,6 +452,13 @@ class TestWorkerEndToEnd:
             findings_key(scan_id, "aig-mcp-scan"),
             json.dumps(serialize_engine_result(aig_result)).encode("utf-8"),
         )
+        # D2 (2026-07-27): worker_tick's collector now WAITS for
+        # SANDBOX_WAITED_ENGINE_NAMES (bandit already written above with a
+        # real finding - skip it here so this doesn't clobber it) before it
+        # will decide this scan at all. aig-mcp-scan is deliberately NOT in
+        # the waited set (see SANDBOX_WAITED_ENGINE_NAMES' own comment) but is
+        # already written above anyway, as this test's own regression target.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id, skip=frozenset({"bandit"}))
 
         # A generous bound, not 20: worker_tick's internal claim counts (10
         # each) are shared, backlog-sensitive budgets across the whole suite
@@ -504,6 +555,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
             )
+        # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
         # Consume-and-ack the original message WITHOUT processing it, then
         # backdate the row past the requeue threshold.
         stale = await airlock.claim_scan_jobs(
@@ -651,7 +704,7 @@ class TestLifecycleSync:
             )
 
         async with orchestration_sessionmaker() as session, session.begin():
-            await submit_scan(
+            scan_id = await submit_scan(
                 session,
                 redis_client,
                 blobstore,
@@ -660,6 +713,8 @@ class TestLifecycleSync:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
             )
+        # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
         # A generous bound, not 20: worker_tick's internal claim counts (10
         # each) are shared, backlog-sensitive budgets across the whole suite
         # run - each tick only makes bounded progress, so enough accumulated
@@ -699,7 +754,7 @@ class TestLifecycleSync:
         unique_consumer: str,
     ) -> None:
         """Closes "orchestration/drift.py exists, is tested, has zero
-        callers anywhere" (coding spec SUP-05, FR-REV-020). A skill with an
+        callers anywhere" (coding spec SUPPLY-06, FR-REV-020). A skill with an
         approved baseline that gets a PASS-verdict scan under DIFFERENT
         content must end up quarantined, not left published - the rug-pull
         pattern this module exists to catch."""
@@ -753,7 +808,7 @@ class TestLifecycleSync:
 
         await airlock.ensure_groups(redis_client)
         async with orchestration_sessionmaker() as session, session.begin():
-            await submit_scan(
+            scan_id = await submit_scan(
                 session,
                 redis_client,
                 blobstore,
@@ -762,6 +817,8 @@ class TestLifecycleSync:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
             )
+        # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
         # See the note on the "published" polling loop above: a generous
         # bound, not 20, since worker_tick's internal claim counts are
         # shared, backlog-sensitive budgets across the whole suite run, and
@@ -847,7 +904,7 @@ class TestLifecycleSync:
 
         await airlock.ensure_groups(redis_client)
         async with orchestration_sessionmaker() as session, session.begin():
-            await submit_scan(
+            scan_id = await submit_scan(
                 session,
                 redis_client,
                 blobstore,
@@ -856,6 +913,8 @@ class TestLifecycleSync:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
             )
+        # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
+        _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
         # A generous bound, not 20: worker_tick's internal claim counts (10
         # each) are shared, backlog-sensitive budgets across the whole suite
         # run - each tick only makes bounded progress, so enough accumulated

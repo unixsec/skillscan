@@ -5,6 +5,7 @@ Pure stdlib, zero runtime dependencies.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 from skillscan_core.models import (
@@ -160,7 +161,7 @@ def security_score(
     verdict: Verdict,
     findings: Iterable[Finding],
     *,
-    hard_gate_triggered: bool = False,
+    pin_to_floor: bool = False,
     weights: CategoryWeights = _DEFAULT_WEIGHTS,
 ) -> int:
     """0-100 advisory score, deterministically derived from an ALREADY-DECIDED
@@ -169,18 +170,42 @@ def security_score(
     score within that band, so a score can never contradict (or be used to
     relitigate) the verdict that produced it.
 
-    SECURITY (INV-3 parity): a hard-gate hit is the unwaivable, most-severe
-    class of finding - it always pins the score to the band floor (0 for
-    BLOCK) rather than letting the ordinary per-finding penalty formula
-    (which could land well above the floor for a single moderate-severity
-    hard-gate finding) understate it.
+    Because the band is chosen first, comparing scores ACROSS verdicts is
+    meaningless: a BLOCK with one CRITICAL scores below a REVIEW with ten
+    HIGHs, by construction. The score ranks packages within a verdict, not
+    between verdicts.
+
+    `pin_to_floor` puts the score at the band floor. Three situations call for
+    it: a hard-gate hit (the unwaivable, most-severe class of finding - INV-3
+    parity); a fail-closed verdict, where the scan could not be completed at
+    all (rejected archive, missing required engine); and a non-PASS verdict
+    reached with an EMPTY `findings` argument even though the verdict itself
+    says something is wrong - e.g. gate.decide()'s dedup-collision signal
+    restoration (INV-4/INV-5) or its flood-cap-forces-REVIEW step (INV-5) can
+    push the verdict up from information outside the scored set, leaving
+    nothing in `findings` to price the severity that actually produced it. All
+    three carry the same shape: we know LESS about this package than about one
+    with real findings we can see and score, so letting it land at the band's
+    top - which is what an empty finding set used to produce - was backwards.
+
+    The penalty saturates rather than accumulating linearly: a linear sum hit
+    the band floor at 9 LOW findings (PASS) or 2 HIGH findings (REVIEW) and
+    stayed there, so the score stopped discriminating exactly where it mattered
+    most. `band_width * (1 - exp(-raw/K))` with K = band width is strictly
+    increasing, never reaches the floor, and keeps near-linear behaviour for
+    small finding counts.
     """
     band_min, band_max = _SCORE_BAND[verdict]
-    if hard_gate_triggered:
+    if pin_to_floor:
         return band_min
-    penalty = sum(
+    raw_penalty = sum(
         _SEVERITY_PENALTY_WEIGHT[f.severity] * f.confidence * weights.for_category(f.category)
         for f in findings
     )
-    raw = band_max - penalty
-    return max(band_min, min(band_max, round(raw)))
+    band_width = band_max - band_min
+    if band_width <= 0:  # defensive: a degenerate band would divide by zero below
+        return band_min
+    penalty = band_width * (1.0 - math.exp(-raw_penalty / band_width))
+    # The clamp is mathematically unnecessary now (penalty < band_width always)
+    # but kept as a backstop against a mis-configured weight or a future band.
+    return max(band_min, min(band_max, round(band_max - penalty)))

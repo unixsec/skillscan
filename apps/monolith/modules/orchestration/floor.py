@@ -10,10 +10,11 @@ unconditionally by whoever builds a policy - this module does not enforce
 that itself (policy construction is `main.py`'s/M6 policy-as-code's job), it
 only defines what belongs in the floor set.
 
-`IntelMatcher` (coding spec's NET-06/07/08) is deliberately NOT part of the
-floor: unlike these, it needs a DB-fetched IOC snapshot at construction time
-(see `modules.intel.matcher`), so it can't be built from zero arguments the
-way every floor engine can.
+`IntelMatcher` (coding spec's INTEL-01/02/03, corrected 2026-07-27 from the
+previously mislabelled NET-06/07/08) is deliberately NOT part of the floor:
+unlike these, it needs a DB-fetched IOC snapshot at construction time (see
+`modules.intel.matcher`), so it can't be built from zero arguments the way
+every floor engine can.
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ from __future__ import annotations
 from engine_runner.detectors.crypto_weak import CryptoWeakDetector
 from engine_runner.detectors.file_type import FileTypeDetector
 from engine_runner.detectors.jailbreak_inducement_zh import JailbreakInducementZhDetector
+from engine_runner.detectors.mcp_config import McpConfigDetector
 from engine_runner.detectors.pii import PiiDetector
 from engine_runner.detectors.prompt_injection_zh import PromptInjectionZhDetector
+from engine_runner.detectors.skill_permissions import SkillPermissionsDetector
 from engine_runner.detectors.toctou import TocTouDetector
 from skillscan_core import DetectionEngine, StaticKeywordEngine
 
@@ -39,6 +42,11 @@ def floor_engines() -> dict[str, DetectionEngine]:
         TocTouDetector(),
         PromptInjectionZhDetector(),  # PROMPT-01 中文直接提示词注入
         JailbreakInducementZhDetector(),  # PROMPT-04 中文诱导提示/越权话术
+        # 随包 .mcp.json 检测(Cat-8)。注释曾写 "MCP-01/02" - 809c550(2026-07-27)
+        # 校正后各规则实际归属 CODE-01/MCP-04/CRED-04/GEN-01(详见
+        # mcp_config.py 自身的 _TEST_ITEM_IDS 与其模块文档字符串)。
+        McpConfigDetector(),
+        SkillPermissionsDetector(),  # Cat-5 PERM-* SKILL.md 权限声明
     )
     return {engine.metadata.name: engine for engine in instances}
 

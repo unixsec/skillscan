@@ -23,7 +23,14 @@ One `worker_tick()` drives, in order:
                          scan)
 4. score + decide      - orchestration.service.run_result_collector_tick with
                          a LIVE allowlist read (closes the startup-snapshot
-                         gap: MAINTENANCE_GUIDE §3 gap 2)
+                         gap: MAINTENANCE_GUIDE §3 gap 2); the gate now WAITS
+                         for the sandbox engines too (D2, 2026-07-27) before
+                         deciding, so orchestration.service.
+                         sweep_sandbox_wait_timeouts runs right after it to
+                         force through anything that waited past
+                         ScanRuntime.sandbox_wait_timeout_s - see
+                         SANDBOX_WAITED_ENGINE_NAMES below for what's waited
+                         on and why aig-mcp-scan is excluded
 5. lifecycle sync      - verdicts drive the §16.2 skill state machine
                          (scanning→published on PASS, scanning→review_pending
                          on REVIEW; review-approved skills →published) - a
@@ -32,7 +39,7 @@ One `worker_tick()` drives, in order:
                          already has an approved baseline (inventory.service.
                          set_baseline, a separate admin action) and this
                          content_hash doesn't match it, the transition goes
-                         to quarantined instead (coding spec SUP-05:
+                         to quarantined instead (coding spec SUPPLY-06:
                          "content_hash 对比 baseline, 不一致 → 隔离",
                          FR-REV-020) - closes "drift.py exists, is tested,
                          has no live caller"
@@ -67,6 +74,7 @@ from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from skillscan_core import GatePolicy
 from sqlalchemy import select
 
+from monolith.modules.admin.engine_registry import list_disabled_engines
 from monolith.modules.audit.service import drain_pending_intents
 from monolith.modules.gate.models import PolicyProposalRow, VerdictRow
 from monolith.modules.gate.policy import GatePolicyLoadError, parse_gate_policy
@@ -84,6 +92,7 @@ from monolith.modules.orchestration.service import (
     POISON_PILL_STATUS,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
+    sweep_sandbox_wait_timeouts,
 )
 from monolith.modules.reporting import service as reporting_service
 from monolith.modules.reporting.models import ReportScheduleRow
@@ -103,6 +112,16 @@ _WORKER_OPERATOR = "system:worker"
 # silently dropped aig-mcp-scan (computed and blob-written by engine-runner,
 # never aggregated into any verdict here) until this alias replaced it.
 SANDBOX_ADVISORY_ENGINE_NAMES: tuple[str, ...] = SANDBOX_ENGINE_NAMES
+# The sandbox engines the gate WAITS for (D2, 2026-07-27). aig-mcp-scan is
+# excluded unconditionally: it is only constructed when vllm_base_url is set
+# (sandbox_engines.py:137), so on a default deployment it never reports at all,
+# and even when enabled its 240s subprocess timeout would consume almost the
+# entire 300s wait window on its own - starving the other four. Its findings
+# therefore remain probabilistically visible; fixing that needs per-engine
+# timeouts, not a bigger global one.
+SANDBOX_WAITED_ENGINE_NAMES: tuple[str, ...] = tuple(
+    n for n in SANDBOX_ADVISORY_ENGINE_NAMES if n != "aig-mcp-scan"
+)
 # Engine marker for the sweep's "artifact vanished from the blob store"
 # dead-letter (audit-distinguishable from a real worker's poison-pill; the
 # collector keys off status, the engine field is informational).
@@ -230,7 +249,8 @@ async def reload_policy_if_changed(runtime: ScanRuntime) -> bool:
 
 async def _floor_engines_with_intel(runtime: ScanRuntime) -> dict[str, Any]:
     """`floor_engines()` plus a freshly-snapshotted `IntelMatcher` (coding
-    spec NET-06/07/08) - not itself a floor engine (see module docstring's
+    spec INTEL-01/02/03, corrected 2026-07-27 from the previously mislabelled
+    NET-06/07/08) - not itself a floor engine (see module docstring's
     step-3 note: it needs a DB read to construct, floor engines don't), and
     deliberately not `required_engines` (an intel-DB hiccup degrades to
     floor-only findings rather than fail-closed BLOCKing every scan, same
@@ -316,7 +336,7 @@ _VERDICT_TARGET_STATE = {"PASS": "published", "REVIEW": "review_pending"}
 
 
 async def _quarantine_if_drifted(runtime: ScanRuntime, *, skill_id: str, content_hash: str) -> None:
-    """SUP-05 (coding spec, FR-REV-020): "content_hash 对比 baseline, 不一致 →
+    """SUPPLY-06 (coding spec, FR-REV-020): "content_hash 对比 baseline, 不一致 →
     隔离". `inventory.lifecycle`'s own transition graph only allows
     'quarantined' FROM 'published' (confirmed: `scanning -> quarantined` is
     not a legal edge) - so this runs as a follow-up AFTER a skill has just
@@ -339,6 +359,13 @@ async def _quarantine_if_drifted(runtime: ScanRuntime, *, skill_id: str, content
                 skill_id=skill_id,
                 to_state="quarantined",
                 reason=(
+                    # FROZEN literal, not a spec citation: `reeval/router.py`'s
+                    # _DRIFT_REASON_PREFIX matches historical rows against this
+                    # exact prefix. The catalog renumbered SUP-05 -> SUPPLY-06
+                    # (2026-07-28) and the comments around here followed, but
+                    # changing THIS string would make every drift event written
+                    # before the rename invisible on the reeval page. See that
+                    # constant's comment for the full reasoning.
                     f"drift detected (SUP-05): baseline={drift.baseline_content_hash} "
                     f"!= current={content_hash}"
                 ),
@@ -506,6 +533,16 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
         "swept": 0,
         "engine_jobs": 0,
         "decided": 0,
+        # 2026-07-27 review (Minor): named "swept", not "timeouts" -
+        # sweep_sandbox_wait_timeouts returns how many scans IT decided (any
+        # queued/running row older than the cutoff it force-decided, whether
+        # or not a sandbox engine was actually still missing at that point -
+        # _try_score_and_decide returns True for every row it successfully
+        # scores), not a count of genuine sandbox timeouts. The per-verdict
+        # `sandbox_wait_timeout:<engines>` reason is the accurate signal for
+        # "this specific verdict was missing a sandbox engine"; this counter
+        # is only ever "how much work did the sweep do this tick."
+        "sandbox_swept": 0,
         "lifecycle": 0,
         "audit_chained": 0,
         "outbox_dispatched": 0,
@@ -531,17 +568,57 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
     # `additional_engine_names` above - they run only in the separate engine-runner
     # service (INV-15 subprocess/license isolation), and this process has no adapter
     # instance for them to dispatch. They're aggregation-only: when the
-    # engine-runner has already written a finding blob for one by the time this
-    # tick's collector runs, it counts toward severity/trifecta (same advisory,
-    # never-gates-the-wait treatment as the intel matcher); before this fix their
-    # blobs were written but silently never read at all. In practice the floor
-    # tick usually decides within the same synchronous tick it dispatches in,
-    # while the sandbox engines are real subprocesses on their own poll interval
-    # in a different process - so this makes them visible when they win that
-    # race, not reliably visible on every scan. Making them reliably visible
-    # (wait for them) or required/gating is a real security-posture/latency
-    # tradeoff for the user to decide, not made here.
+    # engine-runner has already written a finding blob for one, it counts toward
+    # severity/trifecta (same advisory, never-fail-closed treatment as the intel
+    # matcher - see `_try_score_and_decide`'s docstring). Before this fix their
+    # blobs were written but silently never read at all; after it, but before D2
+    # (2026-07-27), they were read only when they happened to already be written
+    # by the time this tick's collector ran - the floor tick usually decides
+    # within the same synchronous tick it dispatches in, while the sandbox
+    # engines are real subprocesses on their own poll interval in a different
+    # process, so a verdict was routinely signed before their first subprocess
+    # had even exited.
+    #
+    # DECIDED (D2): the gate now WAITS for SANDBOX_WAITED_ENGINE_NAMES (below)
+    # before `run_result_collector_tick` will decide a scan at all - they are
+    # passed as `waited_advisory_engines`, not just `additional_engines`. They
+    # stay advisory, never `required_engines`: a missing one degrades to an
+    # advisory absence rather than a fail-closed BLOCK, so one crashed engine
+    # (or engine-runner outage) cannot block every scan. A wait that runs past
+    # `runtime.sandbox_wait_timeout_s` is forced through by
+    # `sweep_sandbox_wait_timeouts` below - see that function's own docstring
+    # for why the sweep's cutoff isn't exactly `sandbox_wait_timeout_s`. On a
+    # forced timeout, `reasons` gains `sandbox_wait_timeout:<engines>` so the
+    # downgrade is visible via `GET /v1/scans/{id}`, never silent.
+    #
+    # aig-mcp-scan is excluded from the WAITED set (SANDBOX_WAITED_ENGINE_NAMES)
+    # but stays in the AGGREGATED set below: it is only constructed when
+    # `vllm_base_url` is set, so a default deployment would otherwise wait the
+    # full budget for an engine that can never report, and even when enabled
+    # its 240s subprocess timeout would consume nearly the whole 300s window on
+    # its own, starving the other four. Its findings remain probabilistically
+    # visible - counted when it happens to have reported by decide time, same
+    # as before D2 - rather than reliably waited-for.
     aggregation_advisory_engines = dispatchable_advisory_engines + SANDBOX_ADVISORY_ENGINE_NAMES
+    # SECURITY/operability (Important 2, 2026-07-27 review): SANDBOX_WAITED_
+    # ENGINE_NAMES is a static constant - it never reflects the admin
+    # enable/disable toggle (PATCH /v1/admin/engines/{name}, gated only by
+    # `engine_registry.is_disableable`, which allows disabling any of these
+    # four since none is in `required_engines`). The engine-runner service
+    # skips a disabled engine with a bare `continue` (services/engine_runner/
+    # worker.py) - no blob, no result message, ever. Waiting on a name that
+    # can structurally never report would silently turn a routine admin
+    # disable into a 330s decision delay on EVERY scan from then on (still
+    # recorded in `reasons`, so not silent in the audit sense - but a steep,
+    # surprising operability cliff for one legitimate admin action). Read live
+    # each tick (same Redis key `list_disabled_engines` reads for the
+    # dashboard at reporting/service.py:359 and engine-runner's own dispatch
+    # gate) so a re-enable takes effect on the very next tick, same as the
+    # disable did.
+    disabled_engines = await list_disabled_engines(runtime.redis)
+    active_sandbox_waited_engines = tuple(
+        n for n in SANDBOX_WAITED_ENGINE_NAMES if n not in disabled_engines
+    )
     counts["engine_jobs"] = await run_mock_engine_worker_tick(
         runtime.redis,
         runtime.blobstore,
@@ -563,6 +640,19 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
         signer=runtime.signer,
         consumer=consumer,
         operator=_WORKER_OPERATOR,
+        additional_engines=aggregation_advisory_engines,
+        waited_advisory_engines=active_sandbox_waited_engines,
+    )
+    counts["sandbox_swept"] = await sweep_sandbox_wait_timeouts(
+        runtime.blobstore,
+        runtime.orchestration_session_factory,
+        runtime.gate_session_factory,
+        policy=runtime.policy,
+        trust_tier=runtime.default_trust_tier,
+        allowlist=allowlist,
+        signer=runtime.signer,
+        waited_advisory_engines=active_sandbox_waited_engines,
+        wait_timeout_s=runtime.sandbox_wait_timeout_s,
         additional_engines=aggregation_advisory_engines,
     )
 

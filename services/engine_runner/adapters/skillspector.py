@@ -1,5 +1,50 @@
 """skillspector adapter (coding spec §10: SARIF output) → 大部分 Cat-1..6.
 
+test_item_id mapping (2026-07-27 hardening, D7): `test_item_id=ruleId` used to
+pass skillspector's own SARIF ruleId (e.g. "TP1", "P1", "PE3") straight
+through - a raw engine id never matches a detection-catalog id, so every one
+of those findings counted as UNCOVERED in any report keyed on the catalog
+(the systemic problem `doc/devfile/oss-vs-custom-report.html` documented
+2026-07-09). `_TEST_ITEM_ID_BY_RULE_ID` below now classifies every ruleId
+this adapter has a fixed, confirmed label for (the same set `_RULE_ID_TITLES`
+covers, per the vendored static analyzers) into its real catalog entry;
+anything not in the table - including every LLM-driven free-text ruleId,
+which by construction can't be pre-enumerated - falls back to GEN-01, the
+catalog's own explicit "detected but unclassified" marker (企业Skill安全评估
+测试维度清单.xlsx, D10), never the raw ruleId again. A few ruleIds
+(P6/P7/P8 system-prompt extraction; MP2 context stuffing; OH1-3 output
+handling; AS3 skill enumeration; EA2 unconfirmed autonomy; RA1 self-
+modification; TM1/TM2 tool-parameter/chaining abuse; TR1-3 trigger-word
+issues) are deliberately left at GEN-01 rather than forced into a
+poorly-fitting catalog item - the same "honest about the gap" posture as
+bandit.py's own mapping table, not an oversight.
+
+2026-07-27 review correction: this table originally also mapped RA2 →
+PERM-07 and TM3 → MCP-04 - both syntactically valid catalog ids but
+semantically mismatched (exactly the class of defect this task exists to
+remove). RA2's real pattern is OS-level persistence (crontab/dotfiles/
+systemd/launchd), not the agent's own hooks system PERM-07 actually
+describes; TM3's real pattern is generic app config hygiene (TLS
+verification disabled, permissive CORS, debug mode), not MCP-04's
+MCP-protocol-specific server config. Both now fall through to GEN-01 - see
+each one's own comment in `_TEST_ITEM_ID_BY_RULE_ID` below.
+
+2026-07-27 review follow-up: TP1-4 (the MCP tool-poisoning analyzer,
+`mcp_tool_poisoning.py`) had NO entry at all - a plain omission, not a
+deliberate GEN-01 call - so all four silently fell to the GEN-01 fallback
+despite being real, fixed ruleIds this module already names in
+`_RULE_ID_TITLES`. Unlike a raw-ruleId passthrough, GEN-01 doesn't even
+preserve which ruleId produced the finding, so this was a real regression in
+traceability, introduced by D7's own GEN-01 fallback. Read directly:
+`mcp_tool_poisoning.py` confirms TP1 (hidden instructions), TP2 (Unicode
+deception), TP3 (parameter-description injection) and TP4 (LLM-based
+description-vs-behavior mismatch, gated on `state.get("use_llm", True)`) are
+all tool-description-poisoning checks - MCP-01 in the xlsx, whose detection
+means column lists both `static_regex` (TP1-3) and `semantic_llm` (TP4) as
+in-scope mechanisms for this single catalog item. All four now map to
+MCP-01; TP4 never fires in a static-only deployment (no vLLM backend),
+same caveat already recorded elsewhere for PROMPT-05/GEN-01.
+
 Real CLI/output confirmed by reading `vendor/skillspector/` directly (coding
 spec's own instruction - read the real vendored source, don't guess the
 interface):
@@ -150,6 +195,101 @@ _TEMPLATED_RULE_ID_PREFIXES: dict[str, str] = {
     "TR1": "触发词范围过宽",
     "TR2": "触发词与内置命令冲突",
     "TR3": "诱导性关键词触发",
+}
+
+# 2026-07-27（D7 硬化）：skillspector 自身 SARIF ruleId → 检测目录 test_item_id。
+# 覆盖 _RULE_ID_TITLES/_TEMPLATED_RULE_ID_PREFIXES 已确认存在固定标签的 ruleId
+# 中，能在企业Skill安全评估测试维度清单里找到明确对应条目的部分；刻意不覆盖的
+# ruleId（P6/P7/P8 系统提示词提取、MP2 上下文填塞、OH1-3 输出处理、AS3 枚举其它
+# Skill、EA2 未经确认的自主决策、RA1 自我修改、TM1/TM2 工具参数/链式调用滥用、
+# TR1-3 触发词问题）没有能一一对应的目录条目，强行凑一个不精确的映射比诚实地走
+# GEN-01 兜底更糟——这与本文件 module docstring 的说明一致。
+_TEST_ITEM_ID_BY_RULE_ID: dict[str, str] = {
+    # AS: agent-surface access.
+    "AS1": "CRED-07",  # 访问 Agent 配置目录 - 敏感文件访问
+    "AS2": "CRED-03",  # 访问 MCP 配置 - 敏感凭据读取（MCP 连接信息/凭据）
+    # E: exfiltration.
+    "E1": "NET-04",  # 向外部传输数据 - 数据外传
+    "E2": "CRED-03",  # 收集环境变量 - 敏感凭据读取（env 常含密钥）
+    "E3": "CRED-07",  # 枚举文件系统 - 敏感文件访问
+    "E4": "CRED-04",  # 上下文信息泄露 - 敏感数据外泄
+    # 2026-07-27 review correction: E5 matches boto3 put_object/gsutil cp/Azure
+    # blob upload (企业云存储 API 调用), not NET-03's "免费域名托管、dnslog 等
+    # 不可信平台" - NET-03 would misreport normal enterprise storage calls as
+    # Critical exfil to an untrusted platform. NET-04「数据外传」is the actual
+    # fit (its own description explicitly exempts allowlisted destinations).
+    "E5": "NET-04",  # 向云存储外泄数据 - 数据外传
+    # EA: excessive agency.
+    "EA1": "PERM-05",  # 不受限制的工具访问权限 - 过度授权
+    "EA3": "PERM-05",  # 权限/职责范围蔓延 - 过度授权
+    "EA4": "PERM-05",  # 无边界的资源访问 - 过度授权
+    # MP: memory poisoning.
+    "MP1": "PERM-06",  # 持久化上下文注入 - 写 agent 记忆/身份文件
+    "MP3": "PERM-06",  # 记忆篡改 - 写 agent 记忆/身份文件
+    # P: prompt injection.
+    "P1": "PROMPT-01",  # 指令覆盖 - 直接提示词注入
+    "P2": "PROMPT-03",  # 隐藏指令 - 隐藏/带外指令
+    "P3": "PROMPT-04",  # 数据外泄指令 - 诱导提示/越权话术
+    "P4": "PROMPT-04",  # 行为操纵 - 诱导提示/越权话术
+    "P5": "PROMPT-04",  # 有害内容注入 - 诱导提示/越权话术
+    # PE: privilege escalation.
+    "PE1": "PERM-05",  # 权限过度 - 过度授权
+    "PE2": "PERM-01",  # 以 sudo/root 权限执行 - 权限提升
+    "PE3": "CRED-03",  # 访问凭据 - 敏感凭据读取
+    "PE4": "PERM-03",  # 访问 Docker Socket - 沙箱逃逸
+    "PE5": "PERM-03",  # 特权容器/容器逃逸 - 沙箱逃逸
+    # RA: runtime anomaly.
+    # 2026-07-27 review correction: RA2's real pattern
+    # (static_patterns_rogue_agent.py) is crontab/.bashrc/.zshrc/systemd/
+    # launchd - OS-level persistence, not PERM-07's agent-specific hooks
+    # system (PreToolUse/PostToolUse/Stop/session-end). Different mechanism
+    # entirely; no catalog item covers OS-level persistence directly, so this
+    # falls through to GEN-01 (same "honest about the gap" call already made
+    # for RA1 above).
+    # SC: supply chain.
+    "SC1": "SUPPLY-04",  # 依赖未锁定版本 - 依赖锁定与混淆依赖
+    "SC2": "SUPPLY-03",  # 拉取外部脚本 - 引入不可信外部功能
+    "SC3": "CODE-05",  # 混淆代码 - 编码/混淆存在
+    "SC4": "SUPPLY-02",  # 已知存在漏洞的依赖 - 使用已知脆弱组件
+    "SC5": "SUPPLY-02",  # 已废弃/无人维护的依赖 - 使用已知脆弱组件
+    "SC6": "SUPPLY-05",  # 疑似域名抢注式仿冒包名 - 克隆/typosquat
+    # TM: tool misuse.
+    # 2026-07-27 review correction: TM3's real pattern
+    # (static_patterns_tool_misuse.py) is verify=False/ssl_verify=false/
+    # CORS=*/FLASK_ENV=development - generic application config hygiene, not
+    # MCP-04's MCP-protocol-specific server config (强制 auth/仅 HTTPS/限制出
+    # 站/两次 tools/list 一致性). A plain Flask app running in debug mode is
+    # not "MCP server config hygiene" coverage; no catalog item covers
+    # generic app config hygiene, so this falls through to GEN-01.
+    "TM4": "PERM-03",  # 特权 Kubernetes 工作负载 - 沙箱逃逸
+    # AR: anti-refusal rhetoric.
+    "AR1": "PROMPT-04",
+    "AR2": "PROMPT-04",
+    "AR3": "PROMPT-04",
+    # SSRF.
+    "SSRF1": "NET-06",  # 访问云元数据服务 - SSRF
+    "SSRF2": "NET-06",  # 发起内网请求 - SSRF
+    "SSRF3": "NET-06",  # 动态请求目标 - SSRF
+    # TP: MCP tool-poisoning (2026-07-27, review follow-up - these four had NO
+    # mapping at all, so every one of them fell to the GEN-01 fallback despite
+    # being real, fixed ruleIds `_RULE_ID_TITLES` already names; unlike a raw
+    # passthrough this cost real information, since GEN-01 no longer carries
+    # even the original ruleId to trace back). `mcp_tool_poisoning.py` (read
+    # directly, vendor/skillspector/src/skillspector/nodes/analyzers/
+    # mcp_tool_poisoning.py) confirms all four ARE tool-description-poisoning
+    # checks -> MCP-01 (清单: "工具描述投毒", 检测手段 static_regex/
+    # semantic_llm - both mechanisms are explicitly in scope for this one
+    # catalog item, not two different items):
+    "TP1": "MCP-01",  # 隐藏指令(HTML/markdown 注释、零宽字符、base64/data URI)
+    "TP2": "MCP-01",  # Unicode 混淆(西里尔/希腊字母仿冒拉丁字符)
+    "TP3": "MCP-01",  # 参数描述注入(指令覆盖/外泄/恶意URL/shell命令/超长描述)
+    # TP4 is the exception: `_run_tp4` only executes `if state.get("use_llm",
+    # True)` (mcp_tool_poisoning.py) - an LLM-based description-vs-behavior
+    # mismatch check, same MCP-01 concept as TP1-3 but gated on an LLM
+    # backend being configured. Static-only deployments never produce a TP4
+    # finding, the same caveat already recorded for PROMPT-05/GEN-01
+    # elsewhere in this codebase.
+    "TP4": "MCP-01",  # 描述-行为不符(LLM 门控,use_llm=False 时不产生 finding)
 }
 
 
@@ -427,7 +567,11 @@ def parse_sarif(sarif_bytes: bytes) -> tuple[Finding, ...]:
             findings.append(
                 Finding(
                     rule_id=f"skillspector.{rule_id}",
-                    test_item_id=rule_id,
+                    # 2026-07-27：原先直接把 ruleId 原样传给 test_item_id，从不
+                    # 匹配任何检测目录条目，报表因此把这些真实能力算成未覆盖；
+                    # 改为查 _TEST_ITEM_ID_BY_RULE_ID，兜底 GEN-01（诚实的"已检
+                    # 出但未归类"，而不是继续透传原始 ID）。
+                    test_item_id=_TEST_ITEM_ID_BY_RULE_ID.get(rule_id, "GEN-01"),
                     category=_category_for_rule_id(rule_id),
                     title=_title_for(rule_id, message),
                     severity=_LEVEL_TO_SEVERITY.get(level, Severity.MEDIUM),

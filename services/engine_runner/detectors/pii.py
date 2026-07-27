@@ -1,4 +1,7 @@
-"""PII/PCI detector (coding spec §11.4 DATA-06, SRS Cat-3, INV-9).
+"""PII/PCI detector (coding spec §11.4 CRED-06, SRS Cat-3, INV-9).
+
+2026-07-27：原标签 DATA-06 与检测目录不符（检测目录里根本没有 DATA-06 这一项），
+修正为 CRED-06（企业Skill安全评估测试维度清单 D3「PII/PCI数据」）。
 
 SECURITY (INV-9): a PII/PCI match is, by definition, the exact kind of value
 that must never appear in a finding's evidence. Every match is redacted to a
@@ -18,34 +21,46 @@ from skillscan_core import (
     EngineCapability,
     EngineMetadata,
     EngineResult,
-    EngineStatus,
     Finding,
-    ScanMode,
     Severity,
 )
 
+from engine_runner.detectors._engine_base import run_with_deadline
 from engine_runner.detectors._text_utils import looks_binary
 
 # NOTE: patterns match PII/PCI-SHAPED strings inside untrusted scanned content
 # - nothing here parses, imports, or executes the scanned Skill.
-_PII_PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
+#
+# confidence is per-rule (D6, 2026-07-27): how much the match SHAPE alone can
+# be trusted as real PII versus prose/example/test data.
+#   0.9   regex + Luhn + real-card-length whitelist - three-way structural
+#         verification, the strongest evidence in this detector.
+#   0.85  a very specific shape (ddd-dd-dddd); also the sole hard_gate_rule
+#         (policies/gate/v1.yaml), so it never depended on this floor anyway.
+#   0.5   a bare regex that's extremely common in docs/examples/fixtures.
+#   0.4   the most false-positive-prone rule - any formatted 11-digit run
+#         can match.
+_PII_PATTERNS: tuple[tuple[str, str, str, Severity, float], ...] = (
     (
         "pii.credit_card",
         r"\b(?:\d[ -]?){13,19}\b",
         "疑似信用卡号",
         Severity.HIGH,
+        0.9,
     ),
     (
         "pii.us_ssn",
         r"\b\d{3}-\d{2}-\d{4}\b",
         "疑似美国社会安全号（SSN）",
         Severity.HIGH,
+        0.85,
     ),
     (
         "pii.email",
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
         "电子邮件地址",
         Severity.LOW,
+        0.5,
     ),
     # SECURITY/FP-TUNING: require actual phone formatting (parens around the area
     # code or a separator between EVERY group) so a bare 10-digit run - the shape
@@ -57,6 +72,7 @@ _PII_PATTERNS: tuple[tuple[str, str, str, Severity], ...] = (
         r"(?<!\d)(?:\+?1[-. ])?(?:\(\d{3}\)[-. ]?|\d{3}[-. ])\d{3}[-. ]\d{4}(?!\d)",
         "疑似电话号码",
         Severity.LOW,
+        0.4,
     ),
 )
 
@@ -95,9 +111,27 @@ _VALID_CARD_LENGTHS = frozenset({13, 14, 15, 16, 19})
 
 
 def _metadata() -> EngineMetadata:
+    # SECURITY (INV-7, D6 2026-07-27 review): must change if ANY field that
+    # affects scoring changes, not just rule_id/pattern - a `for rule_id,
+    # pattern, *_rest in _PII_PATTERNS` here would silently swallow severity
+    # and confidence into `_rest` and never hash them, leaving
+    # toolchain_digest/cache_key unchanged across a confidence/severity edit
+    # (a stale cached verdict would then survive it). Same shape as
+    # skillscan_core.engines._static_keyword_ruleset_digest.
+    #
+    # 2026-07-27 (final review, F-3 guard): `_CATEGORY` and `_VALID_CARD_
+    # LENGTHS` are hashed for the same reason. Category is a real scoring
+    # input (scoring.py weights every finding by `weights.for_category`), and
+    # the accepted card lengths decide what this detector reports at all - so
+    # both are "fields that change detection or scoring" and both must bust
+    # the digest. Only human-facing prose (titles, _RISK_DESCRIPTIONS) is
+    # deliberately left out; see tests/test_detector_digest_sensitivity.py,
+    # which enforces exactly that split.
     hasher = hashlib.sha256()
-    for rule_id, pattern, *_rest in _PII_PATTERNS:
-        hasher.update(f"{rule_id}:{pattern}\n".encode())
+    hasher.update(f"category:{_CATEGORY.value}\n".encode())
+    hasher.update(f"valid_card_lengths:{sorted(_VALID_CARD_LENGTHS)}\n".encode())
+    for rule_id, pattern, _title, severity, confidence in _PII_PATTERNS:
+        hasher.update(f"{rule_id}:{pattern}:{severity.value}:{confidence}\n".encode())
     return EngineMetadata(
         name="inhouse-pii",
         version="1.0.0",
@@ -127,7 +161,7 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
             continue  # FP-TUNING: text PII regexes have no meaning over binary bytes
         text = data.decode("utf-8", errors="replace")
         for line_no, line in enumerate(text.splitlines(), start=1):
-            for rule_id, pattern, title, severity in _PII_PATTERNS:
+            for rule_id, pattern, title, severity, confidence in _PII_PATTERNS:
                 for match in re.finditer(pattern, line):
                     raw = match.group(0)
                     if rule_id == "pii.credit_card":
@@ -142,11 +176,13 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                     findings.append(
                         Finding(
                             rule_id=rule_id,
-                            test_item_id="DATA-06",
+                            # 2026-07-27：原标签与检测目录不符，修正为 CRED-06
+                            # （PII/PCI数据，企业Skill安全评估测试维度清单 D3）。
+                            test_item_id="CRED-06",
                             category=_CATEGORY,
                             title=f"检测到{title}",
                             severity=severity,
-                            confidence=0.7,
+                            confidence=confidence,
                             source_engine="inhouse-pii",
                             source_capability=EngineCapability.STATIC,
                             file_path=path,
@@ -171,10 +207,4 @@ class PiiDetector:
         return _metadata()
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
-        return EngineResult(
-            engine=self.metadata,
-            findings=scan(files),
-            status=EngineStatus.OK,
-            scan_mode=ScanMode.STATIC,
-            llm_used=False,
-        )
+        return run_with_deadline(self.metadata, scan, files, deadline)

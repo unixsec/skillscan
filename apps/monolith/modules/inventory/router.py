@@ -4,7 +4,7 @@ baseline}` (coding spec §9/§16.2 FR-INV).
 SECURITY: read routes require approver/auditor/admin; quarantine/retire/
 baseline require admin specifically (coding spec §16.2: "quarantine/retire 需
 admin"; baseline-setting is the same class of high-risk admin action - it's
-what worker.py's drift-triggered auto-quarantine (SUP-05) keys off) plus CSRF
+what worker.py's drift-triggered auto-quarantine (SUPPLY-06) keys off) plus CSRF
 (state-changing, coding spec §16.1 INV-16).
 """
 
@@ -171,7 +171,7 @@ async def set_skill_baseline(
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> dict[str, Any]:
     """Sets/replaces the approved drift-detection baseline (coding spec
-    SUP-05) for `skill_id`. This is the ONLY HTTP-reachable way to call
+    SUPPLY-06) for `skill_id`. This is the ONLY HTTP-reachable way to call
     `inventory.service.set_baseline` - previously that function had no
     caller anywhere, so worker.py's drift-triggered auto-quarantine could
     never fire in any real deployment (it always read `has_baseline=False`).

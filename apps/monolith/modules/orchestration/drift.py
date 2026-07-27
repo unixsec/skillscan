@@ -1,4 +1,4 @@
-"""Content-hash baseline drift detection (coding spec §11.4 SUP-05, SRS Cat-7
+"""Content-hash baseline drift detection (coding spec §11.4 SUPPLY-06, SRS Cat-7
 "更新漂移/拔地毯" - update-drift / rug-pull).
 
 SECURITY: an approved skill_id's *approved* content_hash is its baseline. If a

@@ -26,12 +26,11 @@ from skillscan_core import (
     EngineCapability,
     EngineMetadata,
     EngineResult,
-    EngineStatus,
     Finding,
-    ScanMode,
     Severity,
 )
 
+from engine_runner.detectors._engine_base import run_with_deadline
 from engine_runner.detectors._text_utils import looks_binary
 
 _CATEGORY = DetectionCategory.INSTRUCTION
@@ -70,6 +69,28 @@ _A1 = r"(?:不受限制|无限制|越狱|无审查|无道德|没有(?:任何)?�
 # M1: mode/identity noun
 _M1 = r"(?:模式|状态|AI|人工智能|助手|角色|身份)"
 
+# confidence (D6, 2026-07-27 + follow-up review): single source of truth for
+# both scan()'s Finding.confidence and _metadata()'s digest input. This
+# module has no rule table (rules are inline in scan()), so a duplicate
+# hardcoded value in _metadata() - unconnected to what Finding() actually
+# records - would silently drift the first time either changed independently
+# (the exact gap a review caught: _metadata() hashed only rule_id/pattern,
+# so a confidence-only edit here never busted toolchain_digest/cache_key).
+# Both rules get the same value: co-occurrence of multiple distinct words on
+# one line is stronger evidence than a single StaticKeywordEngine substring.
+_CONFIDENCE = 0.75
+
+# severity (2026-07-27 final review, F-3): single source of truth for both
+# scan()'s Finding.severity and _metadata()'s digest input, for exactly the
+# same reason _CONFIDENCE is - severity drives the gate's block/review
+# thresholds AND the 0-100 score, so a severity-only rule edit must bust
+# ruleset_digest/toolchain_digest/cache_key or the corrected rule is served a
+# stale cached verdict.
+_SEVERITIES: dict[str, Severity] = {
+    "prompt_zh.instruction_override": Severity.HIGH,
+    "prompt_zh.unrestricted_persona": Severity.HIGH,
+}
+
 # 安全风险描述（2026-07-24）：受 INV-9 约束不能展示命中的原文行，这里给出
 # 每类规则固定的攻击手法说明（BUG 修复：此前这两条 evidence 一直是未翻译的
 # 英文占位文本，2026-07-23 的中文化提交遗漏了本文件）。
@@ -88,12 +109,29 @@ _UNRESTRICTED_PERSONA_RISK = (
 
 
 def _metadata() -> EngineMetadata:
+    # SECURITY (INV-7, D6 2026-07-27 follow-up review): confidence must be
+    # part of this hash - see _CONFIDENCE's docstring above for why a second,
+    # disconnected copy is exactly the bug being fixed here.
+    #
+    # SEVERITY too (2026-07-27 final review, F-3): that follow-up added
+    # confidence but left severity out, so downgrading either rule from HIGH
+    # still left ruleset_digest -> toolchain_digest -> cache_key unchanged and
+    # every already-scanned package kept its old verdict. `_SEVERITIES` is the
+    # single source for both this hash and scan()'s Finding().
     hasher = hashlib.sha256()
+    hasher.update(f"category:{_CATEGORY.value}\n".encode())
+    # the defensive-statement suppressor decides which matches are DROPPED, so
+    # widening either half changes what this detector reports just as directly
+    # as widening _V1/_N1/_Q1 does - it must bust the digest too.
+    hasher.update(f"defensive_suppressor:{_NEGATION}:{_INDUCEMENT_FRAME}\n".encode())
     for rule_id, pattern in (
         ("prompt_zh.instruction_override", _V1 + _N1 + _Q1),
         ("prompt_zh.unrestricted_persona", _P1 + _A1 + _M1),
     ):
-        hasher.update(f"{rule_id}:{pattern}\n".encode())
+        hasher.update(
+            f"{rule_id}:{pattern}:{_SEVERITIES[rule_id].value}:"
+            f"{_CONFIDENCE}:{_TEST_ITEM_ID}\n".encode()
+        )
     return EngineMetadata(
         name="inhouse-prompt-injection-zh",
         version="1.0.0",
@@ -129,8 +167,13 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         test_item_id=_TEST_ITEM_ID,
                         category=_CATEGORY,
                         title="直接提示词注入：中文指令覆盖话术",
-                        severity=Severity.HIGH,
-                        confidence=0.7,
+                        severity=_SEVERITIES["prompt_zh.instruction_override"],
+                        # co-occurrence of multiple distinct words on the same
+                        # line is stronger evidence than a single
+                        # StaticKeywordEngine substring, and this rule already
+                        # suppresses the known defensive-statement false
+                        # positive - see _CONFIDENCE for the single-source note.
+                        confidence=_CONFIDENCE,
                         source_engine="inhouse-prompt-injection-zh",
                         source_capability=EngineCapability.STATIC,
                         file_path=path,
@@ -146,8 +189,13 @@ def scan(files: dict[str, bytes]) -> tuple[Finding, ...]:
                         test_item_id=_TEST_ITEM_ID,
                         category=_CATEGORY,
                         title="直接提示词注入：中文无限制身份声明",
-                        severity=Severity.HIGH,
-                        confidence=0.7,
+                        severity=_SEVERITIES["prompt_zh.unrestricted_persona"],
+                        # a three-way co-occurrence (identity-declaration verb
+                        # + unrestricted adjective + mode/identity noun on the
+                        # same line) is stronger evidence than a single
+                        # StaticKeywordEngine substring - see _CONFIDENCE for
+                        # the single-source note.
+                        confidence=_CONFIDENCE,
                         source_engine="inhouse-prompt-injection-zh",
                         source_capability=EngineCapability.STATIC,
                         file_path=path,
@@ -167,10 +215,4 @@ class PromptInjectionZhDetector:
         return _metadata()
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
-        return EngineResult(
-            engine=self.metadata,
-            findings=scan(files),
-            status=EngineStatus.OK,
-            scan_mode=ScanMode.STATIC,
-            llm_used=False,
-        )
+        return run_with_deadline(self.metadata, scan, files, deadline)

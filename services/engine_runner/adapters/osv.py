@@ -1,5 +1,5 @@
 """osv-scanner adapter (coding spec §10: `osv-scanner --offline --format json`)
-→ SUP-01 已知脆弱组件 CVE.
+→ SUPPLY-02 使用已知脆弱组件.
 
 Real JSON schema confirmed by reading
 `vendor/osv-scanner/pkg/models/results.go` directly (coding spec's own
@@ -119,7 +119,19 @@ def parse_output(
                 findings.append(
                     Finding(
                         rule_id=f"osv.{vuln_id}",
-                        test_item_id="SUP-01",
+                        # 2026-07-27（最终评审 F-1）：原值 "SUP-01" 根本不在检测
+                        # 目录里——企业Skill安全评估测试维度清单.xlsx 的 D8 供应链
+                        # 维度是 SUPPLY-01…SUPPLY-06，没有任何 SUP-* 前缀的条目。
+                        # 于是本系统唯一的已知 CVE 检测能力，其每一条 finding 都
+                        # 挂在一个合规报告无法解析的编号上，D8 整个维度读起来像
+                        # 没有覆盖。SUPPLY-02（使用已知脆弱组件，检测手段
+                        # sca_osv）才是本适配器对应的条目，与 skillspector 适配器
+                        # 里 SC4/SC5 的映射保持一致。
+                        #
+                        # 这类缺陷用「形状」是查不出来的（SUP-01 的形状和真编号
+                        # 一模一样），只能靠对真实目录做成员资格校验——见
+                        # tests/test_test_item_catalog.py 这道守卫测试。
+                        test_item_id="SUPPLY-02",
                         category=DetectionCategory.SUPPLY_CHAIN,
                         # i18n (2026-07-23): translate the template's own
                         # words; vuln_id/pkg_name/pkg_version stay as-is -
