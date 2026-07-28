@@ -97,6 +97,12 @@ async def admin_sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]
 
 
 @pytest_asyncio.fixture
+async def marketplace_sessionmaker() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    async for sm in _make_module_sessionmaker("svc_marketplace"):
+        yield sm
+
+
+@pytest_asyncio.fixture
 async def redis_client() -> AsyncIterator[aioredis.Redis]:
     client: aioredis.Redis = aioredis.Redis.from_url("redis://localhost:6379/0")
     try:

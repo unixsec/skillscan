@@ -22,7 +22,7 @@ from common.errors import AuthenticationError, AuthorizationError
 from fastapi import Depends, HTTPException, Request
 from skillscan_core import TrustTier
 
-from .m2m import M2MError, authenticate_client_credentials
+from .m2m import M2MError, M2MGrant, authenticate_client_credentials
 from .middleware import (
     BREAKGLASS_SESSION_COOKIE_NAME,
     LOCAL_SESSION_COOKIE_NAME,
@@ -47,6 +47,7 @@ class AuthRuntime:
         cache: IntrospectionCache,
         group_role_map: dict[str, str],
         allowed_m2m_service_accounts: frozenset[str] = frozenset(),
+        m2m_grants: dict[str, M2MGrant] | None = None,
         breakglass_redis: aioredis.Redis | None = None,
         saml_redis: aioredis.Redis | None = None,
         local_redis: aioredis.Redis | None = None,
@@ -56,6 +57,11 @@ class AuthRuntime:
         self.cache = cache
         self.group_role_map = group_role_map
         self.allowed_m2m_service_accounts = allowed_m2m_service_accounts
+        # SECURITY (2026-07-28, 里程碑 B'): per-service-account scope/tier
+        # grants (see m2m.M2MGrant/resolve_grant) - None defaults to {} so
+        # every unconfigured caller falls through to DEFAULT_M2M_GRANT
+        # (scan:submit only, PUBLIC tier), never a wider grant.
+        self.m2m_grants: dict[str, M2MGrant] = m2m_grants if m2m_grants is not None else {}
         # SECURITY (§16.3): None by default - break-glass session resolution
         # is only even ATTEMPTED when this is wired up (main.py), keeping
         # every other caller (most tests included) unaffected.
@@ -116,6 +122,7 @@ async def _resolve_breakglass_session_context(
         scopes=frozenset(),
         tier=TrustTier.INTERNAL,
         token_exp=time.time() + 1,  # re-validated against Redis on every request anyway
+        is_machine=False,  # break-glass is an operator with a cookie, not a service account
     )
 
 
@@ -150,6 +157,7 @@ async def _resolve_saml_session_context(
         scopes=frozenset(),
         tier=TrustTier.INTERNAL,
         token_exp=time.time() + 1,  # re-validated against Redis on every request anyway
+        is_machine=False,  # a validated SAML assertion is a person
     )
 
 
@@ -179,6 +187,7 @@ async def _resolve_local_session_context(
         scopes=frozenset(),
         tier=TrustTier.INTERNAL,
         token_exp=time.time() + 1,  # re-validated against Redis on every request anyway
+        is_machine=False,  # a local account is a person's login
     )
 
 
@@ -204,6 +213,7 @@ async def get_session_context(request: Request) -> SessionContext:
                 http_client=runtime.http_client,
                 cache=runtime.cache,
                 allowed_service_accounts=runtime.allowed_m2m_service_accounts,
+                grants=runtime.m2m_grants,
             )
         cookie_token = request.cookies.get(SESSION_COOKIE_NAME)
         return await authenticate(
@@ -229,6 +239,52 @@ def require_role(*roles: str) -> Callable[..., Awaitable[SessionContext]]:
         if roles and not session.has_role(*roles):
             raise _as_http_exception(
                 AuthorizationError(internal_detail=f"requires one of {roles}, has {session.roles}")
+            )
+        return session
+
+    return _dependency
+
+
+def require_human_role(*roles: str) -> Callable[..., Awaitable[SessionContext]]:
+    """`require_role(*roles)` plus a refusal of machine identities.
+
+    SECURITY (2026-07-28, milestone B' C1): this is what the CONSOLE surface
+    depends on. `require_role()` with no arguments means "any authenticated
+    session", and an M2M identity carries `roles={"submitter"}` (m2m.M2M_ROLES)
+    and is the legitimate submitter of the scans it submitted itself - so it
+    satisfied both the role check and the object-level ownership check, and
+    could read `GET /v1/scans/{scan_id}` with the very same bearer token it used
+    to submit through `POST /v1/market/scans`. That response is the raw internal
+    shape: `snippet_hash`, `provenance`, `required_ok`, `hard_gate_hits`, the
+    exact four things the marketplace projection exists to withhold (spec §5.3).
+    A whole anti-corruption layer that the other side can simply walk around is
+    decoration.
+
+    403, deliberately NOT the 404 that object-level authz uses elsewhere in this
+    codebase: 404 exists there to hide whether someone else's scan_id exists.
+    Nothing is being hidden here - the endpoint exists, the identity is valid,
+    and it is the KIND of identity that is refused. A 404 would turn a
+    correctly-enforced boundary into a debugging guessing game for the
+    integrator, who would reasonably conclude their own scan had vanished.
+
+    Machine callers are not losing access to anything: `/v1/market/scans` +
+    `/v1/market/scans/{scan_id}` is the surface built for them, and it serves
+    the same scans through the projection.
+    """
+    role_dependency = require_role(*roles)
+
+    async def _dependency(
+        session: SessionContext = Depends(role_dependency),
+    ) -> SessionContext:
+        if session.is_machine:
+            raise _as_http_exception(
+                AuthorizationError(
+                    detail=(
+                        "this endpoint is not available to machine identities; "
+                        "use the /v1/market endpoints"
+                    ),
+                    internal_detail=f"machine identity {session.subject!r} on a console endpoint",
+                )
             )
         return session
 

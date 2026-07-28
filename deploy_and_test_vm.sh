@@ -128,6 +128,31 @@ if [ "$after" != "$expected" ]; then
   echo "!!! expects a schema this database does not have. Refusing to continue."
   exit 1
 fi
+
+# Grants, same story as the migration above: step 8 runs setup_grants.py against
+# the THROWAWAY database it builds for the test suite, and nothing ever ran it
+# against the deployed one. A module whose least-privilege user was never created
+# does not crash - engines connect lazily, so the process starts healthy and only
+# that module's writes fail. `marketplace_api`'s audit write swallows its own
+# errors by design (it must never fail a poll), so the symptom is an empty audit
+# table on a system that looks fine. Run it, then VERIFY the users exist rather
+# than trusting the exit code.
+echo "--- applying least-privilege grants to the k3s database ---"
+SKILLSCAN_ADMIN_DB_DSN="mysql://root@127.0.0.1:13306/skillscan" uv run python3 db/setup_grants.py
+
+echo "--- verifying every module user in the manifest actually exists ---"
+missing=""
+for u in $(grep -oE '^\s{2}svc_[a-z_]+' policies/grants/manifest.yaml | tr -d ' :' | sort -u); do
+  found=$(mysql -uroot -h 127.0.0.1 -P 13306 -N -e \
+    "SELECT COUNT(*) FROM mysql.user WHERE user='$u';")
+  [ "$found" = "0" ] && missing="$missing $u"
+done
+if [ -n "$missing" ]; then
+  echo "!!! these module users are in the grants manifest but NOT in the database:$missing"
+  echo "!!! their modules will start fine and fail every write silently. Refusing to continue."
+  exit 1
+fi
+echo "--- all manifest users present"
 REMOTE_MIGRATE
 
 echo "=== [6/8] health check ==="

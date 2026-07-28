@@ -54,6 +54,7 @@ def _scan_result(*, content_hash: str, findings: tuple[Finding, ...] = ()) -> Sc
         findings=findings,
         engine_provenance=(),
         findings_capped=False,
+        findings_total=len(findings),
         required_ok=True,
         missing_or_failed_required=(),
     )

@@ -200,6 +200,34 @@ class TestAggregate(unittest.TestCase):
         self.assertEqual(len(result.findings), 1)
         self.assertEqual(result.findings[0].rule_id, "critical")
 
+    def test_findings_total_survives_capping(self) -> None:
+        # SECURITY (marketplace_api.views's `summary.total`, spec §5.3, review
+        # 2026-07-28): same rationale as pre_cap_hard_gate_hits/
+        # pre_cap_trifecta_present - a finding flood must not make the TRUE count
+        # unrecoverable, only the full findings list. findings_total is captured
+        # before max_findings truncation and must reflect the real count, not the
+        # cap, even though `len(result.findings)` itself IS the cap.
+        policy = default_policy()
+        findings = [
+            make_finding(rule_id=f"filler-{i}", severity=Severity.LOW, confidence=1.0)
+            for i in range(10)
+        ]
+        result = scan_result_from_findings(findings, policy, max_findings=3)
+        self.assertTrue(result.findings_capped)
+        self.assertEqual(len(result.findings), 3)
+        self.assertEqual(result.findings_total, 10)
+
+    def test_findings_total_equals_len_findings_when_not_capped(self) -> None:
+        policy = default_policy()
+        findings = [
+            make_finding(rule_id="a", severity=Severity.LOW, confidence=1.0),
+            make_finding(rule_id="b", severity=Severity.MEDIUM, confidence=1.0),
+        ]
+        result = scan_result_from_findings(findings, policy, max_findings=5000)
+        self.assertFalse(result.findings_capped)
+        self.assertEqual(result.findings_total, 2)
+        self.assertEqual(result.findings_total, len(result.findings))
+
 
 class TestSecurityScore(unittest.TestCase):
     def test_pass_with_no_findings_scores_100(self) -> None:

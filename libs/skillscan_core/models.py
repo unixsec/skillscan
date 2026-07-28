@@ -177,6 +177,13 @@ class ScanResult:
     findings_capped: bool
     required_ok: bool
     missing_or_failed_required: tuple[str, ...]
+    # SECURITY: the pre-cap count, i.e. `len(all_findings)` before `max_findings`
+    # truncation (scoring.py aggregate()). Same rationale as the pre-cap hard-gate
+    # and trifecta preservation below: a finding flood must not be able to make
+    # the TRUE count unknowable, only the full findings list. Consumers (e.g.
+    # marketplace_api.views's `summary.total`) need the real number even when
+    # `findings` itself was capped.
+    findings_total: int
     # SECURITY: rule_ids that lost at least one candidate to a _dedup() key
     # collision (scoring.py) - lets gate.decide() check whether the SPECIFIC
     # rule_id(s) behind a dedup-collision signal restoration are already

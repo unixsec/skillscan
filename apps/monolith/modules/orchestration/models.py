@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, SmallInteger, String
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, SmallInteger, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -53,6 +53,54 @@ class ScanJob(Base):
     sandbox_wait_started_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=False), nullable=True
     )
+    # SECURITY (2026-07-28, milestone B' Task 4): the trust tier this submission is
+    # judged at, recorded AT SUBMIT TIME. The worker decides asynchronously, long
+    # after the submitting session is gone, so the tier cannot be read from a
+    # request context - it has to travel with the scan. Before this column every
+    # verdict used `runtime.default_trust_tier` (a process-wide TrustTier.INTERNAL,
+    # the most permissive tier), so a machine caller submitting third-party content
+    # was judged by the internal-content threshold regardless of its identity.
+    #
+    # Nullable with no backfill: rows written before this column genuinely have no
+    # recorded tier, and inventing one would be fabricating the basis of a past
+    # decision. NULL falls back to `runtime.default_trust_tier` at decide time,
+    # which is exactly the behaviour those rows were actually decided under.
+    #
+    # 2026-07-28 (C3): NULL means "this row records no tier" and nothing more.
+    # It is NOT a reliable marker of "written before the column existed" -
+    # `reeval.controller.build_rescan_job` produced NULL rows continuously
+    # after the migration because it never mapped the column. Both production
+    # writers now always record a tier; that is a property of those two call
+    # sites, and any third writer must uphold it deliberately.
+    trust_tier: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
+class ScanSubmitterRow(Base):
+    """Who is authorized to read one scan (里程碑 B' review, C2).
+
+    SECURITY: object-level authorization for `GET /v1/scans/{scan_id}`,
+    `.../sarif`, `GET /v1/scans` and `GET /v1/market/scans/{scan_id}` is
+    membership in THIS table, not equality against `ScanJob.submitter`.
+    `submit_scan` is single-flight on `cache_key`, so a second caller
+    submitting byte-identical content under the same toolchain is handed the
+    FIRST caller's scan_job - and was then refused it, permanently, because
+    the row still named someone else. A scan legitimately has N submitters.
+
+    `ScanJob.submitter` is kept as the FIRST submitter: it is what the scan
+    list displays, and the trust tier the verdict was judged at is that
+    submission's (the adjudication is not redone for a later arrival, so the
+    tier must not be reattributed either - see `views.project_scan`'s
+    `judged_at_tier`).
+
+    Append-only by design, and granted INSERT+SELECT only: revoking a
+    submitter's access to a scan they really did submit is not a use case, and
+    an UPDATE here would silently re-attribute someone else's scan.
+    """
+
+    __tablename__ = "scan_submitter"
+
+    scan_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    submitter: Mapped[str] = mapped_column(String(255), primary_key=True)
 
 
 class ScanResultRow(Base):
@@ -64,6 +112,14 @@ class ScanResultRow(Base):
     confidence_at_max: Mapped[float] = mapped_column(Float, nullable=False)
     trifecta_present: Mapped[bool] = mapped_column(Boolean, nullable=False)
     findings_capped: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # SECURITY: nullable with no backfill, on purpose. Every row written from this
+    # point on gets the real pre-cap count (skillscan_core.ScanResult.findings_total,
+    # itself computed before truncation - see scoring.py). Pre-existing rows never
+    # captured that number, and it cannot be reconstructed after the fact (the
+    # dropped findings are gone); NULL is the honest answer for them, not 0 or the
+    # post-cap length. See db/migrations/versions for the migration that added this
+    # column, and marketplace_api.views._summarize for the NULL fallback.
+    findings_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     required_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
     findings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     provenance: Mapped[list[list[str]]] = mapped_column(JSON, nullable=False)

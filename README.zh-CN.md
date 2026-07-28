@@ -51,8 +51,18 @@ break-glass 不再是唯一可用的会话登录方式。那轮审计暴露的�
   统计的合规报表把真实运行着的能力误判为未覆盖。现已加测试断言：凡引擎可能发出的
   编号必须是目录中的真实条目——**形状检查抓不住一个形状完全合法的错误编号**。
 
-**1103 个后端测试**针对真实 MySQL/Redis 全部通过（不 mock 被测系统），另有
-**182 个内核测试**（`tests/`，纯 `skillscan_core`，仅依赖标准库）。
+- **市场现在可以轮询扫描结果。** `POST /v1/market/scans` 与
+  `GET /v1/market/scans/{scan_id}`，接口面与控制台刻意分离。跨越这道边界的是**投影**而非
+  内部模型：十三个字段的显式白名单，因此新增内部字段在对外是无操作，而不是泄漏。只给脱敏
+  证据——`snippet_hash` 与裁决过程内部量（`provenance`/`required_ok`/`hard_gate_hits`）
+  一律不外露。判定如实给出三个值；`REVIEW` 对市场意味着什么由市场自己决定。
+- **机器身份的 scope 与 trust tier 改为按服务账号授予。** 此前 scope 是所有 M2M 调用方共享的
+  一个模块级集合，而 trust tier 硬编码为最宽松的一档——提交第三方内容的调用方因此按内部内容的
+  阈值被判定。两者现已按身份区分，且 tier 随扫描持久化，不再于裁决时读取进程级常量。
+- **控制台接口面对机器身份关闭。** 否则投影只是市场**被期望走**的那扇门，而不是它**唯一能走**的门。
+
+**1202 个后端测试**针对真实 MySQL/Redis 全部通过（不 mock 被测系统），另有
+**184 个内核测试**（`tests/`，纯 `skillscan_core`，仅依赖标准库）。
 `ruff check` / `ruff format --check` / `mypy --strict` 全部干净，
 `scripts/check_import_boundaries.py` 守住跨模块 ORM 边界——每个模块拥有自己的
 表和自己的最小权限数据库账号，这个检查防止代码侧的边界被侵蚀。前端（`web/`，
@@ -72,8 +82,8 @@ Node/npm。
 
 ```bash
 uv sync                    # 安装全部依赖（后端 + 开发工具）到 .venv
-uv run pytest -q           # 针对本地 MySQL/Redis 跑后端测试套件（1103 个测试）
-uv run pytest tests/ -q    # 内核测试套件，无外部依赖（182 个测试）
+uv run pytest -q           # 针对本地 MySQL/Redis 跑后端测试套件（1202 个测试）
+uv run pytest tests/ -q    # 内核测试套件，无外部依赖（184 个测试）
 uv run mypy                # 严格类型检查
 uv run ruff check .        # lint
 uv run ruff format --check .

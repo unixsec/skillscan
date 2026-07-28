@@ -41,6 +41,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from monolith.modules.orchestration.service import STATE_QUEUED
+
 from .models import ScanJobInsertOnly, SkillReadOnly, SkillVersionReadOnly
 
 # SECURITY: lower number = higher priority - public-tier exposure is highest,
@@ -86,15 +88,26 @@ def build_rescan_job(
     function so the single-flight UNIQUE constraint behaves identically to
     every other scan_job insertion path (a rescan already in flight for this
     exact content+toolchain combination is naturally deduplicated by the DB,
-    not by this function)."""
+    not by this function).
+
+    SECURITY (2026-07-28, milestone B' C3): `trust_tier` comes from the skill's
+    OWN recorded tier (`status.trust_tier`, already read out of `skill` by
+    `list_published_toolchain_statuses` and already used above for batch
+    ordering) - never omitted and never a default. Omitting it wrote NULL, and
+    a NULL tier makes the decide path fall back to `runtime.default_trust_tier`
+    (INTERNAL, the most permissive tier), so a PUBLIC skill's rescan was judged
+    at the internal threshold: BLOCK@CRITICAL instead of BLOCK@HIGH. Every
+    reeval-triggered re-decision was therefore softer than the original one it
+    was meant to refresh."""
     return ScanJobInsertOnly(
         scan_id=str(uuid.uuid4()),
         content_hash=status.content_hash,
         toolchain_digest=toolchain_digest,
         cache_key=cache_key(status.content_hash, toolchain_digest),
-        state="queued",
+        state=STATE_QUEUED,
         submitter=submitter,
         created_at=now,
+        trust_tier=status.trust_tier.value,
     )
 
 

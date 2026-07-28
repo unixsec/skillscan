@@ -90,6 +90,7 @@ from monolith.modules.orchestration.floor import floor_engines
 from monolith.modules.orchestration.models import ScanJob
 from monolith.modules.orchestration.service import (
     POISON_PILL_STATUS,
+    STATE_QUEUED,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
     sweep_sandbox_wait_timeouts,
@@ -282,7 +283,9 @@ async def sweep_queued_jobs_to_airlock(
         rows = (
             (
                 await session.execute(
-                    select(ScanJob).where(ScanJob.state == "queued", ScanJob.created_at < cutoff)
+                    select(ScanJob).where(
+                        ScanJob.state == STATE_QUEUED, ScanJob.created_at < cutoff
+                    )
                 )
             )
             .scalars()
@@ -629,13 +632,19 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
 
     async with runtime.gate_session_factory() as gate_session:
         allowlist = await list_active_allowlist_entries(gate_session, now=airlock.now_epoch())
+    # SECURITY (2026-07-28, milestone B' Task 4): `runtime.default_trust_tier`
+    # is no longer the tier every scan is judged at - each scan carries its
+    # own `ScanJob.trust_tier`, recorded by `submit_scan` at submission time,
+    # and `run_result_collector_tick`/`sweep_sandbox_wait_timeouts` read that
+    # per-scan value internally. What's passed here is only the fallback for a
+    # scan_job row written before that column existed (NULL, no backfill).
     counts["decided"] = await run_result_collector_tick(
         runtime.redis,
         runtime.blobstore,
         runtime.orchestration_session_factory,
         runtime.gate_session_factory,
         policy=runtime.policy,
-        trust_tier=runtime.default_trust_tier,
+        default_trust_tier=runtime.default_trust_tier,
         allowlist=allowlist,
         signer=runtime.signer,
         consumer=consumer,
@@ -648,7 +657,7 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
         runtime.orchestration_session_factory,
         runtime.gate_session_factory,
         policy=runtime.policy,
-        trust_tier=runtime.default_trust_tier,
+        default_trust_tier=runtime.default_trust_tier,
         allowlist=allowlist,
         signer=runtime.signer,
         waited_advisory_engines=active_sandbox_waited_engines,

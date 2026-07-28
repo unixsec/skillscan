@@ -13,7 +13,12 @@ from common.config import SessionSettings
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from monolith.modules.gateway.auth.dependencies import AuthRuntime, require_csrf, require_role
+from monolith.modules.gateway.auth.dependencies import (
+    AuthRuntime,
+    require_csrf,
+    require_human_role,
+    require_role,
+)
 from monolith.modules.gateway.auth.middleware import (
     BREAKGLASS_SESSION_COOKIE_NAME,
     CSRF_COOKIE_NAME,
@@ -34,9 +39,14 @@ def _build_app(handler: Callable[[httpx.Request], httpx.Response]) -> FastAPI:
     # it's the standard, required FastAPI dependency-injection pattern.
     _any_authenticated = require_role()
     _approver_or_admin = require_role("approver", "admin")
+    _humans_only = require_human_role()
 
     @app.get("/submit-only")
     def submit_only(session: SessionContext = Depends(_any_authenticated)) -> dict[str, Any]:
+        return {"subject": session.subject}
+
+    @app.get("/console-only")
+    def console_only(session: SessionContext = Depends(_humans_only)) -> dict[str, Any]:
         return {"subject": session.subject}
 
     @app.get("/approver-only")
@@ -155,6 +165,64 @@ class TestRequireRoleViaBearerM2M:
         client = TestClient(_build_app(handler))
         response = client.get("/approver-only", headers={"Authorization": "Bearer m2m-token"})
         assert response.status_code == 403
+
+
+class TestRequireHumanRole:
+    """SECURITY (milestone B' C1): the console surface refuses machine identities.
+
+    The bug this locks down: `require_role()` with no arguments accepts ANY
+    authenticated session, and an M2M identity carries `roles={"submitter"}` -
+    so the same bearer token that submits through `/v1/market/scans` also read
+    the console's internal scan shape. `require_human_role()` judges the KIND of
+    identity, which is why these tests go through the REAL m2m authentication
+    path (a bearer token + introspection) rather than a hand-built
+    SessionContext: the flag has to survive the actual authentication code, not
+    just exist on the dataclass.
+    """
+
+    @staticmethod
+    def _m2m_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"active": True, "client_id": "ci-runner", "exp": time.time() + 60}
+        )
+
+    def test_a_machine_identity_is_403_even_though_it_is_authenticated(self) -> None:
+        client = TestClient(_build_app(self._m2m_handler))
+        response = client.get("/console-only", headers={"Authorization": "Bearer m2m-token"})
+        assert response.status_code == 403
+
+    def test_the_same_machine_identity_still_passes_plain_require_role(self) -> None:
+        # The contrast that makes the test above mean something: this identity is
+        # fully authenticated and role-satisfying. It is refused on the console
+        # for what it IS, not for lacking authentication or a role.
+        client = TestClient(_build_app(self._m2m_handler))
+        assert (
+            client.get("/submit-only", headers={"Authorization": "Bearer m2m-token"}).status_code
+            == 200
+        )
+
+    def test_403_not_404_and_the_reason_is_actionable(self) -> None:
+        # SECURITY/OPERABILITY: object-level authz answers 404 elsewhere to hide
+        # whether someone else's object exists. Nothing is hidden here - the
+        # endpoint exists and the token is valid - so a 404 would only leave an
+        # integrator hunting a scan that never disappeared.
+        client = TestClient(_build_app(self._m2m_handler))
+        response = client.get("/console-only", headers={"Authorization": "Bearer m2m-token"})
+        assert response.status_code == 403
+        assert "/v1/market" in response.json()["detail"]
+
+    def test_a_human_cookie_session_is_unaffected(self) -> None:
+        client = TestClient(_build_app(_active_submitter))
+        client.cookies.set(SESSION_COOKIE_NAME, "a-valid-opaque-token")
+        response = client.get("/console-only")
+        assert response.status_code == 200
+        assert response.json()["subject"] == "alice"
+
+    def test_an_unauthenticated_request_is_still_401_not_403(self) -> None:
+        # Order matters: authentication fail-closes first, so an anonymous
+        # caller must not be told "you are a machine".
+        client = TestClient(_build_app(_active_submitter))
+        assert client.get("/console-only").status_code == 401
 
 
 class TestRequireCsrf:

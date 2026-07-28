@@ -184,6 +184,7 @@ async def _run_pipeline_once(
             submitter="alice",
             engine_metadatas=(_ENGINE.metadata,),
             policy=policy,
+            trust_tier=TrustTier.INTERNAL,
         )
 
     for _ in range(20):
@@ -196,7 +197,7 @@ async def _run_pipeline_once(
             orchestration_sessionmaker,
             gate_sessionmaker,
             policy=policy,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=LocalDevSigner(),
             consumer=consumer,
@@ -295,6 +296,7 @@ class TestSingleFlightDedup:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
         async with orchestration_sessionmaker() as session, session.begin():
             scan_id_2 = await submit_scan(
@@ -305,6 +307,7 @@ class TestSingleFlightDedup:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         assert scan_id_1 == scan_id_2
@@ -372,6 +375,7 @@ class TestSkillNameParsing:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         async with orchestration_sessionmaker() as session:
@@ -399,6 +403,7 @@ class TestSkillNameParsing:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         async with orchestration_sessionmaker() as session:
@@ -439,6 +444,7 @@ class TestSkillNameParsing:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         async with orchestration_sessionmaker() as session:
@@ -473,6 +479,7 @@ class TestPoisonPill:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         # Force delivery_count past the threshold by repeatedly claiming (via
@@ -513,7 +520,7 @@ class TestPoisonPill:
                 orchestration_sessionmaker,
                 gate_sessionmaker,
                 policy=policy,
-                trust_tier=TrustTier.INTERNAL,
+                default_trust_tier=TrustTier.INTERNAL,
                 allowlist=(),
                 signer=LocalDevSigner(),
                 consumer=consumer,
@@ -561,6 +568,7 @@ class TestPoisonPill:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
         # Delete the artifact the submission just wrote, so the worker's
         # blobstore.get raises BlobNotFoundError on its very first attempt.
@@ -586,7 +594,7 @@ class TestPoisonPill:
                 orchestration_sessionmaker,
                 gate_sessionmaker,
                 policy=policy,
-                trust_tier=TrustTier.INTERNAL,
+                default_trust_tier=TrustTier.INTERNAL,
                 allowlist=(),
                 signer=LocalDevSigner(),
                 consumer=consumer,
@@ -660,6 +668,7 @@ class TestBlobstoreOffloadedToThread:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         calls = self._spy_to_thread(monkeypatch)
@@ -698,6 +707,7 @@ class TestBlobstoreOffloadedToThread:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
+                trust_tier=TrustTier.INTERNAL,
             )
         # Get the mock engine to actually write the findings blob first (a
         # real precondition for _try_score_and_decide's `blobstore.exists`
@@ -717,7 +727,7 @@ class TestBlobstoreOffloadedToThread:
             orchestration_sessionmaker,
             gate_sessionmaker,
             policy=policy,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=LocalDevSigner(),
             consumer=consumer,
@@ -772,6 +782,7 @@ class TestResultCollectorExceptionIsolation:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy_good,
+                trust_tier=TrustTier.INTERNAL,
             )
         async with orchestration_sessionmaker() as session, session.begin():
             scan_id_bad = await submit_scan(
@@ -782,6 +793,7 @@ class TestResultCollectorExceptionIsolation:
                 submitter="alice",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy_bad,
+                trust_tier=TrustTier.INTERNAL,
             )
 
         # Get both scans' findings reported so a single run_result_collector_tick
@@ -815,7 +827,7 @@ class TestResultCollectorExceptionIsolation:
             orchestration_sessionmaker,
             gate_sessionmaker,
             policy=policy_good,  # required_engines identical for both test policies
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=LocalDevSigner(),
             consumer=consumer,
@@ -922,7 +934,7 @@ class TestSandboxWait:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -949,7 +961,7 @@ class TestSandboxWait:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -975,7 +987,7 @@ class TestSandboxWait:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -1005,7 +1017,7 @@ class TestSandboxWait:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -1043,7 +1055,7 @@ class TestSandboxWait:
                 orchestration_sessionmaker,
                 gate_sessionmaker,
                 policy=_POLICY,
-                trust_tier=TrustTier.INTERNAL,
+                default_trust_tier=TrustTier.INTERNAL,
                 allowlist=(),
                 signer=_signer(),
                 consumer=consumer,
@@ -1122,7 +1134,7 @@ async def _sweep(
         orchestration_sessionmaker,
         gate_sessionmaker,
         policy=_POLICY,
-        trust_tier=TrustTier.INTERNAL,
+        default_trust_tier=TrustTier.INTERNAL,
         allowlist=(),
         signer=_signer(),
         waited_advisory_engines=("bandit",),
@@ -1344,7 +1356,7 @@ class TestSandboxWaitSweep:
             orchestration_sessionmaker,
             gate_sessionmaker,
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             waited_advisory_engines=("bandit",),
@@ -1384,7 +1396,7 @@ class TestSandboxWaitClock:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -1422,7 +1434,7 @@ class TestSandboxWaitClock:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -1465,7 +1477,7 @@ class TestSandboxWaitClock:
             scan_id=scan_id,
             required_engines=tuple(sorted(_POLICY.required_engines)),
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             operator="test",
@@ -1541,7 +1553,7 @@ class TestResultMessageLossStillConverges:
             orchestration_sessionmaker,
             gate_sessionmaker,
             policy=_POLICY,
-            trust_tier=TrustTier.INTERNAL,
+            default_trust_tier=TrustTier.INTERNAL,
             allowlist=(),
             signer=_signer(),
             consumer=live_consumer,
@@ -1580,7 +1592,7 @@ class TestResultMessageLossStillConverges:
         consumer = f"live-{uuid.uuid4().hex[:8]}"
         kwargs: dict[str, Any] = {
             "policy": _POLICY,
-            "trust_tier": TrustTier.INTERNAL,
+            "default_trust_tier": TrustTier.INTERNAL,
             "allowlist": (),
             "signer": _signer(),
             "consumer": consumer,

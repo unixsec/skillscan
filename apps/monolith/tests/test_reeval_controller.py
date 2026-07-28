@@ -128,6 +128,25 @@ class TestBuildRescanJob:
         job_b = build_rescan_job(status, toolchain_digest="d", submitter="t", now=now)
         assert job_a.scan_id != job_b.scan_id
 
+    @pytest.mark.parametrize(
+        "tier", [TrustTier.PUBLIC, TrustTier.PARTNER, TrustTier.INTERNAL], ids=lambda t: t.value
+    )
+    def test_carries_the_skills_own_trust_tier(self, tier: TrustTier) -> None:
+        # SECURITY (C3): the rescan must be judged at the SAME tier the skill is
+        # registered under. An unmapped/omitted column here writes NULL, and the
+        # decide path reads NULL as "fall back to runtime.default_trust_tier"
+        # (INTERNAL - the most permissive), so every reeval quietly re-decided
+        # public content at the internal threshold. Parametrized over all three
+        # tiers so a hardcoded constant cannot pass this.
+        status = _status(tier=tier, digest="old-digest")
+        job = build_rescan_job(
+            status,
+            toolchain_digest="new-digest",
+            submitter="tester",
+            now=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+        )
+        assert job.trust_tier == tier.value
+
 
 class TestListPublishedToolchainStatuses:
     @pytest.mark.asyncio
@@ -199,6 +218,34 @@ class TestTriggerRescans:
             ).scalar_one()
         assert row.state == "queued"
         assert row.toolchain_digest == toolchain_digest
+
+    @pytest.mark.asyncio
+    async def test_the_queued_row_records_the_skills_trust_tier(
+        self,
+        reeval_sessionmaker: SessionmakerFixture,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # SECURITY (C3): the unit test above proves `build_rescan_job` sets the
+        # attribute; this proves it actually reaches the DATABASE through
+        # svc_reeval's INSERT-only grant. A column the ORM class does not map is
+        # silently dropped from the INSERT with no error anywhere - which is
+        # exactly how this shipped - so only a read-back under orchestration's
+        # own credentials can tell the two apart.
+        status = _status(tier=TrustTier.PUBLIC, digest="old-digest")
+        toolchain_digest = f"new-digest-{uuid.uuid4().hex[:12]}"
+
+        async with reeval_sessionmaker() as session, session.begin():
+            await trigger_rescans(
+                session, [status], toolchain_digest=toolchain_digest, submitter="tester"
+            )
+
+        async with orchestration_sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(ScanJob).where(ScanJob.content_hash == status.content_hash)
+                )
+            ).scalar_one()
+        assert row.trust_tier == TrustTier.PUBLIC.value
 
     @pytest.mark.asyncio
     async def test_reeval_session_cannot_read_scan_job_back(

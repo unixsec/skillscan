@@ -27,12 +27,16 @@ just in the one place someone remembered to wrap it.
 
 from __future__ import annotations
 
+import json
 import os
 
 from common.config import require_internal_endpoint
 from common.log import get_logger
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from skillscan_core import TrustTier
+
+from monolith.modules.gateway.auth.m2m import M2MGrant
 
 _logger = get_logger("skillscan.monolith.config")
 
@@ -105,6 +109,18 @@ class Settings(BaseSettings):
     # (scripts/dev/run_local.py, docker-compose) turn this on explicitly.
     worker_enabled: bool = False
     worker_interval_s: float = 1.0
+    # SECURITY (2026-07-28, 里程碑 B'): per-service-account M2M scope/tier
+    # grants (see modules/gateway/auth/m2m.py's M2MGrant/resolve_grant) -
+    # empty by default, so every unconfigured service account still resolves
+    # to DEFAULT_M2M_GRANT (scan:submit only, PUBLIC tier) rather than this
+    # field silently widening anyone's access.
+    m2m_grants: dict[str, M2MGrant] = {}
+    # 2026-07-28, 里程碑 B' Task 5 (spec §6.3): per-service-account polling
+    # rate limit - see modules/marketplace_api/ratelimit.py's check_rate_limit.
+    # This is the penalty for a caller that ignores the poll_after_ms hint
+    # (marketplace_api.views.POLL_AFTER_MS); it does not replace the hint,
+    # which is what actually keeps well-behaved callers under this budget.
+    marketplace_rate_limit_per_min: int = 120
 
     @model_validator(mode="after")
     def _validate(self) -> Settings:
@@ -126,6 +142,53 @@ class Settings(BaseSettings):
         if self.access_token_ttl_s > 600:
             raise ValueError("access_token_ttl_s must be <= 600 (SAD FR-SES-030)")
         return self
+
+
+def _parse_m2m_grants(raw: str) -> dict[str, M2MGrant]:
+    """Parse `SKILLSCAN_M2M_GRANTS_JSON`.
+
+    SECURITY: same fail-closed posture as `main.py`'s `_load_policy` - a
+    malformed value must crash startup, never be silently swallowed into the
+    empty-dict default. Silently falling back would leave an operator
+    believing their configured grants took effect when they never did.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SKILLSCAN_M2M_GRANTS_JSON is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "SKILLSCAN_M2M_GRANTS_JSON must be a JSON object of service_account -> grant"
+        )
+
+    grants: dict[str, M2MGrant] = {}
+    for service_account, grant_obj in parsed.items():
+        if not isinstance(grant_obj, dict):
+            raise ValueError(
+                f"SKILLSCAN_M2M_GRANTS_JSON entry {service_account!r} must be a JSON object"
+            )
+        try:
+            scopes = grant_obj["scopes"]
+            tier_raw = grant_obj["tier"]
+        except KeyError as exc:
+            raise ValueError(
+                f"SKILLSCAN_M2M_GRANTS_JSON entry {service_account!r} missing required key {exc}"
+            ) from exc
+        if not isinstance(scopes, list) or not all(isinstance(s, str) for s in scopes):
+            raise ValueError(
+                f"SKILLSCAN_M2M_GRANTS_JSON entry {service_account!r}: "
+                "'scopes' must be a JSON array of strings"
+            )
+        try:
+            tier = TrustTier(tier_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"SKILLSCAN_M2M_GRANTS_JSON entry {service_account!r}: invalid tier {tier_raw!r}"
+            ) from exc
+        grants[service_account] = M2MGrant(scopes=frozenset(scopes), tier=tier)
+    return grants
 
 
 def load_settings() -> Settings:
@@ -164,6 +227,10 @@ def load_settings() -> Settings:
         == "true",
         worker_enabled=os.environ.get("SKILLSCAN_WORKER_ENABLED", "false").lower() == "true",
         worker_interval_s=float(os.environ.get("SKILLSCAN_WORKER_INTERVAL_S", "1.0")),
+        m2m_grants=_parse_m2m_grants(os.environ.get("SKILLSCAN_M2M_GRANTS_JSON", "")),
+        marketplace_rate_limit_per_min=int(
+            os.environ.get("SKILLSCAN_MARKETPLACE_RATE_LIMIT_PER_MIN", "120")
+        ),
     )
 
 

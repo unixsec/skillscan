@@ -65,8 +65,26 @@ Since then:
   every id any engine can emit is a real catalog entry — a shape check cannot
   catch a wrong id that is shaped exactly like a right one.
 
-**1103 backend tests** pass against real MySQL/Redis (no mocking of the systems
-under test), plus **182 kernel tests** (`tests/`, pure `skillscan_core`, stdlib
+- **A marketplace can now poll for results.** `POST /v1/market/scans` and
+  `GET /v1/market/scans/{scan_id}`, on a surface deliberately separate from the
+  console. What crosses that boundary is a *projection*, not the internal model:
+  an explicit whitelist of thirteen fields, so adding an internal field is a
+  no-op externally rather than a leak. Redacted evidence only — `snippet_hash`
+  and the adjudication internals (`provenance`, `required_ok`, `hard_gate_hits`)
+  never cross. The verdict is reported honestly as all three values; a
+  marketplace decides for itself what `REVIEW` means for it.
+- **Machine identities are scoped and tiered per service account.** Scopes used
+  to be one module-level set shared by every M2M caller, and the trust tier was
+  hardcoded to the most permissive value — so a caller submitting third-party
+  content was judged at the internal-content threshold. Both are now per
+  identity, and the tier travels with the scan rather than being read from a
+  process-wide constant at decide time.
+- **The console surface is closed to machine identities.** Otherwise the
+  projection would be the door the marketplace was *expected* to use rather than
+  the only one it *could* use.
+
+**1202 backend tests** pass against real MySQL/Redis (no mocking of the systems
+under test), plus **184 kernel tests** (`tests/`, pure `skillscan_core`, stdlib
 only). `ruff check` / `ruff format --check` / `mypy --strict` are clean across
 the tree, and `scripts/check_import_boundaries.py` guards the cross-module ORM
 boundary — each module owns its own tables and its own least-privilege database
@@ -87,8 +105,8 @@ Node/npm.
 
 ```bash
 uv sync                    # install all deps (backend + dev tools) into .venv
-uv run pytest -q           # backend suite against local MySQL/Redis (1103 tests)
-uv run pytest tests/ -q    # kernel suite, no external dependencies (182 tests)
+uv run pytest -q           # backend suite against local MySQL/Redis (1202 tests)
+uv run pytest tests/ -q    # kernel suite, no external dependencies (184 tests)
 uv run mypy                # strict type-check
 uv run ruff check .        # lint
 uv run ruff format --check .

@@ -58,6 +58,7 @@ from monolith.modules.gate.service import SignerPort
 from monolith.modules.gate.signer import LocalDevSigner, VaultTransitSigner
 from monolith.modules.gateway.auth.dependencies import AuthRuntime
 from monolith.modules.gateway.auth.login_router import router as login_router
+from monolith.modules.gateway.auth.m2m import M2MGrant
 from monolith.modules.gateway.auth.middleware import SecurityHeadersMiddleware
 from monolith.modules.gateway.auth.rbac import KNOWN_ROLES, load_group_role_map
 from monolith.modules.gateway.auth.session import IntrospectionCache
@@ -68,6 +69,8 @@ from monolith.modules.integration_relay.marketplace import HttpMarketplaceAdapte
 from monolith.modules.integration_relay.siem import SyslogSiemAdapter
 from monolith.modules.intel.router import router as intel_router
 from monolith.modules.inventory.router import router as inventory_router
+from monolith.modules.marketplace_api.router import router as marketplace_router
+from monolith.modules.marketplace_api.views import POLL_AFTER_MS
 from monolith.modules.orchestration.floor import floor_engines
 from monolith.modules.reeval.reconciliation import reconciliation_mode_warnings
 from monolith.modules.reeval.router import router as reeval_router
@@ -364,6 +367,7 @@ def _load_trusted_intel_public_keys() -> tuple[RSAPublicKey, ...]:
 
 def _build_auth_runtime(
     *,
+    m2m_grants: dict[str, M2MGrant] | None = None,
     breakglass_redis: aioredis.Redis | None = None,
     saml_redis: aioredis.Redis | None = None,
     local_redis: aioredis.Redis | None = None,
@@ -397,6 +401,7 @@ def _build_auth_runtime(
             _env("SKILLSCAN_M2M_ALLOWED_SERVICE_ACCOUNTS", "").split(",")
         )
         - frozenset({""}),
+        m2m_grants=m2m_grants,
     )
 
 
@@ -408,6 +413,41 @@ def _build_reconciliation_settings() -> ReconciliationSettings:
     )
 
 
+def _warn_if_marketplace_poll_hint_too_slow(settings: Settings) -> None:
+    """coding spec §6.3 startup self-check: the RUNNING poll_after_ms hint
+    (marketplace_api.views.POLL_AFTER_MS) only reduces marketplace polling load
+    if a caller that follows it can still observe the terminal state before the
+    gate's sandbox wait budget (`sandbox_wait_timeout_s`) runs out. Require the
+    hint to be at most a quarter of that budget - a caller polling near the
+    hint's own cadence needs headroom for network latency and its own
+    processing time, not just the bare minimum.
+
+    Never raises: whoever tunes `sandbox_wait_timeout_s` down later (see that
+    field's own docstring in config.py) has no reason to think of this file, so
+    the drift has to be caught here rather than assumed away. A stale hint
+    makes a well-behaved caller poll too slowly and repeatedly miss the
+    terminal state - a real operational cost, but not a reason to refuse to
+    start.
+    """
+    threshold_ms = settings.sandbox_wait_timeout_s * 1000 / 4
+    running_hint_ms = POLL_AFTER_MS["RUNNING"]
+    if running_hint_ms > threshold_ms:
+        _logger.warning(
+            "marketplace POLL_AFTER_MS['RUNNING'] exceeds a quarter of "
+            "sandbox_wait_timeout_s - a caller polling at the hinted cadence will "
+            "repeatedly miss the terminal state before the sandbox wait budget "
+            "expires",
+            extra={
+                "context": {
+                    "metric": "marketplace_poll_hint_too_slow",
+                    "poll_after_ms_running": running_hint_ms,
+                    "sandbox_wait_timeout_s": settings.sandbox_wait_timeout_s,
+                    "threshold_ms": threshold_ms,
+                }
+            },
+        )
+
+
 def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
     """Returns the runtime plus the SQLAlchemy engines it created, so
     `create_app()`'s lifespan can dispose them on shutdown - only when it
@@ -415,6 +455,7 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
     lifecycle, e.g. test fixtures managing a shared engine across tests)."""
     settings = load_settings()
     warn_on_unbuildable_dynamic_sandbox(settings)
+    _warn_if_marketplace_poll_hint_too_slow(settings)
     orchestration_engine = make_engine(_default_module_dsn("svc_orchestration"))
     gate_engine = make_engine(_default_module_dsn("svc_gate"))
     reeval_engine = make_engine(_default_module_dsn("svc_reeval"))
@@ -424,6 +465,10 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
     intel_engine = make_engine(_default_module_dsn("svc_intel"))
     relay_engine = make_engine(_default_module_dsn("svc_relay"))
     admin_engine = make_engine(_default_module_dsn("svc_admin"))
+    # 里程碑 B' spec §7 - marketplace_api's own least-privilege user
+    # (policies/grants/manifest.yaml: INSERT+SELECT on marketplace_fetch_log
+    # and nothing else, so even a bug here cannot touch another module's data).
+    marketplace_engine = make_engine(_default_module_dsn("svc_marketplace"))
     admin_session_factory = make_session_factory(admin_engine)
     redis = aioredis.Redis.from_url(settings.redis_url)
     blobstore = LocalFilesystemBlobStore(Path(settings.blobstore_root))
@@ -467,6 +512,8 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
         trusted_intel_public_keys=_load_trusted_intel_public_keys(),
         relay_session_factory=make_session_factory(relay_engine),
         admin_session_factory=admin_session_factory,
+        marketplace_session_factory=make_session_factory(marketplace_engine),
+        marketplace_rate_limit_per_min=settings.marketplace_rate_limit_per_min,
     )
     return runtime, (
         orchestration_engine,
@@ -478,6 +525,7 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
         intel_engine,
         relay_engine,
         admin_engine,
+        marketplace_engine,
     )
 
 
@@ -543,6 +591,7 @@ def create_app(
         auth_runtime
         if auth_runtime is not None
         else _build_auth_runtime(
+            m2m_grants=worker_settings.m2m_grants,
             breakglass_redis=scan_runtime.redis,
             saml_redis=scan_runtime.redis,
             local_redis=scan_runtime.redis,
@@ -568,6 +617,11 @@ def create_app(
     app.include_router(allowlist_router)
     app.include_router(reviews_router)
     app.include_router(intel_router)
+    # 里程碑 B' - the marketplace's own /v1/market surface. Mounted alongside
+    # the console's routers but deliberately sharing nothing with them: its
+    # responses are `marketplace_api.views` projections, never the internal
+    # model (spec §3.1).
+    app.include_router(marketplace_router)
 
     # SECURITY (coding spec §13 startup self-check): a degraded reconciliation
     # posture must never be silent - poll=off (with or without push) always

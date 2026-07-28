@@ -71,6 +71,17 @@ class ScanRuntime:
     # 2026-07-14 (item #13) - admin's own local_account/group_role_mapping
     # tables, optional same shape as the other per-module factories above.
     admin_session_factory: SessionFactory | None = None
+    # 里程碑 B' spec §7 - marketplace_api's own append-only fetch audit table,
+    # written with svc_marketplace's INSERT+SELECT-only credentials. Optional,
+    # same shape as the other per-module factories above; when it is None the
+    # marketplace router logs a warning and still returns the polled result
+    # (the audit write must never be able to fail a fetch - spec §7).
+    marketplace_session_factory: SessionFactory | None = None
+    # 里程碑 B' spec §6.3 - per-service-account polling budget for /v1/market
+    # (Settings.marketplace_rate_limit_per_min). Lives on the runtime rather
+    # than being re-read from the environment per request, same as
+    # scan_deadline_s below.
+    marketplace_rate_limit_per_min: int = 120
     # SECURITY (SEC-UPD-010): empty by default - intel_sync.import_offline_package
     # fails closed ("no trusted public keys configured") when this is empty,
     # never silently accepting an unverifiable package.

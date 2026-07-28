@@ -226,6 +226,7 @@ class TestWorkerEndToEnd:
                 submitter="worker-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): worker_tick's collector now waits for the sandbox
         # engines too - simulate the engine-runner having already finished
@@ -306,6 +307,7 @@ class TestWorkerEndToEnd:
                 submitter="intel-wiring-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -381,6 +383,7 @@ class TestWorkerEndToEnd:
                 submitter="sandbox-advisory-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
 
         bandit_result = EngineResult(
@@ -554,6 +557,7 @@ class TestWorkerEndToEnd:
                 submitter="sweep-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -620,6 +624,7 @@ class TestWorkerEndToEnd:
                 submitter="vanished-artifact-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # Ack away the original stream message, delete the artifact, backdate.
         stale = await airlock.claim_scan_jobs(
@@ -712,6 +717,7 @@ class TestLifecycleSync:
                 submitter="lifecycle-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -816,6 +822,7 @@ class TestLifecycleSync:
                 submitter="drift-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -912,6 +919,7 @@ class TestLifecycleSync:
                 submitter="no-baseline-test",
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
+                trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)

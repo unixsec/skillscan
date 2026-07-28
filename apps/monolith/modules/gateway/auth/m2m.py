@@ -1,15 +1,18 @@
 """M2M authentication: OAuth2 client-credentials or mTLS (coding spec §11.2,
 FR-API-080, FR-OIDC-020).
 
-SECURITY: M2M callers get a fixed, minimal role/scope set - there is no
-"trusted service" bypass of the usual per-request object-level authorization.
-Client-credentials tokens go through the exact same introspection path as
-interactive tokens (no separate home-grown validation).
+SECURITY: M2M callers get a minimal, per-service-account scope/tier grant (see
+M2MGrant/resolve_grant below - never a single global grant shared by every
+identity) - there is no "trusted service" bypass of the usual per-request
+object-level authorization. Client-credentials tokens go through the exact
+same introspection path as interactive tokens (no separate home-grown
+validation).
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 import httpx
 from common.config import SessionSettings
@@ -21,8 +24,32 @@ from .session import IntrospectionCache, SessionContext, introspect_token
 
 logger = get_logger(__name__)
 
+
+@dataclass(frozen=True)
+class M2MGrant:
+    """What one machine identity is allowed to do.
+
+    SECURITY (2026-07-28, 里程碑 B'): scopes used to be a module-level
+    frozenset shared by EVERY M2M caller, so granting one identity a new scope
+    granted it to all of them. `tier` used to be hardcoded to
+    TrustTier.INTERNAL - the most PERMISSIVE tier (BLOCK at CRITICAL; PUBLIC
+    blocks at HIGH) - which meant a caller submitting third-party content was
+    judged by the internal-content threshold.
+    """
+
+    scopes: frozenset[str]
+    tier: TrustTier
+
+
 M2M_ROLES: frozenset[str] = frozenset({"submitter"})
-M2M_SCOPES: frozenset[str] = frozenset({"scan:submit"})
+
+# SECURITY: the default must never grant more than the pre-2026-07-28 behaviour
+# did for scopes, and must be the STRICTEST tier rather than the old INTERNAL.
+DEFAULT_M2M_GRANT: M2MGrant = M2MGrant(scopes=frozenset({"scan:submit"}), tier=TrustTier.PUBLIC)
+
+
+def resolve_grant(service_account: str, grants: dict[str, M2MGrant]) -> M2MGrant:
+    return grants.get(service_account, DEFAULT_M2M_GRANT)
 
 
 class M2MError(Exception):
@@ -36,6 +63,7 @@ async def authenticate_client_credentials(
     http_client: httpx.AsyncClient,
     cache: IntrospectionCache,
     allowed_service_accounts: frozenset[str],
+    grants: dict[str, M2MGrant],
 ) -> SessionContext:
     if not token:
         raise M2MError("no client-credentials token provided")
@@ -65,17 +93,25 @@ async def authenticate_client_credentials(
     if time.time() >= exp:
         raise M2MError("client-credentials token expired per introspection exp")
 
+    grant = resolve_grant(subject, grants)
     return SessionContext(
         subject=subject,
         roles=M2M_ROLES,
-        scopes=M2M_SCOPES,
-        tier=TrustTier.INTERNAL,
+        scopes=grant.scopes,
+        tier=grant.tier,
         token_exp=float(exp),
+        # SECURITY (2026-07-28, milestone B' C1): this module is the ONLY place
+        # that may set this - see SessionContext's own docstring for what the
+        # console refuses on the strength of it.
+        is_machine=True,
     )
 
 
 def authenticate_mtls(
-    forwarded_client_cert_header: str | None, *, allowed_service_accounts: frozenset[str]
+    forwarded_client_cert_header: str | None,
+    *,
+    allowed_service_accounts: frozenset[str],
+    grants: dict[str, M2MGrant],
 ) -> SessionContext:
     """SECURITY: only trustworthy when the deployment topology guarantees this
     header can only be set by the mesh sidecar (SAD §3.4) - see common/mtls.py."""
@@ -90,12 +126,16 @@ def authenticate_mtls(
     if not allowed_service_accounts or service_account not in allowed_service_accounts:
         raise M2MError(f"service account {service_account!r} is not allowlisted")
 
+    grant = resolve_grant(service_account, grants)
     return SessionContext(
         subject=service_account,
         roles=M2M_ROLES,
-        scopes=M2M_SCOPES,
-        tier=TrustTier.INTERNAL,
+        scopes=grant.scopes,
+        tier=grant.tier,
         # mTLS identity has no opaque-token expiry of its own - it's bounded by
         # mesh certificate rotation instead, so there's no finite exp to report.
         token_exp=float("inf"),
+        # SECURITY (2026-07-28, milestone B' C1): same as the client-credentials
+        # path above - a SPIFFE workload identity is a machine, full stop.
+        is_machine=True,
     )

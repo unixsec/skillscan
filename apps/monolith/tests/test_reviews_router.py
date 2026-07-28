@@ -50,6 +50,7 @@ def _session(subject: str, roles: frozenset[str]) -> SessionContext:
         scopes=frozenset(),
         tier=TrustTier.INTERNAL,
         token_exp=9999999999.0,
+        is_machine=False,  # a console/reviewer session is a person
     )
 
 

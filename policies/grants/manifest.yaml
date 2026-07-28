@@ -33,6 +33,14 @@ users:
     tables:
       scan_job: ALL
       scan_result: ALL
+      # 里程碑 B' review (C2): who may read one scan - a scan has N rightful
+      # submitters because submit_scan is single-flight on content+toolchain.
+      # SECURITY: INSERT+SELECT only, never ALL. Append-only by design -
+      # revoking a submitter's access to a scan they really did submit is not
+      # a use case, and an UPDATE here would silently re-attribute someone
+      # else's scan to a different subject, which is the object-level
+      # authorization decision itself.
+      scan_submitter: [INSERT, SELECT]
       baseline: [SELECT]  # SECURITY: drift.py (M4, SUPPLY-06) reads the approved baseline only
     database_privileges: [LOCK TABLES]  # scan_job SELECT ... FOR UPDATE (single-flight decide)
   svc_gate:
@@ -105,6 +113,15 @@ users:
       # audit_intent:[INSERT] shape - never SELECT/UPDATE, admin can append
       # an audit intent but never read back or alter the chain itself.
       audit_intent: [INSERT]
+  svc_marketplace:
+    password_env: SKILLSCAN_DB_PASSWORD_MARKETPLACE
+    tables:
+      # 里程碑 B' (marketplace pull integration) spec §7 - marketplace_api's
+      # only owned table. SECURITY: INSERT+SELECT only, deliberately no
+      # UPDATE/DELETE - this is an append-only fetch audit trail (non-
+      # repudiation + reverse-gap detection), and an audit record that can be
+      # rewritten after the fact is not an audit record.
+      marketplace_fetch_log: [INSERT, SELECT]
 
 # SECURITY: no user above has write access to any other module's private business
 # table; gate_outbox/audit_intent/skill/skill_version/scan_result/audit_entry are

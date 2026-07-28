@@ -15,12 +15,12 @@ import datetime
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import DBAPIError
 
 from monolith.modules.audit.models import AuditIntent
 from monolith.modules.gate.models import VerdictRow
-from monolith.modules.orchestration.models import ScanJob
+from monolith.modules.orchestration.models import ScanJob, ScanSubmitterRow
 from monolith.tests.conftest import SessionmakerFixture
 
 
@@ -81,6 +81,79 @@ class TestCrossModuleWritesRejected:
         async with gate_sessionmaker() as session:
             with pytest.raises(DBAPIError, match=r"(?i)command denied"):
                 await session.execute(select(AuditIntent).limit(1))
+
+
+class TestScanSubmitterIsAppendOnlyAtTheGrantLevel:
+    """SECURITY (milestone B' review, C2): `scan_submitter` decides who may read
+    a scan, so it is granted INSERT+SELECT and nothing else - even to
+    svc_orchestration, which owns it and holds ALL on its two sibling tables.
+
+    An UPDATE here would silently re-attribute someone else's scan to a
+    different subject; a DELETE would revoke a submitter's access to a scan they
+    really did submit. Neither is a use case, and application-layer convention
+    is not what this project relies on for that (the whole point of the
+    per-module GRANT manifest is that the database refuses).
+    """
+
+    @pytest.mark.asyncio
+    async def test_orchestration_can_insert_and_select_its_own_association(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # Positive control, so the two refusals below are a real grant boundary
+        # rather than a missing table or a blanket failure.
+        scan_id = str(uuid.uuid4())
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(ScanSubmitterRow(scan_id=scan_id, submitter="tester"))
+            await session.flush()
+        async with orchestration_sessionmaker() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ScanSubmitterRow).where(ScanSubmitterRow.scan_id == scan_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert [r.submitter for r in rows] == ["tester"]
+
+    @pytest.mark.asyncio
+    async def test_orchestration_cannot_update_an_association(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        async with orchestration_sessionmaker() as session, session.begin():
+            with pytest.raises(DBAPIError, match=r"(?i)command denied"):
+                await session.execute(
+                    update(ScanSubmitterRow)
+                    .where(ScanSubmitterRow.submitter == "tester")
+                    .values(submitter="attacker")
+                )
+
+    @pytest.mark.asyncio
+    async def test_orchestration_cannot_delete_an_association(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        async with orchestration_sessionmaker() as session, session.begin():
+            with pytest.raises(DBAPIError, match=r"(?i)command denied"):
+                await session.execute(
+                    delete(ScanSubmitterRow).where(ScanSubmitterRow.submitter == "tester")
+                )
+
+    @pytest.mark.asyncio
+    async def test_every_other_module_user_is_refused_the_table_entirely(
+        self,
+        gate_sessionmaker: SessionmakerFixture,
+        reeval_sessionmaker: SessionmakerFixture,
+        marketplace_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # Object-level authorization data belongs to exactly one module. The
+        # marketplace user is named explicitly because marketplace_api is the
+        # module that CONSUMES this decision - it does so through
+        # orchestration's own accessor and session, never its own query.
+        for sessionmaker in (gate_sessionmaker, reeval_sessionmaker, marketplace_sessionmaker):
+            async with sessionmaker() as session:
+                with pytest.raises(DBAPIError, match=r"(?i)command denied"):
+                    await session.execute(text("SELECT 1 FROM scan_submitter LIMIT 1"))
 
 
 class TestSameModuleWritesSucceed:

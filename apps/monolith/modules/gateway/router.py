@@ -3,7 +3,7 @@ allowlist/gate policy land in M6, reconciliation/rescan-trigger in M7,
 inventory/admin/reports/breakglass in M8 (§16) - see each module's own router
 file (admin_router.py, inventory_router.py) for the rest of §9.
 
-SECURITY: every route requires authentication via M2's `require_role()`
+SECURITY: every route requires authentication via M2's `require_human_role()`
 (fail-closed 401/403, enforced server-side - never trust a client-supplied
 role). Object-level authorization (a submitter may only read their OWN scans;
 approver/auditor/admin may read any) is enforced here in the handler, never
@@ -11,6 +11,13 @@ left to the frontend (FR-API defense against IDOR). Every state-changing
 route also depends on `require_csrf` (coding spec §16.1 INV-16) - a no-op for
 bearer-token (M2M/API) callers, enforced for cookie-authenticated (BFF)
 callers.
+
+SECURITY: this is the CONSOLE surface and it is closed to machine identities
+(403). Its responses are the internal scan shape - findings blobs with
+`snippet_hash`, plus `provenance`/`required_ok`/`hard_gate_hits` - which
+`marketplace_api` deliberately withholds from external callers. A service
+account belongs on `/v1/market/*`, where the same scans are served through the
+projection. See `auth/dependencies.require_human_role`.
 """
 
 from __future__ import annotations
@@ -31,13 +38,13 @@ from sqlalchemy import select
 
 from monolith.modules.admin.engine_registry import filter_enabled_engines
 from monolith.modules.gate.models import VerdictRow
-from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
+from monolith.modules.gateway.auth.dependencies import require_csrf, require_human_role
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.inventory.lifecycle import InvalidTransitionError
 from monolith.modules.inventory.models import SkillVersionRow
 from monolith.modules.inventory.service import register_skill_version, transition_skill
-from monolith.modules.orchestration.models import ScanJob, ScanResultRow
-from monolith.modules.orchestration.service import submit_scan
+from monolith.modules.orchestration.models import ScanJob, ScanResultRow, ScanSubmitterRow
+from monolith.modules.orchestration.service import is_scan_submitter, submit_scan
 from monolith.modules.reeval.reconciliation import (
     MarketplacePublishedEntry,
     PushEventVerificationError,
@@ -53,7 +60,14 @@ router = APIRouter(prefix="/v1")
 # NOTE: hoisted so Depends(...) below wraps a plain reference, not a nested
 # call - matches the convention established in auth/dependencies tests (ruff
 # B008 flags function calls in argument defaults otherwise).
-_submitter_or_above = require_role()
+#
+# SECURITY (2026-07-28, milestone B' C1): `require_human_role`, not
+# `require_role`. Every route below returns the INTERNAL scan shape, so a
+# machine identity reaching any of them walks straight around
+# `marketplace_api.views`'s projection using the same token it submitted with.
+# See `require_human_role`'s docstring for the full reasoning and for why the
+# refusal is keyed on the KIND of identity rather than on a scope.
+_submitter_or_above = require_human_role()
 
 _REVIEWER_ROLES = ("approver", "admin", "auditor")
 
@@ -110,6 +124,14 @@ async def create_scan(
             submitter=session.subject,
             engine_metadatas=enabled_engine_metadatas,
             policy=runtime.policy,
+            # SECURITY (2026-07-28, milestone B' Task 4): `tier` (above) is what
+            # gets judged now - previously this scan's verdict silently used
+            # `runtime.default_trust_tier` instead, regardless of what `tier`
+            # resolved to. Console behaviour is unchanged: a caller-supplied
+            # `trust_tier` form field still wins here (see `tier`'s own
+            # resolution above) - that gap is open, tracked in coding spec
+            # §4.1's closing note, and out of this task's scope.
+            trust_tier=tier,
             deadline_s=runtime.scan_deadline_s,
         )
 
@@ -206,7 +228,17 @@ async def get_scan(
         # SECURITY: object-level authz (IDOR defense) - a plain submitter may
         # only read their own scans; approver/auditor/admin may read any. A
         # 404 (not 403) so existence of another user's scan_id isn't leaked.
-        if job.submitter != session.subject and not session.has_role(*_REVIEWER_ROLES):
+        #
+        # C2: membership in `scan_submitter`, not `job.submitter == subject`.
+        # Single-flight dedup means the scan a user just submitted may be a
+        # scan_job someone else's earlier submission created, and the column
+        # still names them - so the person who submitted it was refused their
+        # own scan. Fixing only the marketplace side would have produced the
+        # mirror-image bug here: marketplace can read it, the console user who
+        # submitted the same bytes cannot.
+        if not await is_scan_submitter(
+            db_session, scan_id=scan_id, subject=session.subject
+        ) and not session.has_role(*_REVIEWER_ROLES):
             raise HTTPException(status_code=404, detail="scan not found")
 
         result_row = (
@@ -253,7 +285,12 @@ async def get_scan_sarif(
         ).scalar_one_or_none()
         if job is None:
             raise HTTPException(status_code=404, detail="scan not found")
-        if job.submitter != session.subject and not session.has_role(*_REVIEWER_ROLES):
+        # C2: same association-table check as `get_scan` above - a fix applied
+        # to only one of the two identical checks leaves the same hole one path
+        # segment away.
+        if not await is_scan_submitter(
+            db_session, scan_id=scan_id, subject=session.subject
+        ) and not session.has_role(*_REVIEWER_ROLES):
             raise HTTPException(status_code=404, detail="scan not found")
 
     if runtime.reporting_session_factory is None:
@@ -276,8 +313,19 @@ async def list_scans(
     stmt = select(ScanJob)
     # SECURITY: object-level authz - a plain submitter only ever sees their own
     # scans in the list; approver/auditor/admin see all.
+    #
+    # C2: driven by `scan_submitter`, the same association the per-scan checks
+    # above use. Filtering on `ScanJob.submitter` here would leave a submitter
+    # able to open a deduplicated scan by id but unable to find it in their own
+    # list - i.e. no way to reach it at all through the UI.
     if not session.has_role(*_REVIEWER_ROLES):
-        stmt = stmt.where(ScanJob.submitter == session.subject)
+        stmt = stmt.where(
+            ScanJob.scan_id.in_(
+                select(ScanSubmitterRow.scan_id).where(
+                    ScanSubmitterRow.submitter == session.subject
+                )
+            )
+        )
     if state is not None:
         stmt = stmt.where(ScanJob.state == state)
     stmt = stmt.order_by(ScanJob.created_at.desc()).limit(bounded_limit).offset(max(0, offset))

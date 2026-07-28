@@ -35,11 +35,32 @@ class SessionError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class SessionContext:
+    """SECURITY: `is_machine` is the KIND of identity, not its permission list.
+
+    It exists so the console surface (`gateway/router.py`) can refuse machine
+    identities outright. Before it, `require_role()` with no arguments meant
+    "any authenticated session", and an M2M caller carries `roles={"submitter"}`
+    and is the submitter of its own scans - so it passed both the role check and
+    the object-level ownership check and could read the console's
+    `GET /v1/scans/{scan_id}`, whose body is the raw internal shape
+    (`snippet_hash`, `provenance`, `required_ok`, `hard_gate_hits` - the four
+    things `marketplace_api.views` deliberately withholds). The projection was
+    the door the marketplace was EXPECTED to use, not the only door it could.
+
+    Deliberately NOT expressed as "requires scope X": a scope allowlist is one
+    added scope away from silently reopening that hole, and scopes describe what
+    an identity may do, whereas the question here is what an identity IS. There
+    is no default value for the same reason - a new session type must state its
+    kind rather than inherit "human" by omission, and a test fixture that fakes
+    an M2M session must say so or it is not testing the machine path at all.
+    """
+
     subject: str
     roles: frozenset[str]
     scopes: frozenset[str]
     tier: TrustTier
     token_exp: float
+    is_machine: bool
 
     def has_role(self, *roles: str) -> bool:
         return bool(self.roles.intersection(roles))
@@ -153,4 +174,8 @@ async def authenticate(
         scopes=scopes,
         tier=_resolve_trust_tier(payload),
         token_exp=float(exp),
+        # An interactive OIDC session is a person behind a browser/CLI, not a
+        # service account - `m2m.py` is the only module that builds machine
+        # sessions.
+        is_machine=False,
     )

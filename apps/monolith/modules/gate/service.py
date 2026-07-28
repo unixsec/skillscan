@@ -13,6 +13,7 @@ import datetime
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import jwt as pyjwt
 from ports import SignerPort
@@ -269,6 +270,40 @@ async def revoke_allowlist_entry(session: AsyncSession, *, allowlist_id: str, ac
         )
     )
     await session.flush()
+
+
+async def get_verdict_view(session: AsyncSession, *, scan_id: str) -> dict[str, Any] | None:
+    """The externally-projectable fields of one verdict as a plain dict, or
+    None when this scan has no verdict yet.
+
+    ARCHITECTURE (scripts/check_import_boundaries.py): same posture as
+    `list_issued_verdicts` above - `marketplace_api.router` needs a verdict to
+    project, and gets plain values rather than a `VerdictRow` and rather than
+    a licence to `select()` against gate's private table itself.
+
+    The key names are the ones `marketplace_api.views.project_scan` reads.
+    `issued_at` is serialized here (naive-UTC `.isoformat()`, the convention
+    every other router in this codebase uses) because `views` is a pure
+    function with no clock and no I/O - handing it a `datetime` would push a
+    serialization decision into the projection layer.
+
+    Deliberately NOT included: `jti`, `content_hash`, `effective_severity`,
+    `reasons`. They are internal adjudication detail (spec §5.3) - anything
+    returned here is one `views` change away from being part of the external
+    contract, so the narrow set is the safe default.
+    """
+    row = (
+        await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return {
+        "verdict": row.verdict,
+        "score": row.score,
+        "policy_version": row.policy_version,
+        "issued_at": row.issued_at.isoformat(),
+        "jws_signature": row.jws_signature,
+    }
 
 
 async def list_pending_reviews(session: AsyncSession) -> Sequence[VerdictRow]:

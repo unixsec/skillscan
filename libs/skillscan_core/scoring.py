@@ -107,7 +107,11 @@ def aggregate(
         pre_cap_trifecta_signals |= f.trifecta_signals
     pre_cap_trifecta_present = ALL_TRIFECTA_SIGNALS.issubset(pre_cap_trifecta_signals)
 
-    findings_capped = len(all_findings) > max_findings
+    # SECURITY: captured BEFORE truncation, same reasoning as pre_cap_hard_gate_hits/
+    # pre_cap_trifecta_present above - a finding flood must not make the true count
+    # unrecoverable, only the full findings list.
+    findings_total = len(all_findings)
+    findings_capped = findings_total > max_findings
     capped_findings = all_findings[:max_findings] if findings_capped else all_findings
 
     deduped, collided_rule_ids = _dedup(capped_findings)
@@ -134,6 +138,7 @@ def aggregate(
         findings=deduped,
         engine_provenance=engine_provenance,
         findings_capped=findings_capped,
+        findings_total=findings_total,
         required_ok=required_ok,
         missing_or_failed_required=missing_or_failed,
         dedup_collision_rule_ids=collided_rule_ids,

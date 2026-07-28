@@ -1,5 +1,8 @@
 """Scan state machine (coding spec §11.3): queued -> running -> scored -> decided/failed.
 
+This sentence is a description; `SCAN_STATES` below is the definition. Anything
+that needs the full set of states reads that constant - never this prose.
+
 SECURITY: `run_mock_engine_worker_tick` stands in for a real sandboxed worker
 process (coding spec §10, M4/M5) and therefore touches ONLY Redis + the blob
 store - never a database session - exactly like a real subprocess/sandbox
@@ -21,6 +24,7 @@ import json
 import tarfile
 import uuid
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import redis.asyncio as aioredis
 from common import airlock
@@ -49,14 +53,39 @@ from skillscan_core import (
     toolchain_digest as compute_toolchain_digest,
 )
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from monolith.modules.gate.service import SignerPort, decide_and_record
 
 from .aggregate import load_and_aggregate, unavailable_engine_result
-from .models import ScanJob, ScanResultRow
+from .models import ScanJob, ScanResultRow, ScanSubmitterRow
 
 SessionFactory = Callable[[], AsyncSession]
+
+# The scan state machine (coding spec §11.3), as a CONSTANT this module's own
+# writers use - not as prose in the module docstring.
+#
+# CONTRACT: `SCAN_STATES` is the single source of truth for "which states a
+# `scan_job` row can be in", and every consumer that must cover the whole
+# machine reads it from here. `marketplace_api.views._STATUS_PROJECTION` is one
+# such consumer: an internal state with no external projection makes
+# `project_status` raise, which 500s every marketplace poll of such a scan.
+# test_marketplace_views.py's guard reads THIS set, so adding a state below
+# without mapping it there fails that test - the previous guard parsed the
+# docstring prose with a regex that enumerated the five states it was meant to
+# discover, and therefore could never see a sixth one (review 2026-07-28).
+STATE_QUEUED = "queued"
+STATE_RUNNING = "running"
+STATE_SCORED = "scored"
+STATE_DECIDED = "decided"
+STATE_FAILED = "failed"
+SCAN_STATES: frozenset[str] = frozenset(
+    {STATE_QUEUED, STATE_RUNNING, STATE_SCORED, STATE_DECIDED, STATE_FAILED}
+)
+# The two non-terminal states: a job here has not been scored yet, so it is
+# still claimable by the collector, the dead-letter path and the sweeps.
+_UNSCORED_STATES: tuple[str, ...] = (STATE_QUEUED, STATE_RUNNING)
 
 # SECURITY: sentinel engine-status values a worker reports on the results
 # stream to signal the orchestrator to dead-letter a job immediately, carrying
@@ -141,12 +170,36 @@ async def submit_scan(
     submitter: str,
     engine_metadatas: Sequence[EngineMetadata],
     policy: GatePolicy,
+    trust_tier: TrustTier,
     deadline_s: float = 300.0,
 ) -> str:
     """SECURITY (single-flight): `scan_job.cache_key` UNIQUE - two submissions of
     the same content+toolchain collapse to one scan_job/one pipeline run rather
     than duplicating work or racing two independent verdicts for one content_hash.
     Caller must run this inside `async with session.begin():`.
+
+    SECURITY (2026-07-28, milestone B' Task 4): `trust_tier` is REQUIRED, not
+    defaulted - a default would let a missed call site silently fall back to
+    some tier, which is exactly the failure mode this parameter exists to
+    eliminate (every verdict used to be judged at a single process-wide
+    `runtime.default_trust_tier` regardless of who submitted, since
+    `session.tier` was never threaded any further than a whoami diagnostic).
+    Recorded onto `ScanJob.trust_tier` here, at submit time, because the
+    worker decides asynchronously - long after this request/session is gone -
+    so the tier has to travel with the scan rather than through a request
+    context. See `ScanJob.trust_tier` and this column's migration for the
+    full history.
+
+    SECURITY (2026-07-28, milestone B' review C2): BOTH paths out of this
+    function record `submitter` in `scan_submitter`. On the dedup path the
+    caller is handed someone else's existing scan_job, and every object-level
+    authorization check in the system reads that association table - without
+    the append, the second submitter is told 404 for a scan_id it was just
+    given, permanently (the next submission returns the same id). The tier is
+    NOT re-derived for a later submitter: the adjudication already happened, at
+    the first submitter's tier, and re-tiering it would mean claiming a decision
+    that was never made. `views.project_scan.judged_at_tier` is what makes that
+    visible externally rather than silently assumed.
     """
     c_hash = compute_content_hash(files)
     t_digest = compute_toolchain_digest(engine_metadatas, policy.version)
@@ -156,6 +209,7 @@ async def submit_scan(
         await session.execute(select(ScanJob).where(ScanJob.cache_key == ck))
     ).scalar_one_or_none()
     if existing is not None:
+        await _associate_submitter(session, scan_id=str(existing.scan_id), submitter=submitter)
         return str(existing.scan_id)
 
     scan_id = str(uuid.uuid4())
@@ -169,13 +223,15 @@ async def submit_scan(
             content_hash=c_hash,
             toolchain_digest=t_digest,
             cache_key=ck,
-            state="queued",
+            state=STATE_QUEUED,
             submitter=submitter,
             created_at=_naive_utcnow(),
             skill_name=_parse_skill_name(files),
+            trust_tier=trust_tier.value,
         )
     )
     await session.flush()
+    await _associate_submitter(session, scan_id=scan_id, submitter=submitter)
 
     await airlock.produce_scan_job(
         redis,
@@ -186,6 +242,120 @@ async def submit_scan(
         engines=tuple(sorted(policy.required_engines)),
     )
     return scan_id
+
+
+async def _associate_submitter(session: AsyncSession, *, scan_id: str, submitter: str) -> None:
+    """Idempotently record that `submitter` submitted `scan_id` (C2).
+
+    Read-then-insert rather than `INSERT ... ON DUPLICATE KEY UPDATE`: the
+    latter needs the UPDATE privilege even for a no-op update, and
+    `scan_submitter` is granted INSERT+SELECT only on purpose (an UPDATE here
+    could silently re-attribute a scan). The SAVEPOINT covers the race two
+    concurrent submissions of the same content leave open between the SELECT
+    and the INSERT - same idiom, and same reason, as
+    `reeval.controller.trigger_rescans`: a duplicate is the expected benign
+    outcome, so it rolls back only this statement and not the caller's
+    transaction.
+    """
+    already = (
+        await session.execute(
+            select(ScanSubmitterRow.scan_id).where(
+                ScanSubmitterRow.scan_id == scan_id, ScanSubmitterRow.submitter == submitter
+            )
+        )
+    ).scalar_one_or_none()
+    if already is not None:
+        return
+    try:
+        async with session.begin_nested():
+            session.add(ScanSubmitterRow(scan_id=scan_id, submitter=submitter))
+            await session.flush()
+    except IntegrityError:
+        # A concurrent submission of the same content by the same subject won
+        # the race. The association exists either way, which is all that is
+        # being asserted here.
+        pass
+
+
+async def is_scan_submitter(session: AsyncSession, *, scan_id: str, subject: str) -> bool:
+    """Did `subject` submit `scan_id`? (object-level authorization, C2)
+
+    ARCHITECTURE (scripts/check_import_boundaries.py): this exists so a
+    consumer OUTSIDE orchestration - `marketplace_api.router` - can make its
+    authorization decision without importing orchestration's ORM classes and
+    issuing its own `select()`. Same posture as
+    `gate.service.list_issued_verdicts`: plain values cross the module
+    boundary, never an ORM row and never this module's session.
+
+    SECURITY: this is deliberately SEPARATE from `get_scan_state_and_tier`
+    below, rather than one accessor that filters internally and returns None
+    for both "no such scan" and "not yours". Those two cases must stay
+    distinguishable to a caller that legitimately needs to tell them apart -
+    the console's reviewer roles may read any scan, so it needs "does this
+    exist" independently of "is it yours". Callers that must NOT distinguish
+    them (the marketplace, spec §6.2) collapse both to 404 themselves.
+
+    Membership in `scan_submitter`, not equality against `ScanJob.submitter`:
+    single-flight dedup means one scan can have several rightful submitters.
+    """
+    row = (
+        await session.execute(
+            select(ScanSubmitterRow.scan_id).where(
+                ScanSubmitterRow.scan_id == scan_id, ScanSubmitterRow.submitter == subject
+            )
+        )
+    ).scalar_one_or_none()
+    return row is not None
+
+
+async def get_scan_state_and_tier(
+    session: AsyncSession, *, scan_id: str
+) -> tuple[str, str | None] | None:
+    """`(state, trust_tier)` for one scan, or None when no such scan exists.
+
+    Same cross-module-boundary rationale as `is_scan_submitter` above.
+
+    `trust_tier` is the tier this scan's verdict was actually adjudicated at
+    (`ScanJob.trust_tier`, recorded at submit time). It is surfaced to the
+    marketplace as `judged_at_tier` because of dedup: a caller whose submission
+    collapsed onto an existing scan_job receives a verdict decided at the FIRST
+    submitter's tier, and would otherwise reasonably assume it was judged at
+    its own. None means the row records no tier (see `ScanJob.trust_tier`).
+    """
+    job = (
+        await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+    ).scalar_one_or_none()
+    if job is None:
+        return None
+    return job.state, job.trust_tier
+
+
+async def get_scan_result_view(session: AsyncSession, *, scan_id: str) -> dict[str, Any] | None:
+    """The projection-relevant `scan_result` columns as a plain dict, or None
+    when this scan has no result row.
+
+    None is meaningful, not merely "empty": a scan that was decided WITHOUT a
+    result row is the fail-closed signature (`_dead_letter_and_decide` signs a
+    BLOCK verdict but writes no findings blob), and
+    `marketplace_api.views.project_scan` derives `fail_closed` from exactly
+    this None. Returning `{}` here instead would silently turn every
+    fail-closed BLOCK into an ordinary one.
+
+    Same cross-module-boundary rationale as `is_scan_submitter` above. The key
+    names are the ones `marketplace_api.views` reads; only the columns the
+    external projection actually needs are included, so a new internal column
+    does not become externally reachable by default.
+    """
+    row = (
+        await session.execute(select(ScanResultRow).where(ScanResultRow.scan_id == scan_id))
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return {
+        "findings": row.findings,
+        "findings_capped": row.findings_capped,
+        "findings_total": row.findings_total,
+    }
 
 
 async def run_mock_engine_worker_tick(
@@ -358,6 +528,7 @@ def forced_block_scan_result(content_hash: str, *, reason: str) -> ScanResult:
         findings=(),
         engine_provenance=(),
         findings_capped=False,
+        findings_total=0,
         required_ok=False,
         missing_or_failed_required=(reason,),
     )
@@ -370,7 +541,7 @@ async def run_result_collector_tick(
     gate_session_factory: SessionFactory,
     *,
     policy: GatePolicy,
-    trust_tier: TrustTier,
+    default_trust_tier: TrustTier,
     allowlist: Sequence[AllowlistEntry],
     signer: SignerPort,
     consumer: str,
@@ -383,6 +554,25 @@ async def run_result_collector_tick(
     """Claims pending result messages and, for every scan_id that now has all
     `policy.required_engines` reported (or was reported as a poison-pill),
     records a verdict. Returns how many scans were newly decided this tick.
+
+    `default_trust_tier` (2026-07-28, milestone B' Task 4 - renamed from
+    `trust_tier`): every scan is judged at ITS OWN `job.trust_tier`, recorded
+    by `submit_scan` at submission time - never this parameter directly. This
+    is only the fallback `_dead_letter_and_decide`/`_try_score_and_decide` use
+    for a `job.trust_tier` that is NULL, i.e. a row that carries no recorded
+    tier at all. Passing a single process-wide value here is correct ONLY as
+    that fallback; it must never again become the tier a live submission is
+    actually judged at.
+
+    2026-07-28 (C3 correction): this docstring used to claim NULL was "only
+    possible for a row written before the trust_tier column existed". That was
+    FALSE and it mattered - `reeval.controller.build_rescan_job` did not map the
+    column, so every reeval-triggered rescan inserted NULL and was silently
+    re-decided at this permissive default. That path is fixed; both production
+    writers (`submit_scan` and `build_rescan_job`) now always record a tier, so
+    NULL means "written before the column existed, never backfilled" and
+    nothing else. Do not restate that as an invariant of the schema - it is a
+    property of the two writers, and it holds only as long as both keep it.
 
     `additional_engines` (e.g. the intel matcher, coding spec INTEL-01/02/03,
     corrected 2026-07-27 from the previously mislabelled NET-06/07/08): read
@@ -442,7 +632,7 @@ async def run_result_collector_tick(
                     gate_session_factory,
                     scan_id=scan_id,
                     policy=policy,
-                    trust_tier=trust_tier,
+                    default_trust_tier=default_trust_tier,
                     signer=signer,
                     operator=operator,
                     reason=reason,
@@ -456,7 +646,7 @@ async def run_result_collector_tick(
                     scan_id=scan_id,
                     required_engines=required,
                     policy=policy,
-                    trust_tier=trust_tier,
+                    default_trust_tier=default_trust_tier,
                     allowlist=allowlist,
                     signer=signer,
                     operator=operator,
@@ -497,7 +687,7 @@ async def sweep_sandbox_wait_timeouts(
     gate_session_factory: SessionFactory,
     *,
     policy: GatePolicy,
-    trust_tier: TrustTier,
+    default_trust_tier: TrustTier,
     allowlist: Sequence[AllowlistEntry],
     signer: SignerPort,
     waited_advisory_engines: Sequence[str],
@@ -506,6 +696,12 @@ async def sweep_sandbox_wait_timeouts(
     additional_engines: Sequence[str] = (),
 ) -> int:
     """Decide scans that have waited past `wait_timeout_s` for a sandbox engine.
+
+    `default_trust_tier` (2026-07-28, milestone B' Task 4): same fallback-only
+    role as `run_result_collector_tick`'s parameter of the same name - each
+    scan is judged at its own `job.trust_tier`; this is only what
+    `_try_score_and_decide` falls back to for a `job.trust_tier` that is NULL,
+    i.e. a row with no recorded tier.
 
     WHY THIS EXISTS: `run_result_collector_tick` is message-driven - it only
     tries to decide a scan when a result message arrives. The moment a wait
@@ -548,7 +744,7 @@ async def sweep_sandbox_wait_timeouts(
             (
                 await session.execute(
                     select(ScanJob.scan_id)
-                    .where(ScanJob.state.in_(("queued", "running")))
+                    .where(ScanJob.state.in_(_UNSCORED_STATES))
                     .where(ScanJob.sandbox_wait_started_at.is_not(None))
                     .where(ScanJob.sandbox_wait_started_at < cutoff)
                     # SECURITY/Minor (2026-07-27 review): oldest-first, not
@@ -577,7 +773,7 @@ async def sweep_sandbox_wait_timeouts(
                 scan_id=str(scan_id),
                 required_engines=tuple(sorted(policy.required_engines)),
                 policy=policy,
-                trust_tier=trust_tier,
+                default_trust_tier=default_trust_tier,
                 allowlist=allowlist,
                 signer=signer,
                 operator=operator,
@@ -601,8 +797,8 @@ async def _mark_running_if_queued(
     async with orchestration_session_factory() as session, session.begin():
         await session.execute(
             update(ScanJob)
-            .where(ScanJob.scan_id == scan_id, ScanJob.state == "queued")
-            .values(state="running")
+            .where(ScanJob.scan_id == scan_id, ScanJob.state == STATE_QUEUED)
+            .values(state=STATE_RUNNING)
         )
 
 
@@ -612,7 +808,7 @@ async def _dead_letter_and_decide(
     *,
     scan_id: str,
     policy: GatePolicy,
-    trust_tier: TrustTier,
+    default_trust_tier: TrustTier,
     signer: SignerPort,
     operator: str,
     reason: str,
@@ -634,17 +830,28 @@ async def _dead_letter_and_decide(
                 select(ScanJob).where(ScanJob.scan_id == scan_id).with_for_update()
             )
         ).scalar_one_or_none()
-        if job is None or job.state not in ("queued", "running"):
+        if job is None or job.state not in _UNSCORED_STATES:
             return False
         content_hash = str(job.content_hash)
+        # SECURITY (2026-07-28, milestone B' Task 4): judge this scan at its
+        # OWN submission-time tier, not the process-wide default - see
+        # `run_result_collector_tick`'s `default_trust_tier` docstring.
+        # A NULL `job.trust_tier` means this row records no tier and falls back
+        # to `default_trust_tier` (C3 correction: that is NOT the same claim as
+        # "only pre-column rows can be NULL" - reeval used to produce NULL rows
+        # continuously; see the docstring above).
+        job_trust_tier = job.trust_tier
 
+    effective_trust_tier = (
+        TrustTier(job_trust_tier) if job_trust_tier is not None else default_trust_tier
+    )
     async with gate_session_factory() as gate_session, gate_session.begin():
         await decide_and_record(
             gate_session,
             scan_id=scan_id,
             scan_result=forced_block_scan_result(content_hash, reason=reason),
             policy=policy,
-            trust_tier=trust_tier,
+            trust_tier=effective_trust_tier,
             allowlist=(),
             signer=signer,
             operator=operator,
@@ -654,8 +861,8 @@ async def _dead_letter_and_decide(
     async with orchestration_session_factory() as session, session.begin():
         await session.execute(
             update(ScanJob)
-            .where(ScanJob.scan_id == scan_id, ScanJob.state.in_(("queued", "running")))
-            .values(state="failed")
+            .where(ScanJob.scan_id == scan_id, ScanJob.state.in_(_UNSCORED_STATES))
+            .values(state=STATE_FAILED)
         )
     return True
 
@@ -668,7 +875,7 @@ async def _try_score_and_decide(
     scan_id: str,
     required_engines: Sequence[str],
     policy: GatePolicy,
-    trust_tier: TrustTier,
+    default_trust_tier: TrustTier,
     allowlist: Sequence[AllowlistEntry],
     signer: SignerPort,
     operator: str,
@@ -682,6 +889,14 @@ async def _try_score_and_decide(
     path) rather than a fail-closed BLOCK, so one crashed engine cannot block
     every scan. `force_decide` is what the wait-timeout sweep passes to stop
     waiting - see `sweep_sandbox_wait_timeouts`.
+
+    `default_trust_tier` (2026-07-28, milestone B' Task 4 - renamed from
+    `trust_tier`): this scan is judged at its OWN `job.trust_tier`, read below
+    under the same `SELECT ... FOR UPDATE` that already loads `job` - this
+    parameter is only the fallback for a `job.trust_tier` that is NULL, i.e. a
+    row that records no tier at all (see `run_result_collector_tick`'s own
+    docstring for why "NULL == pre-column row" is a claim about the writers,
+    not about the schema, and was false for reeval's rescans until C3).
 
     `force_decide` ONLY ever bypasses the `waited_advisory_engines` wait - it
     NEVER bypasses the `required_engines` presence check. `required_engines`
@@ -704,8 +919,14 @@ async def _try_score_and_decide(
                 select(ScanJob).where(ScanJob.scan_id == scan_id).with_for_update()
             )
         ).scalar_one_or_none()
-        if job is None or job.state not in ("queued", "running"):
+        if job is None or job.state not in _UNSCORED_STATES:
             return False  # unknown, or already scored/decided/failed elsewhere
+
+        # SECURITY (2026-07-28, milestone B' Task 4): captured now, while `job`
+        # is still in scope under the row lock, for use after this session
+        # block closes below - see `default_trust_tier`'s docstring above for
+        # what a NULL here means and what it deliberately no longer claims.
+        job_trust_tier = job.trust_tier
 
         # SECURITY (Critical, 2026-07-27 review): this check is UNCONDITIONAL -
         # never skipped by `force_decide`. If it were skipped, a forced decide
@@ -814,22 +1035,26 @@ async def _try_score_and_decide(
                 confidence_at_max=scan_result.confidence_at_max,
                 trifecta_present=scan_result.trifecta_present,
                 findings_capped=scan_result.findings_capped,
+                findings_total=scan_result.findings_total,
                 required_ok=scan_result.required_ok,
                 findings=[serialize_finding(f) for f in scan_result.findings],
                 provenance=[list(p) for p in scan_result.engine_provenance],
                 hard_gate_hits=list(scan_result.hard_gate_hits),
             )
         )
-        job.state = "scored"
+        job.state = STATE_SCORED
         await session.flush()
 
+    effective_trust_tier = (
+        TrustTier(job_trust_tier) if job_trust_tier is not None else default_trust_tier
+    )
     async with gate_session_factory() as gate_session, gate_session.begin():
         await decide_and_record(
             gate_session,
             scan_id=scan_id,
             scan_result=scan_result,
             policy=policy,
-            trust_tier=trust_tier,
+            trust_tier=effective_trust_tier,
             allowlist=allowlist,
             signer=signer,
             operator=operator,
@@ -840,7 +1065,7 @@ async def _try_score_and_decide(
     async with orchestration_session_factory() as session, session.begin():
         await session.execute(
             update(ScanJob)
-            .where(ScanJob.scan_id == scan_id, ScanJob.state == "scored")
-            .values(state="decided")
+            .where(ScanJob.scan_id == scan_id, ScanJob.state == STATE_SCORED)
+            .values(state=STATE_DECIDED)
         )
     return True

@@ -83,6 +83,7 @@ class TestRealScanRuntimeWiring:
             scopes=frozenset(),
             tier=TrustTier.INTERNAL,
             token_exp=9999999999.0,
+            is_machine=False,
         )
         transport = httpx.ASGITransport(app=real_app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:

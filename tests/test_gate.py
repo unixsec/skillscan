@@ -255,6 +255,7 @@ class TestGateScore(unittest.TestCase):
             findings=(survivor,),
             engine_provenance=(),
             findings_capped=False,
+            findings_total=1,
             required_ok=True,
             missing_or_failed_required=(),
             dedup_collision_rule_ids=frozenset({"rule.y"}),

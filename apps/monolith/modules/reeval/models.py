@@ -51,6 +51,15 @@ class ScanJobInsertOnly(Base):
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     submitter: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+    # SECURITY (2026-07-28, milestone B' C3): mapped so a reeval-triggered
+    # rescan CARRIES the skill's trust tier. Without this column here the INSERT
+    # simply omitted it and every rescan landed with trust_tier=NULL, which the
+    # decide path falls back to `runtime.default_trust_tier` (INTERNAL - the
+    # most permissive tier) for. A PUBLIC skill that BLOCKed on a HIGH finding
+    # was therefore re-judged at the INTERNAL threshold and came back REVIEW:
+    # re-evaluation, whose entire purpose is to re-apply CURRENT detection to
+    # already-published content, was silently relaxing every verdict it touched.
+    trust_tier: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class SkillReadOnly(Base):
