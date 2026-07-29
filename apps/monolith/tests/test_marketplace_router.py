@@ -760,6 +760,12 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
         # not the scan's tier under a second label.
         assert body["requested_tier"] == TrustTier.PUBLIC.value
         assert body["tier_direction"] == "looser"
+        # 2026-07-29 residual triage: the label is qualified by the policy it
+        # was computed under. This scan was just decided by the live runtime, so
+        # its verdict carries the loaded policy's own version - the one case
+        # where the direction really does describe the adjudication that
+        # happened rather than today's thresholds.
+        assert body["tier_direction_basis"] == "signing_policy"
 
     @pytest.mark.asyncio
     async def test_no_divergence_is_reported_when_the_caller_created_the_scan(
@@ -778,6 +784,9 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
         assert body["judged_at_tier"] == TrustTier.PUBLIC.value
         assert body["requested_tier"] == TrustTier.PUBLIC.value
         assert body["tier_direction"] is None
+        # Nothing was compared, so there is nothing to qualify - a basis here
+        # would be claiming a comparison that never happened.
+        assert body["tier_direction_basis"] is None
 
     @pytest.mark.asyncio
     async def test_the_disclosure_does_not_widen_the_whitelist(
@@ -832,6 +841,7 @@ _SPEC_TOP_LEVEL_FIELDS = frozenset(
         "judged_at_tier",
         "requested_tier",
         "tier_direction",
+        "tier_direction_basis",
         "summary",
         "findings",
     }

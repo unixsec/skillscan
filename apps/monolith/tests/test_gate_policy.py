@@ -15,9 +15,11 @@ from skillscan_core import Severity, TrustTier, Verdict
 
 from monolith.modules.gate.policy import (
     GatePolicyLoadError,
+    TierDivergence,
     load_gate_policy,
     parse_gate_policy,
     tier_direction,
+    tier_divergence,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -231,3 +233,96 @@ class TestTierDirection:
         )
         assert tier_direction(policy, requested="internal", judged="public") == "looser"
         assert tier_direction(policy, requested="public", judged="internal") == "stricter"
+
+
+class TestTierDivergence:
+    """2026-07-29 residual triage: `tier_direction` is computed from the policy
+    loaded NOW, so an approved policy change between signing and viewing could
+    relabel a historical verdict - showing a divergence that did not exist when
+    the adjudication happened, or hiding one that did.
+
+    What is recoverable is the verdict's own `policy_version`, and that is all
+    this reports. The historical policy CONTENT is deliberately not
+    reconstructed (see the function's docstring): the label stays, and the
+    basis says whether to trust it as a statement about the past.
+    """
+
+    def test_the_signing_policy_is_named_when_it_is_the_one_loaded(self) -> None:
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        result = tier_divergence(
+            policy,
+            requested="public",
+            judged="internal",
+            signed_policy_version=policy.version,
+        )
+        assert result.direction == "looser"
+        assert result.basis == "signing_policy"
+
+    def test_a_verdict_signed_under_another_policy_is_marked_as_such(self) -> None:
+        # The finding itself. The direction is still reported - it is the best
+        # available reading and suppressing it would hide a real divergence -
+        # but it now says out loud that it describes TODAY's thresholds.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        result = tier_divergence(
+            policy,
+            requested="public",
+            judged="internal",
+            signed_policy_version=f"{policy.version}-superseded",
+        )
+        assert result.direction == "looser"
+        assert result.basis == "current_policy"
+
+    def test_a_scan_with_no_verdict_yet_reports_the_current_policy(self) -> None:
+        # Nothing has been signed, so there is no past to describe. Honest, and
+        # the same string a superseded policy gets - both mean "this is what
+        # today's policy says", which is exactly what the console caveats.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        result = tier_divergence(
+            policy, requested="public", judged="internal", signed_policy_version=None
+        )
+        assert result.direction == "looser"
+        assert result.basis == "current_policy"
+
+    def test_no_comparison_means_no_basis_to_report(self) -> None:
+        # `basis` must never claim a comparison happened. Every case where
+        # `tier_direction` says "cannot say" carries a null basis, including the
+        # one where the versions DO match - there is simply nothing to qualify.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        for requested, judged in (
+            ("public", "public"),
+            (None, "internal"),
+            ("public", None),
+            ("not-a-tier", "internal"),
+        ):
+            result = tier_divergence(
+                policy,
+                requested=requested,
+                judged=judged,
+                signed_policy_version=policy.version,
+            )
+            assert result == TierDivergence(direction=None, basis=None)
+
+    def test_the_direction_is_the_same_answer_tier_direction_gives(self) -> None:
+        """One implementation, not two. `tier_divergence` must never grow its
+        own copy of the threshold comparison - the inverted-override policy
+        below is the case an enum-order reimplementation would get backwards,
+        and both functions have to agree on it.
+        """
+        policy = parse_gate_policy(
+            _minimal_raw(
+                block_on_severity="CRITICAL",
+                tier_block_overrides=[{"tier": "internal", "severity": "HIGH"}],
+            )
+        )
+        for requested, judged in (
+            ("internal", "public"),
+            ("public", "internal"),
+            ("partner", "internal"),
+            ("public", "public"),
+        ):
+            assert tier_divergence(
+                policy,
+                requested=requested,
+                judged=judged,
+                signed_policy_version=policy.version,
+            ).direction == tier_direction(policy, requested=requested, judged=judged)

@@ -40,6 +40,9 @@ export function AdminOwnershipPage() {
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   const [failures, setFailures] = useState<OwnerAssignmentResult['failed']>([])
+  // The advisory from the last assignment - see `confirmAssign`. Null when the
+  // identity was recognized, or before any assignment has run.
+  const [ownerNotice, setOwnerNotice] = useState<string | null>(null)
 
   const skills = useMemo(() => data?.skills ?? [], [data])
   const total = data?.total ?? 0
@@ -51,6 +54,7 @@ export function AdminOwnershipPage() {
   useEffect(() => {
     setSelectedIds(new Set())
     setFailures([])
+    setOwnerNotice(null)
   }, [page])
 
   const filterFields: FilterField<UnownedSkill>[] = useMemo(
@@ -115,6 +119,20 @@ export function AdminOwnershipPage() {
       setFailures(result.failed)
       setConfirming(false)
       setSelectedIds(new Set())
+      // ADVISORY, shown alongside the outcome and never instead of it: the rows
+      // really were assigned. A typo in a free-text identity is the realistic
+      // mistake on this page and it fails SILENTLY - the write succeeds, the
+      // skills stay admin-only because the backend compares verbatim, and
+      // nobody learns otherwise until the real owner's next submission 403s.
+      // Kept as its own notice rather than folded into the success toast, since
+      // "assigned 40 skills" is still true and must not read as a failure.
+      setOwnerNotice(
+        result.owner_recognized === false
+          ? t('ownership.ownerUnrecognized', { owner: result.owner })
+          : result.owner_recognized === null
+            ? t('ownership.ownerRecognitionUnavailable', { owner: result.owner })
+            : null,
+      )
       if (result.failed.length === 0) {
         toast.success(t('ownership.assignSucceeded', { count: result.assigned.length }))
       } else {
@@ -182,6 +200,10 @@ export function AdminOwnershipPage() {
       {selectedList.length > MAX_BULK && (
         <p className="hint">{t('ownership.tooManySelected', { max: MAX_BULK })}</p>
       )}
+      {/* Deliberately `hint`, not `error`: nothing failed. The assignment is
+          done and correct; this is the one thing the system can notice about a
+          typo that would otherwise stay silent until someone else's 403. */}
+      {ownerNotice !== null && <p className="hint">{ownerNotice}</p>}
 
       {failures.length > 0 && (
         <div className="card">

@@ -324,9 +324,10 @@ async def require_csrf(request: Request) -> None:
     enumeration copied into this function. That copied enumeration is exactly
     what silently rotted before: break-glass sessions were once left out of it
     and were thereby exempted from CSRF entirely (fail-OPEN) until real browser
-    testing caught it (docs/stories/BACKLOG.md's S8 status note). Adding a new
-    cookie-authenticated session type now updates one registry and this check
-    follows automatically - the two can no longer drift apart.
+    testing caught it - no unit test did. Adding a new cookie-authenticated
+    session type now updates one registry and this check follows automatically
+    - the two can no longer drift apart, and
+    `test_dependencies.TestCsrfCoversEverySessionCookie` fails if they do.
     """
     if not request_has_session_cookie(request):
         # No session cookie -> bearer/API caller, not CSRF-forgeable. Exempt.

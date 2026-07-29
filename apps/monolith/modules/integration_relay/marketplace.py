@@ -9,8 +9,7 @@ reused one client for the other's calls would be caught immediately by the
 marketplace rejecting a wrong-scoped token, not silently "work").
 
 HONESTY: this project has no real marketplace to integrate against in this
-environment (see docs/stories/BACKLOG.md's environment reassessment) - the
-concrete REST shape below (`PUT /v1/verdicts/{content_hash}`,
+environment - the concrete REST shape below (`PUT /v1/verdicts/{content_hash}`,
 `GET /v1/published`, `POST /v1/skills/{skill_id}/quarantine`) is a reasonable,
 clearly-documented assumption, not a confirmed real contract (coding spec §6
 gives precise PORT signatures but the underlying wire format is this

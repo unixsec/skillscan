@@ -235,4 +235,43 @@ describe('AdminOwnershipPage', () => {
     expect(await screen.findByText(/is already owned by 'bob'/)).toBeInTheDocument()
     expect(screen.getByText(/成功 1 项，失败 1 项/)).toBeInTheDocument()
   })
+
+  // 2026-07-29 residual triage. `skill.owner` is free text with no roster to
+  // validate against, so the backend is right to shape-check only - but a typo
+  // then fails SILENTLY: the write succeeds, the skills stay admin-only, and
+  // nobody finds out until the real owner's next submission 403s.
+  async function assignAs(owner: string, result: Record<string, unknown>) {
+    respondWith([unowned()])
+    mockPost.mockResolvedValue({ owner, assigned: ['legacy-skill-1'], failed: [], ...result })
+    renderPage()
+    const row = (await screen.findByText('legacy-skill-1')).closest('tr') as HTMLElement
+    fireEvent.click(within(row).getByRole('checkbox'))
+    fireEvent.change(ownerInput(), { target: { value: owner } })
+    fireEvent.change(reasonInput(), { target: { value: 'r' } })
+    fireEvent.click(assignButton())
+    fireEvent.click(await screen.findByRole('button', { name: '确认' }))
+    await waitFor(() => expect(mockPost).toHaveBeenCalled())
+  }
+
+  it('warns when the assigned identity has never been seen, without calling it a failure', async () => {
+    await assignAs('alicce', { owner_recognized: false })
+    expect(await screen.findByText(/没有见过身份 alicce/)).toBeInTheDocument()
+    // The assignment really happened. An advisory that reads as an error would
+    // send the admin looking for rows that are not there.
+    expect(screen.queryByText(/未能指派的项/)).toBeNull()
+  })
+
+  it('says so when the recognition check itself could not run', async () => {
+    // Distinct from "not found": claiming an identity is unknown when nothing
+    // actually looked would train admins to ignore the real warning.
+    await assignAs('alice', { owner_recognized: null })
+    expect(await screen.findByText(/未能核对身份 alice/)).toBeInTheDocument()
+  })
+
+  it('says nothing at all for a recognized identity', async () => {
+    await assignAs('alice', { owner_recognized: true })
+    await screen.findByText(/共 1 个无归属 Skill/)
+    expect(screen.queryByText(/没有见过身份/)).toBeNull()
+    expect(screen.queryByText(/未能核对身份/)).toBeNull()
+  })
 })

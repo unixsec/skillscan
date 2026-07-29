@@ -9,12 +9,11 @@ response SHAPE mirrors what a real Vault Transit backend actually returns
 read_key) - confirmed live against a real local Vault dev server (Transit
 engine, rsa-2048 key) before that server was torn down per this project's
 Homebrew-system-service-install policy (a fresh live Vault was not
-re-authorized for the automated test suite; see docs/stories/BACKLOG.md's M6
-status note). This proves VaultTransitSigner's OWN JWS-construction logic is
-correct (RFC 7515 compact serialization, RS256) independent of whether a live
-Vault is reachable in this environment - the produced JWS round-trips through
-PyJWT, a completely independent standard library, which is what a real
-marketplace verifier would also use.
+re-authorized for the automated test suite). This proves VaultTransitSigner's
+OWN JWS-construction logic is correct (RFC 7515 compact serialization, RS256)
+independent of whether a live Vault is reachable in this environment - the
+produced JWS round-trips through PyJWT, a completely independent standard
+library, which is what a real marketplace verifier would also use.
 """
 
 from __future__ import annotations

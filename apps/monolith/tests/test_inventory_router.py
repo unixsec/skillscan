@@ -18,6 +18,7 @@ from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
 from sqlalchemy import select
 
 from monolith.main import create_app
+from monolith.modules.admin.local_auth import LocalAccount
 from monolith.modules.audit.models import AuditIntent
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
@@ -1085,3 +1086,132 @@ class TestBulkAssignOwner:
             assert entry.operator == "admin-alice"
             assert entry.payload["previous_owner"] is None
             assert entry.payload["new_owner"] == "tester"
+
+
+class TestOwnerRecognitionAdvisory:
+    """2026-07-29 residual triage: `skill.owner` is free text with no roster to
+    validate against, so `validate_owner_assignment` shape-checks only - and a
+    typo therefore fails SILENTLY. The write succeeds, the skill stays
+    admin-only (`authorize_skill_write` compares verbatim), and nobody learns
+    otherwise until the real owner's next submission 403s.
+
+    ADVISORY, NEVER BLOCKING, and every test here asserts BOTH halves: the
+    warning appears AND the assignment still happened. Rejecting an unknown
+    identity would refuse every legitimate OIDC/SAML owner who has not signed
+    in yet, which is exactly why the check is a sentence and not a 400.
+
+    Follows `/admin/ownership`'s genesis-actor precedent rather than inventing a
+    second style - a fact placed next to the decision, with the decision still
+    the admin's.
+    """
+
+    class _FakeAccountStore:
+        """The `LocalAccountStore` protocol, nothing more. `password_hash` is
+        present because the real store returns it; the point of these tests is
+        that only `username` is ever compared."""
+
+        def __init__(self, *usernames: str) -> None:
+            self._usernames = usernames
+
+        async def fetch_accounts(self) -> tuple[LocalAccount, ...]:
+            return tuple(
+                LocalAccount(username=u, password_hash="not-a-real-hash", role="submitter")
+                for u in self._usernames
+            )
+
+    @pytest.mark.asyncio
+    async def test_an_identity_this_system_has_never_seen_is_flagged_but_assigned(
+        self, app: FastAPI, client: httpx.AsyncClient, inventory_sessionmaker: SessionmakerFixture
+    ) -> None:
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        await _seed_skill(inventory_sessionmaker, skill_id=skill_id)
+        await _make_unowned(inventory_sessionmaker, skill_id=skill_id)
+        stranger = f"typo-{uuid.uuid4().hex[:10]}"
+        _as(app, "admin-alice", frozenset({"admin"}))
+        headers = _csrf_headers_and_cookies(client)
+        response = await client.post(
+            "/v1/inventory/ownership/assign",
+            json={"owner": stranger, "reason": "batch", "skill_ids": [skill_id]},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["owner_recognized"] is False
+        # THE half that makes it advisory: the row really was assigned.
+        assert body["assigned"] == [skill_id]
+        assert body["failed"] == []
+        async with inventory_sessionmaker() as session:
+            skill = await session.get(SkillRow, skill_id)
+        assert skill is not None
+        assert skill.owner == stranger
+
+    @pytest.mark.asyncio
+    async def test_an_identity_that_has_submitted_before_is_recognized(
+        self, app: FastAPI, client: httpx.AsyncClient, inventory_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # `_seed_skill` registers as "tester", which writes a genesis lifecycle
+        # event with that actor - i.e. exactly "has appeared as a submitter".
+        # This is the source that works with NO local accounts configured at
+        # all, which is the deployed VM's own posture for federated identities.
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        await _seed_skill(inventory_sessionmaker, skill_id=skill_id)
+        await _make_unowned(inventory_sessionmaker, skill_id=skill_id)
+        _as(app, "admin-alice", frozenset({"admin"}))
+        headers = _csrf_headers_and_cookies(client)
+        response = await client.post(
+            "/v1/inventory/ownership/assign",
+            json={"owner": "tester", "reason": "batch", "skill_ids": [skill_id]},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["owner_recognized"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_local_account_is_recognized_even_with_no_inventory_history(
+        self, app: FastAPI, client: httpx.AsyncClient, inventory_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # The second source, and the one a brand-new hire actually has: an
+        # account exists but they have never submitted anything. Warning on
+        # them would be the false positive that gets the whole notice ignored.
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        await _seed_skill(inventory_sessionmaker, skill_id=skill_id)
+        await _make_unowned(inventory_sessionmaker, skill_id=skill_id)
+        newcomer = f"newcomer-{uuid.uuid4().hex[:10]}"
+        app.state.scan.local_account_store = self._FakeAccountStore(newcomer)
+        _as(app, "admin-alice", frozenset({"admin"}))
+        headers = _csrf_headers_and_cookies(client)
+        response = await client.post(
+            "/v1/inventory/ownership/assign",
+            json={"owner": newcomer, "reason": "batch", "skill_ids": [skill_id]},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["owner_recognized"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_transfer_on_the_single_skill_route_carries_the_same_advisory(
+        self, app: FastAPI, client: httpx.AsyncClient, inventory_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # Both writers of `skill.owner` are reachable from the console, and a
+        # warning that only one of them carries is the partial-fix shape this
+        # milestone keeps finding. A TRANSFER is also where the advisory is read
+        # BEFORE the write matters most: afterwards the typo IS the recorded
+        # owner, and a post-write check would recognize it.
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        await _seed_skill(inventory_sessionmaker, skill_id=skill_id)
+        stranger = f"typo-{uuid.uuid4().hex[:10]}"
+        _as(app, "admin-alice", frozenset({"admin"}))
+        headers = _csrf_headers_and_cookies(client)
+        response = await client.post(
+            f"/v1/inventory/{skill_id}/owner",
+            json={"owner": stranger, "reason": "handover", "expect_unowned": False},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["owner_recognized"] is False
+        assert body["previous_owner"] == "tester"
+        async with inventory_sessionmaker() as session:
+            skill = await session.get(SkillRow, skill_id)
+        assert skill is not None
+        assert skill.owner == stranger

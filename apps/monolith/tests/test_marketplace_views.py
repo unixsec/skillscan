@@ -212,10 +212,12 @@ class TestScanProjection:
             judged_at_tier="internal",
             requested_tier="public",
             tier_direction="looser",
+            tier_direction_basis="signing_policy",
         )
         assert out["judged_at_tier"] == "internal"
         assert out["requested_tier"] == "public"
         assert out["tier_direction"] == "looser"
+        assert out["tier_direction_basis"] == "signing_policy"
 
     def test_an_unrecorded_request_is_null_and_not_the_judged_tier(self) -> None:
         # A `scan_submitter` row written before `requested_trust_tier` existed
@@ -234,6 +236,7 @@ class TestScanProjection:
         assert out["judged_at_tier"] == "internal"
         assert out["requested_tier"] is None
         assert out["tier_direction"] is None
+        assert out["tier_direction_basis"] is None
 
     def test_summary_counts_by_severity(self) -> None:
         result = {
@@ -367,6 +370,11 @@ _SPEC_TOP_LEVEL_FIELDS = frozenset(
         # marketplace that verdict).
         "requested_tier",
         "tier_direction",
+        # 2026-07-29 residual triage, added by hand on both sides for the same
+        # reason. `tier_direction` is computed from the policy loaded NOW, so a
+        # policy approved between signing and polling can relabel a verdict the
+        # caller already holds. This says which policy the label came from.
+        "tier_direction_basis",
         "summary",
         "findings",
     }

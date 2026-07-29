@@ -39,7 +39,7 @@ BREAKGLASS_SESSION_COOKIE_NAME = "skillscan_breakglass_session"
 # require_csrf below) must recognize ALL THREE cookie names, not just the
 # ones that existed when that check was written - this is the exact bug class
 # a real browser-testing pass already found and fixed once for break-glass
-# (docs/stories/BACKLOG.md's S8 status note) - don't reintroduce it here.
+# (no unit test caught it) - don't reintroduce it here.
 SAML_SESSION_COOKIE_NAME = "skillscan_saml_session"
 # SECURITY (2026-07-13 local-auth addition): a FOURTH cookie-authenticated
 # session type, same "own distinct cookie name" reasoning as the three above.
@@ -53,9 +53,10 @@ LOCAL_SESSION_COOKIE_NAME = "skillscan_local_session"
 #
 # This exact enumeration silently rotting - a new session cookie added without
 # updating the CSRF check, leaving that session type exempt from CSRF entirely
-# (fail-OPEN) - is the bug class that already bit break-glass once
-# (docs/stories/BACKLOG.md's S8 status note). Centralizing it here is what
-# stops the check and the cookie list from drifting apart again.
+# (fail-OPEN) - is the bug class that already bit break-glass once, caught
+# only by real browser testing. Centralizing it here is what stops the check
+# and the cookie list from drifting apart again; the regression lock is
+# `test_dependencies.TestCsrfCoversEverySessionCookie`.
 SESSION_COOKIE_NAMES: frozenset[str] = frozenset(
     {
         SESSION_COOKIE_NAME,

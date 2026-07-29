@@ -11,11 +11,12 @@ every finding it can ever surface already went through `evidence_redacted`
 it reached this module.
 
 SCOPE NOTE: `schedule_report` only persists the DECLARATIVE
-`{template, cron, targets}` tuple - actually firing on that cron schedule and
-delivering to SIEM/email requires a live background worker process (plus a
-real SIEM/mail relay to deliver to) that this environment cannot stand up or
-verify, the same class of gap as M6's live marketplace push / M7's live DR
-drill (see docs/stories/BACKLOG.md's S8 status note).
+`{template, cron, targets}` tuple. Firing on that cron is
+`worker.run_due_report_schedules`, which generates the report and emits it to
+the SIEM notifier when one is configured. EMAIL delivery is still not
+implemented - it needs SMTP infrastructure this environment has never had - so
+an email target is carried through the emitted/logged event and never actually
+delivered. See that function's own docstring, which says so.
 """
 
 from __future__ import annotations

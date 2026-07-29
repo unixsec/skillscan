@@ -75,6 +75,15 @@ EXTERNAL_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         # and the answer it is being handed.
         "requested_tier",
         "tier_direction",
+        # 2026-07-29 residual triage. Added deliberately, as this whitelist
+        # requires: `tier_direction` is computed from the policy loaded NOW, and
+        # a policy approved between signing and polling can relabel a verdict
+        # that is already in the caller's hands. This says which policy the
+        # label came from ("signing_policy" | "current_policy"), so an
+        # integrator can tell a live comparison from a retrospective one. It is
+        # not adjudication detail - it qualifies a field this surface already
+        # returns. See `gate.policy.tier_divergence`.
+        "tier_direction_basis",
         "summary",
         "findings",
     }
@@ -142,6 +151,7 @@ def project_scan(
     judged_at_tier: str | None = None,
     requested_tier: str | None = None,
     tier_direction: str | None = None,
+    tier_direction_basis: str | None = None,
 ) -> dict[str, Any]:
     """Build the marketplace-facing view of one scan.
 
@@ -184,6 +194,14 @@ def project_scan(
     whereas here the field is new and has no meaning to preserve, so null keeps
     its plain sense of "not recorded" rather than silently asserting agreement.
     `tier_direction` is then null too, since there is nothing to compare.
+
+    `tier_direction_basis` (2026-07-29) qualifies `tier_direction` with the
+    policy it was computed under - `"signing_policy"` when the verdict's own
+    `policy_version` is the one loaded, `"current_policy"` otherwise, and null
+    whenever `tier_direction` is. Both come from the same
+    `gate.policy.tier_divergence` call, so this function cannot be handed a
+    direction and a basis that disagree; passing them separately is only what
+    keeps this projection pure.
     """
     status = project_status(internal_state)
     raw_findings: list[dict[str, Any]] = list((result_row or {}).get("findings") or [])
@@ -203,6 +221,7 @@ def project_scan(
         "judged_at_tier": judged_at_tier,
         "requested_tier": requested_tier,
         "tier_direction": tier_direction,
+        "tier_direction_basis": tier_direction_basis,
         "summary": _summarize(
             raw_findings,
             truncated=bool((result_row or {}).get("findings_capped", False)),

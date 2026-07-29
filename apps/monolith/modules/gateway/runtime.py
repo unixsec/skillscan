@@ -13,7 +13,7 @@ import redis.asyncio as aioredis
 from common.blobstore import BlobStorePort
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from ports import NotificationPort
-from skillscan_core import AllowlistEntry, EngineMetadata, GatePolicy, TrustTier
+from skillscan_core import AllowlistEntry, EngineMetadata, GatePolicy, TrustTier, toolchain_digest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from monolith.modules.admin.breakglass import BreakGlassCredentialPort
@@ -40,10 +40,11 @@ class ScanRuntime:
     reeval_session_factory: SessionFactory | None = None
     marketplace: MarketplacePort | None = None
     # coding spec §13 siem_endpoint / §16.2 reporting SIEM destination
-    # (2026-07-06 spec-compliance audit fix) - same "stored on the runtime for
-    # whenever a live gate_outbox-draining process exists" posture as
-    # `marketplace` above; neither is invoked by any live process in this
-    # codebase yet (see docs/stories/BACKLOG.md's worker-loop status note).
+    # (2026-07-06 spec-compliance audit fix) - same "stored on the runtime,
+    # used by whatever drains gate_outbox" posture as `marketplace` above.
+    # Both ARE live now: `worker.worker_tick` passes them to
+    # `integration_relay.service.drain_pending_outbox` on every tick, and
+    # `worker.run_due_report_schedules` emits through this notifier too.
     siem_notifier: NotificationPort | None = None
     push_hmac_secret: str | None = None
     push_replay_window_s: int = 300
@@ -99,3 +100,18 @@ class ScanRuntime:
     # sandbox subprocesses are themselves bounded by that budget, so waiting
     # longer than it cannot produce more results.
     sandbox_wait_timeout_s: float = 300.0
+
+    def current_toolchain_digest(self) -> str:
+        """INV-7's `toolchain_digest` for the engines and policy THIS process
+        currently has loaded - the value `orchestration.submit_scan` would
+        stamp on a scan_job submitted right now.
+
+        ONE definition, on the object that holds both inputs. It used to be
+        recomputed inline wherever it was needed (`reeval.router`, and the
+        worker's digest-advance step would have been a third), which is the
+        "second registry not updated" shape this codebase keeps paying for:
+        `policy.version` changes on every hot-reload, so a call site that
+        passed a stale policy would silently disagree with the one that
+        stamped the job, and every skill would read as permanently stale.
+        """
+        return toolchain_digest(self.engine_metadatas, self.policy.version)

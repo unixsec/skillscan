@@ -124,10 +124,11 @@ async def set_account_role_status(
     if row.role == "admin" and row.status == "active" and (demoting_admin or disabling):
         # SECURITY: without this, an operator can demote/disable the only
         # active admin account through the normal admin API - on a
-        # deployment where local auth is the sole working login path (see
-        # docs/superpowers/plans/2026-07-11-web-console-redesign-STATUS.md's
-        # break-glass activation deadlock), that's a permanent lockout with
-        # no way back in short of direct DB surgery.
+        # deployment where local auth is the sole working login path, that's
+        # a permanent lockout with no way back in short of direct DB surgery.
+        # Not hypothetical: this project has already hit the mirror image of
+        # it - a break-glass activation deadlock where the only route to a
+        # session required a session (`admin.breakglass`).
         other_active_admins = await session.execute(
             select(func.count())
             .select_from(LocalAccountRow)

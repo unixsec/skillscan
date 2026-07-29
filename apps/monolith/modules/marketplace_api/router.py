@@ -46,7 +46,7 @@ from engine_runner.normalizer import UnpackRejected, unpack_hardened
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 
 from monolith.modules.admin.engine_registry import filter_enabled_engines
-from monolith.modules.gate.policy import tier_direction
+from monolith.modules.gate.policy import tier_divergence
 from monolith.modules.gate.service import get_verdict_view
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
 from monolith.modules.gateway.auth.session import SessionContext
@@ -347,6 +347,20 @@ async def get_marketplace_scan(
     async with runtime.gate_session_factory() as gate_session:
         verdict_row = await get_verdict_view(gate_session, scan_id=scan_id)
 
+    # Computed here rather than in `views`, which is pure by contract: the
+    # answer depends on `GatePolicy.block_threshold`, since strictness lives in
+    # `tier_block_overrides` and not in the order of the tier names.
+    #
+    # `signed_policy_version` is read off the verdict this response is carrying,
+    # so a policy approved since it was signed cannot silently relabel it (2026-
+    # 07-29 residual triage). `verdict_row` is `get_verdict_view`'s plain dict,
+    # whose `policy_version` key this surface already returns.
+    divergence = tier_divergence(
+        runtime.policy,
+        requested=requested_tier,
+        judged=judged_at_tier,
+        signed_policy_version=(verdict_row or {}).get("policy_version"),
+    )
     projected = views.project_scan(
         scan_id=scan_id,
         internal_state=internal_state,
@@ -354,12 +368,8 @@ async def get_marketplace_scan(
         result_row=result_row,
         judged_at_tier=judged_at_tier,
         requested_tier=requested_tier,
-        # Computed here rather than in `views`, which is pure by contract: the
-        # answer depends on `GatePolicy.block_threshold`, since strictness lives
-        # in `tier_block_overrides` and not in the order of the tier names.
-        tier_direction=tier_direction(
-            runtime.policy, requested=requested_tier, judged=judged_at_tier
-        ),
+        tier_direction=divergence.direction,
+        tier_direction_basis=divergence.basis,
     )
     await _record_fetch(
         runtime, scan_id=scan_id, service_account=session.subject, projected=projected

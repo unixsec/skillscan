@@ -291,10 +291,10 @@ async def _seed_admin_tables_if_empty(
     gated on whether this call's `auth_runtime`/`scan_runtime` were caller-
     built vs `_build_*`-built: this environment's own monolith-entrypoint
     ConfigMap script builds its own runtimes and passes them into
-    `create_app()` pre-built (see docs/superpowers/plans/2026-07-11-web-
-    console-redesign-STATUS.md for why - the SAME class of bug bit
-    local_auth's `local_redis` wiring earlier this session), so gating this
-    on "auth_runtime is None" would silently never run there.
+    `create_app()` pre-built, so gating this on "auth_runtime is None" would
+    silently never run there. The SAME class of bug - logic reachable only on
+    the `_build_*` path, invisible to a deployment that pre-builds - already
+    bit local_auth's `local_redis` wiring once.
 
     After this call, `auth_runtime.group_role_map` reflects the DB's current
     content (freshly seeded or pre-existing from an earlier boot) - mutated
@@ -575,15 +575,14 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
         gate_session_factory=make_session_factory(gate_engine),
         policy=_load_policy(),
         engine_metadatas=tuple(e.metadata for e in engines.values()),
-        # KNOWN GAP (see docs/stories/BACKLOG.md's M8 status note): this is a
-        # startup-time snapshot, not a live view - `gate.service.
-        # list_active_allowlist_entries` now exists (M8 §9 /v1/allowlist) but
-        # `_build_scan_runtime` is synchronous and can't await it here.
-        # Lower-priority than it looks: the scan-decision worker loop that
-        # would actually CONSUME this value (orchestration.service.
-        # run_result_collector_tick) is itself never invoked by any live
-        # process in this codebase yet (same status note) - fixing allowlist
-        # freshness in isolation wouldn't make scanning work end-to-end.
+        # EMPTY ON PURPOSE, and no longer a gap: this is a startup-time field
+        # that `_build_scan_runtime` (synchronous) cannot await
+        # `gate.service.list_active_allowlist_entries` to fill. The consumer
+        # does not read it - `worker.worker_tick` performs that live read
+        # itself on every tick, through gate's own session, and passes the
+        # result into `run_result_collector_tick` as `allowlist`. Seeding a
+        # stale snapshot here would only create a second, older source for the
+        # same answer.
         allowlist=(),
         signer=_build_signer(settings),
         default_trust_tier=TrustTier.INTERNAL,

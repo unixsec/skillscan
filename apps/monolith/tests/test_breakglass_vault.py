@@ -3,9 +3,8 @@
 Exercised against a fake hvac KV v2 client whose response SHAPE mirrors what
 a real Vault KV v2 backend actually returns
 (`{"data": {"data": {<key>: <value>}}}`) - same fake-hvac-over-real-behavior
-approach as `test_gate_signer.py`'s `_FakeHvacTransit`, for the same reason
-(no live Vault dev server is authorized for this automated suite; see
-docs/stories/BACKLOG.md's M6 status note).
+approach as `test_gate_signer.py`'s `_FakeHvacTransit`, for the same reason:
+no live Vault dev server is authorized for this automated suite.
 """
 
 from __future__ import annotations

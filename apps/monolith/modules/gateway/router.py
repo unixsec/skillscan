@@ -42,7 +42,7 @@ from sqlalchemy import select
 
 from monolith.modules.admin.engine_registry import filter_enabled_engines
 from monolith.modules.gate.models import VerdictRow
-from monolith.modules.gate.policy import tier_direction
+from monolith.modules.gate.policy import tier_divergence
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_human_role
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.inventory.lifecycle import InvalidTransitionError, validate_transition
@@ -545,6 +545,16 @@ async def get_scan(
             await gate_session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
         ).scalar_one_or_none()
 
+    # `signed_policy_version` comes off the VERDICT, not off `runtime.policy`:
+    # the question this answers is whether the direction below describes the
+    # adjudication that happened or only today's thresholds. `None` (no verdict
+    # yet) is honestly "current policy" - nothing has been signed at all.
+    divergence = tier_divergence(
+        runtime.policy,
+        requested=requested_by_caller,
+        judged=job.trust_tier,
+        signed_policy_version=verdict_row.policy_version if verdict_row is not None else None,
+    )
     return {
         "scan_id": scan_id,
         "state": job.state,
@@ -591,9 +601,15 @@ async def get_scan(
         # asked for. Task 18 moved that function out of this file and into
         # `gate.policy` so the marketplace surface can disclose the same
         # divergence without importing this router.
-        "tier_direction": tier_direction(
-            runtime.policy, requested=requested_by_caller, judged=job.trust_tier
-        ),
+        "tier_direction": divergence.direction,
+        # WHICH policy that direction was computed under (2026-07-29 residual
+        # triage). Strictness lives in `tier_block_overrides`, so a policy
+        # approved between signing and viewing can relabel a historical
+        # verdict. The verdict's own `policy_version` is recorded, so "same
+        # version or not" is answerable; the historical policy CONTENT is not
+        # reconstructible, and is therefore not invented - the console caveats
+        # the label instead. See `gate.policy.tier_divergence`.
+        "tier_direction_basis": divergence.basis,
         # 里程碑 F Task 12 (Task 2 reported this BLOCKED - no column existed).
         # `source` is the set of channels this scan arrived through and
         # `submitter_sources` is the per-submitter attribution behind it: which

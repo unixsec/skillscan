@@ -57,6 +57,7 @@ from fastapi import FastAPI
 from skillscan_core import GatePolicy, Severity, StaticKeywordEngine, TrustTier, Verdict
 
 from monolith.main import create_app
+from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.session import SessionContext
@@ -550,6 +551,11 @@ class TestRequestedTrustTier:
         assert bob_body["trust_tier"] == "public"  # what bob asked for
         assert bob_body["judged_at_tier"] == "internal"  # what he actually got
         assert bob_body["tier_direction"] == "looser"
+        # 2026-07-29 residual triage: nothing has decided this scan, so no
+        # verdict has been signed and the direction can only describe today's
+        # thresholds. Saying so is the whole point - see
+        # `TestTierDirectionIsQualifiedByTheSigningPolicy` below.
+        assert bob_body["tier_direction_basis"] == "current_policy"
 
         # alice, on the SAME scan, sees no divergence - hers is the request the
         # verdict was actually reached at. The fields are per-viewer, not a
@@ -561,6 +567,8 @@ class TestRequestedTrustTier:
         assert alice_body["trust_tier"] == "internal"
         assert alice_body["judged_at_tier"] == "internal"
         assert alice_body["tier_direction"] is None
+        # No comparison happened, so there is nothing to qualify.
+        assert alice_body["tier_direction_basis"] is None
 
         # Both requests are on record per name, so a reviewer can see the whole
         # picture rather than only whichever caller happens to be looking.
@@ -682,6 +690,108 @@ class TestRequestedTrustTier:
         assert legacy_body["trust_tier"] == "public"
         assert legacy_body["judged_at_tier"] == "public"
         assert legacy_body["tier_direction"] is None
+
+
+class TestTierDirectionIsQualifiedByTheSigningPolicy:
+    """2026-07-29 residual triage: `tier_direction` is computed from the policy
+    this process has loaded, not from the one the verdict was signed under.
+
+    Strictness lives in `tier_block_overrides`, so an approved policy change
+    between signing and viewing could relabel a historical verdict - showing a
+    divergence that did not exist when the adjudication happened, or hiding one
+    that did. `verdict.policy_version` is the one part of that which IS
+    recoverable, and `tier_direction_basis` is what it buys: the label stays,
+    and the response says whether to read it as a statement about the past.
+
+    The historical policy CONTENT is deliberately not reconstructed anywhere -
+    see `gate.policy.tier_divergence` on why an accurate caveat beats an
+    invented threshold.
+    """
+
+    @staticmethod
+    async def _sign_verdict(
+        gate_sessionmaker: SessionmakerFixture, *, scan_id: str, policy_version: str
+    ) -> None:
+        async with gate_sessionmaker() as db_session, db_session.begin():
+            db_session.add(
+                VerdictRow(
+                    scan_id=scan_id,
+                    content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+                    verdict="PASS",
+                    score=90,
+                    policy_version=policy_version,
+                    jti=str(uuid.uuid4()),
+                    jws_signature="test",
+                    effective_severity=0,
+                    reasons=["test"],
+                    issued_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_signed_under_the_loaded_policy_says_so(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        package = _make_tar_bytes(_unique_content())
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        first_scan_id = await _submit_console(client, package, trust_tier="internal")
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "bob", frozenset({"submitter"})
+        )
+        second_scan_id = await _submit_console(client, package, trust_tier="public")
+        assert second_scan_id == first_scan_id
+
+        runtime: ScanRuntime = app.state.scan
+        await self._sign_verdict(
+            gate_sessionmaker, scan_id=second_scan_id, policy_version=runtime.policy.version
+        )
+
+        body = (await client.get(f"/v1/scans/{second_scan_id}")).json()
+        assert body["tier_direction"] == "looser"
+        assert body["tier_direction_basis"] == "signing_policy"
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_signed_under_a_superseded_policy_is_not_passed_off_as_current(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """THE finding. Same scan, same tiers, same reported direction - the
+        only difference is that the verdict was signed under a policy version
+        this process no longer has, so the direction can no longer be claimed to
+        describe the adjudication that happened.
+
+        The direction is NOT suppressed. Nulling it would hide a divergence that
+        may well be real; the honest move is to keep the best available reading
+        and label what it is.
+        """
+        package = _make_tar_bytes(_unique_content())
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        first_scan_id = await _submit_console(client, package, trust_tier="internal")
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "bob", frozenset({"submitter"})
+        )
+        second_scan_id = await _submit_console(client, package, trust_tier="public")
+        assert second_scan_id == first_scan_id
+
+        runtime: ScanRuntime = app.state.scan
+        await self._sign_verdict(
+            gate_sessionmaker,
+            scan_id=second_scan_id,
+            policy_version=f"{runtime.policy.version}-superseded",
+        )
+
+        body = (await client.get(f"/v1/scans/{second_scan_id}")).json()
+        assert body["tier_direction"] == "looser"
+        assert body["tier_direction_basis"] == "current_policy"
 
 
 _ATTRIBUTION_KEYS = ("submitters", "submitter_sources", "source")

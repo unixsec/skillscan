@@ -41,7 +41,11 @@ from monolith.modules.gate.models import PolicyProposalRow, VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.intel.models import ThreatIndicator
-from monolith.modules.inventory.models import BaselineRow, SkillLifecycleEventRow
+from monolith.modules.inventory.models import (
+    BaselineRow,
+    SkillLifecycleEventRow,
+    SkillVersionRow,
+)
 from monolith.modules.inventory.service import current_state, register_skill_version
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow
 from monolith.modules.orchestration.service import SubmissionChannel, submit_scan
@@ -53,6 +57,7 @@ from monolith.modules.reporting.service import (
 from monolith.tests.conftest import SessionmakerFixture
 from monolith.worker import (
     SANDBOX_WAITED_ENGINE_NAMES,
+    advance_scanned_toolchain_digests,
     promote_approved_policy,
     reload_policy_if_changed,
     run_due_report_schedules,
@@ -1439,6 +1444,240 @@ class TestLifecycleSync:
             # Hygiene: this suite shares the local dev Redis, so a leftover
             # dedup key would silently disarm the first assertion on a re-run.
             await redis_client.delete(f"skillscan:lifecycle:stranded_verdict:{scan_id}")
+
+
+class TestToolchainDigestAdvance:
+    """`advance_scanned_toolchain_digests` - the residual finding that nothing
+    ever moved `skill_version.toolchain_digest` forward after a rescan, so
+    `reeval` re-offered and re-queued the same rescan forever.
+
+    Every test here builds the scan_job/verdict pair DIRECTLY rather than
+    running the pipeline. What is under test is which rows the function is
+    willing to act on, and hand-built rows are the only way to construct the
+    three negative cases at all - a real pipeline run cannot produce a decided
+    scan with no verdict, or a verdict whose content_hash disagrees with its
+    own scan_job.
+    """
+
+    @staticmethod
+    async def _register(
+        inventory_sessionmaker: SessionmakerFixture, *, skill_id: str, digest: str
+    ) -> str:
+        from skillscan_core import content_hash as compute_content_hash
+
+        c_hash = compute_content_hash(_unique_files(skill_id))
+        async with inventory_sessionmaker() as session, session.begin():
+            await register_skill_version(
+                session,
+                skill_id=skill_id,
+                source="test",
+                trust_tier="internal",
+                content_hash=c_hash,
+                toolchain_digest=digest,
+                declared_perms=None,
+                operator="toolchain-test",
+                actor_is_admin=False,
+            )
+        return c_hash
+
+    @staticmethod
+    async def _recorded_digest(
+        inventory_sessionmaker: SessionmakerFixture, *, content_hash: str
+    ) -> str:
+        async with inventory_sessionmaker() as session:
+            row = await session.get(SkillVersionRow, content_hash)
+        assert row is not None
+        return str(row.toolchain_digest)
+
+    @staticmethod
+    async def _decided_scan(
+        orchestration_sessionmaker: SessionmakerFixture,
+        *,
+        content_hash: str,
+        digest: str,
+        state: str = "decided",
+    ) -> str:
+        from skillscan_core import cache_key as compute_cache_key
+
+        scan_id = str(uuid.uuid4())
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanJob(
+                    scan_id=scan_id,
+                    content_hash=content_hash,
+                    toolchain_digest=digest,
+                    cache_key=compute_cache_key(content_hash, digest),
+                    state=state,
+                    submitter="toolchain-test",
+                    created_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                    trust_tier="internal",
+                )
+            )
+        return scan_id
+
+    @staticmethod
+    async def _verdict(
+        gate_sessionmaker: SessionmakerFixture, *, scan_id: str, content_hash: str
+    ) -> None:
+        async with gate_sessionmaker() as session, session.begin():
+            session.add(
+                VerdictRow(
+                    scan_id=scan_id,
+                    content_hash=content_hash,
+                    verdict="PASS",
+                    score=90,
+                    policy_version="vt",
+                    jti=str(uuid.uuid4()),
+                    jws_signature="test",
+                    effective_severity=0,
+                    reasons=["test"],
+                    issued_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_rescan_under_the_current_toolchain_stops_reading_as_stale(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
+        reeval_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        """The finding itself, asserted through REEVAL's own eyes rather than
+        through the column: `is_stale` is the consumer whose answer was wrong,
+        and asserting the column alone would pass even if reeval read something
+        else entirely."""
+        from monolith.modules.reeval.controller import (
+            is_stale,
+            list_published_toolchain_statuses,
+        )
+
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
+        )
+        current = runtime.current_toolchain_digest()
+        skill_id = f"advance-{uuid.uuid4().hex[:12]}"
+        c_hash = await self._register(
+            inventory_sessionmaker, skill_id=skill_id, digest="old-digest"
+        )
+
+        async def stale_now() -> bool:
+            async with reeval_sessionmaker() as session:
+                statuses = await list_published_toolchain_statuses(session)
+            status = next(s for s in statuses if s.skill_id == skill_id)
+            return is_stale(status, current)
+
+        assert await stale_now() is True
+        scan_id = await self._decided_scan(
+            orchestration_sessionmaker, content_hash=c_hash, digest=current
+        )
+        # Still stale: a decided scan with no verdict has decided nothing.
+        assert await advance_scanned_toolchain_digests(runtime) == 0
+        assert await stale_now() is True
+
+        await self._verdict(gate_sessionmaker, scan_id=scan_id, content_hash=c_hash)
+        assert await advance_scanned_toolchain_digests(runtime) == 1
+        assert await stale_now() is False
+        assert await self._recorded_digest(inventory_sessionmaker, content_hash=c_hash) == current
+        # Idempotent: the second pass finds nothing left to move.
+        assert await advance_scanned_toolchain_digests(runtime) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_recorded_against_other_content_advances_nothing(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        """Invariant 2, checked rather than argued. The scan is decided under
+        the current toolchain and HAS a verdict row - but that verdict names
+        different content, so it says nothing about these bytes. Dropping the
+        `verdict.content_hash == scan_job.content_hash` comparison makes this
+        pass, which is the point: the function must not infer the content from
+        the cache_key it found the job by."""
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
+        )
+        current = runtime.current_toolchain_digest()
+        skill_id = f"advance-mismatch-{uuid.uuid4().hex[:12]}"
+        c_hash = await self._register(
+            inventory_sessionmaker, skill_id=skill_id, digest="old-digest"
+        )
+        scan_id = await self._decided_scan(
+            orchestration_sessionmaker, content_hash=c_hash, digest=current
+        )
+        await self._verdict(
+            gate_sessionmaker,
+            scan_id=scan_id,
+            content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        )
+        assert await advance_scanned_toolchain_digests(runtime) == 0
+        assert (
+            await self._recorded_digest(inventory_sessionmaker, content_hash=c_hash) == "old-digest"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_undecided_scan_and_an_older_toolchain_both_advance_nothing(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        """Invariants 1 and 3. A scan still running under the current toolchain
+        has not produced anything to record, and a scan decided under an OLDER
+        toolchain records a fact about a toolchain nobody is claiming - writing
+        `current` off either would be the fail-open write
+        `register_skill_version` refuses to make at submit time."""
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
+        )
+        current = runtime.current_toolchain_digest()
+
+        running_skill = f"advance-running-{uuid.uuid4().hex[:12]}"
+        running_hash = await self._register(
+            inventory_sessionmaker, skill_id=running_skill, digest="old-digest"
+        )
+        running_scan = await self._decided_scan(
+            orchestration_sessionmaker,
+            content_hash=running_hash,
+            digest=current,
+            state="running",
+        )
+        await self._verdict(gate_sessionmaker, scan_id=running_scan, content_hash=running_hash)
+
+        older_skill = f"advance-older-{uuid.uuid4().hex[:12]}"
+        older_hash = await self._register(
+            inventory_sessionmaker, skill_id=older_skill, digest="old-digest"
+        )
+        older_scan = await self._decided_scan(
+            orchestration_sessionmaker, content_hash=older_hash, digest="another-old-digest"
+        )
+        await self._verdict(gate_sessionmaker, scan_id=older_scan, content_hash=older_hash)
+
+        assert await advance_scanned_toolchain_digests(runtime) == 0
+        for content_hash in (running_hash, older_hash):
+            assert (
+                await self._recorded_digest(inventory_sessionmaker, content_hash=content_hash)
+                == "old-digest"
+            )
 
 
 def _proposal_row(yaml_text: str) -> PolicyProposalRow:

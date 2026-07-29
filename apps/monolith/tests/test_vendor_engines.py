@@ -10,8 +10,7 @@ actual vendor/submodule state (`verify-pins`/`license-scan` below) - a test
 against fake fixtures would prove nothing there. `TestVendoredEngines`'s
 TBD-repo/missing-commit exclusion tests are the one exception: they exercise
 `vendored_engines()`'s pure filter logic itself, not any real vendor state,
-so a synthetic in-memory fixture is the more direct test (see
-docs/superpowers/specs/2026-07-22-chinese-prompt-injection-detectors-design.md).
+so a synthetic in-memory fixture is the more direct test.
 """
 
 from __future__ import annotations
@@ -62,10 +61,11 @@ class TestVendoredEngines:
         # SECURITY: repo: TBD (official repo unconfirmed) must never be
         # treated as vendored - synthetic fixture, not the real lock file,
         # since cisco_skill_scanner (this project's only historical TBD
-        # example) was removed once confirmed dead (never vendored, see
-        # docs/superpowers/specs/2026-07-22-chinese-prompt-injection-
-        # detectors-design.md). This keeps the exclusion logic itself
-        # under real test coverage even with no live TBD entry in the repo.
+        # example) was removed once confirmed dead - never vendored; see
+        # `vendor/VENDOR.md`'s entry for it, and the two in-house Chinese
+        # floor detectors under services/engine_runner/detectors/ that cover
+        # the capability gap it was a candidate for. This keeps the exclusion
+        # logic itself under real test coverage even with no live TBD entry.
         engines = {
             "confirmed_engine": {"repo": "https://github.com/example/tool", "commit": "abc123"},
             # commit is set here so this isolates the repo == "TBD" branch

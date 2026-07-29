@@ -45,10 +45,18 @@ One `worker_tick()` drives, in order:
                          to content this skill never published; that goes to
                          quarantined (coding spec SUPPLY-06: "content_hash 对
                          比 baseline, 不一致 → 隔离", FR-REV-020)
-6. audit chain drain   - audit.service.drain_pending_intents
-7. outbox drain        - integration_relay.service.drain_pending_outbox
+6. toolchain advance   - a version that has now actually been re-scanned under
+                         the current toolchain stops reading as stale
+                         (advance_scanned_toolchain_digests). Nothing else in
+                         the tree writes skill_version.toolchain_digest after
+                         submission, so without this step `reeval` re-queues a
+                         rescan of the same content forever; and this is the
+                         only place all three modules involved can be read with
+                         their own least-privilege credentials
+7. audit chain drain   - audit.service.drain_pending_intents
+8. outbox drain        - integration_relay.service.drain_pending_outbox
                          (marketplace writeback + SIEM, both optional)
-8. report schedules    - fire due cron schedules (POST /v1/reports/schedule
+9. report schedules    - fire due cron schedules (POST /v1/reports/schedule
                          finally executes; delivery = SIEM event when
                          configured, always audited via the generation itself)
 
@@ -66,7 +74,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 import yaml
@@ -75,7 +83,7 @@ from common.blobstore import artifact_key
 from common.log import get_logger
 from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from skillscan_core import GatePolicy
-from sqlalchemy import or_, select
+from sqlalchemy import CursorResult, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from monolith.modules.admin.engine_registry import list_disabled_engines
@@ -87,13 +95,14 @@ from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.integration_relay.service import drain_pending_outbox
 from monolith.modules.intel.matcher import IntelMatcher, load_known_iocs
 from monolith.modules.inventory.lifecycle import InvalidTransitionError
-from monolith.modules.inventory.models import SkillLifecycleEventRow
+from monolith.modules.inventory.models import SkillLifecycleEventRow, SkillVersionRow
 from monolith.modules.inventory.service import advance_baseline_on_publish, transition_skill
 from monolith.modules.orchestration.drift import check_drift
 from monolith.modules.orchestration.floor import floor_engines
 from monolith.modules.orchestration.models import ScanJob
 from monolith.modules.orchestration.service import (
     POISON_PILL_STATUS,
+    STATE_DECIDED,
     STATE_QUEUED,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
@@ -350,6 +359,11 @@ _WAITING_STATES = ("scanning", "review_pending")
 # Redis key prefix for stranded-verdict report dedup (C1) - see
 # `_report_stranded_verdicts`.
 _STRANDED_VERDICT_PREFIX = "skillscan:lifecycle:stranded_verdict:"
+# How many recently-decided scans `advance_scanned_toolchain_digests` inspects
+# per tick. Same order as `_UNOWNED_MAX_LIMIT`/`GET /v1/scans`' own clamp: a
+# bound that a single second's scan volume cannot realistically overflow, so
+# freshly decided work is always inside the window.
+_TOOLCHAIN_ADVANCE_BATCH = 200
 
 
 async def _quarantine_if_drifted(runtime: ScanRuntime, *, skill_id: str, content_hash: str) -> None:
@@ -730,6 +744,153 @@ async def _report_stranded_verdicts(
         )
 
 
+async def advance_scanned_toolchain_digests(
+    runtime: ScanRuntime, *, limit: int = _TOOLCHAIN_ADVANCE_BATCH
+) -> int:
+    """Advances `skill_version.toolchain_digest` onto the CURRENT toolchain for
+    every version that has actually been re-scanned under it. Returns how many
+    rows moved.
+
+    THE FINDING (2026-07-29, milestones E+F residual triage). Nothing advanced
+    that column after the first submission, so `reeval` re-offered - and
+    re-queued - a rescan for versions it had already re-evaluated, forever.
+    `register_skill_version` is right to leave it alone (see its docstring:
+    writing it at SUBMIT time would claim "scanned by the current toolchain"
+    before any verdict exists, a fail-open write to the very signal reeval
+    reads), but nothing picked it up after the verdict landed either. Waste
+    rather than incorrectness - until `1b4b1f5` those rescans resolved to
+    nothing anyway; now that they resolve properly the churn is real work.
+
+    WHY HERE AND NOT AT THE DECIDE SITE. `gate.service.decide_and_record` (via
+    `orchestration._try_score_and_decide`) is where all three facts hold at
+    once and it is where I first looked: the `scan_job` row in hand carries
+    both `content_hash` and `toolchain_digest`, and the verdict is being
+    written in that same transaction. It cannot write this column: `skill_version`
+    belongs to inventory, and `svc_orchestration`/`svc_gate` hold no grant on it
+    (policies/grants/manifest.yaml) - by design, not by omission. `reeval` is
+    likewise SELECT-only there, deliberately. The worker is this codebase's
+    composition point for exactly this shape: it holds each module's OWN
+    least-privilege factory and calls across them without any module reaching
+    into another's tables, the same way `sync_lifecycle_tick` reads gate's
+    verdicts through gate's own session.
+
+    NOT FOLDED INTO `sync_lifecycle_tick`, which already resolves a verdict per
+    skill and looks like the cheaper home: it only ever sees scans a LIFECYCLE
+    EVENT named, and `reeval.controller.build_rescan_job` INSERTs its scan_job
+    directly and writes no lifecycle event at all (see
+    `_report_stranded_verdicts` on that same gap). Reeval rescans are precisely
+    the churn this function exists to stop, so putting it there would have
+    fixed the case that was not broken.
+
+    THE INVARIANT, CHECKED RATHER THAN ARGUED. A row is advanced only when all
+    three hold, each read from the row that carries it:
+
+      1. a verdict EXISTS - the `verdict` row is selected through gate's own
+         session and its absence disqualifies the job. `scan_job.state ==
+         'decided'` is checked too, but is not trusted as a proxy: it is set by
+         a different module in a different transaction from the verdict write.
+      2. it is FOR THIS CONTENT - `verdict.content_hash == scan_job.content_hash`
+         and that hash is one this sweep looked up in `skill_version`. Not
+         inferred from the cache_key the job was found by, even though that key
+         is a hash of exactly this pair.
+      3. it was produced by the toolchain BEING RECORDED - `scan_job.
+         toolchain_digest == current`, re-read off the job rather than assumed
+         from the `cache_key` filter that selected it.
+
+    Anything that fails one of the three is left alone: an honest stale digest
+    costs a redundant rescan, a dishonest fresh one silently suppresses a real
+    one.
+
+    BOUNDED, NEWEST FIRST. The driving query is the newest `limit` scan_jobs
+    decided under the current digest, not the whole staleness list. New work
+    always enters that window at the top, so a rescan decided a second ago is
+    always in it; and because the filter is `toolchain_digest = current`, the
+    set empties itself on every policy hot-reload / engine change rather than
+    growing with history. Idempotent - the UPDATE re-asserts `!= current`, so a
+    row that is already advanced is not rewritten and does not count.
+    """
+    if runtime.inventory_session_factory is None:
+        return 0
+    current_digest = runtime.current_toolchain_digest()
+    async with runtime.orchestration_session_factory() as orch_session:
+        jobs = (
+            (
+                await orch_session.execute(
+                    select(ScanJob)
+                    .where(
+                        ScanJob.toolchain_digest == current_digest,
+                        ScanJob.state == STATE_DECIDED,
+                    )
+                    .order_by(ScanJob.created_at.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    if not jobs:
+        return 0
+    # Which of those scans' packages are registered versions at all - most
+    # scans never register a skill_id. A primary-key IN over at most `limit`
+    # hashes, so this stays a point lookup per candidate.
+    candidate_hashes = {str(job.content_hash) for job in jobs}
+    async with runtime.inventory_session_factory() as inv_session:
+        stale_hashes = set(
+            (
+                await inv_session.execute(
+                    select(SkillVersionRow.content_hash).where(
+                        SkillVersionRow.content_hash.in_(candidate_hashes),
+                        SkillVersionRow.toolchain_digest != current_digest,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    pending = [
+        job
+        for job in jobs
+        if str(job.content_hash) in stale_hashes and str(job.toolchain_digest) == current_digest
+    ]
+    if not pending:
+        return 0
+    async with runtime.gate_session_factory() as gate_session:
+        verdict_rows = (
+            await gate_session.execute(
+                select(VerdictRow.scan_id, VerdictRow.content_hash).where(
+                    VerdictRow.scan_id.in_([str(job.scan_id) for job in pending])
+                )
+            )
+        ).all()
+    verdict_content = {str(row.scan_id): str(row.content_hash) for row in verdict_rows}
+    confirmed = {
+        str(job.content_hash)
+        for job in pending
+        if verdict_content.get(str(job.scan_id)) == str(job.content_hash)
+    }
+    if not confirmed:
+        return 0
+    async with runtime.inventory_session_factory() as inv_session, inv_session.begin():
+        # An UPDATE's execute() always returns a CursorResult at runtime (unlike
+        # the generic Result[Any] a SELECT gives) - the cast narrows to what
+        # .rowcount needs, the same idiom `intel_sync.sync._apply_rows` uses.
+        # `rowcount`, not `len(confirmed)`: the WHERE re-asserts staleness, so
+        # this reports the rows that actually MOVED rather than the rows we
+        # intended to move.
+        result = cast(
+            CursorResult[Any],
+            await inv_session.execute(
+                update(SkillVersionRow)
+                .where(
+                    SkillVersionRow.content_hash.in_(confirmed),
+                    SkillVersionRow.toolchain_digest != current_digest,
+                )
+                .values(toolchain_digest=current_digest)
+            ),
+        )
+    return int(result.rowcount or 0)
+
+
 async def run_due_report_schedules(
     runtime: ScanRuntime, *, now: datetime.datetime | None = None
 ) -> int:
@@ -811,6 +972,7 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
         # is only ever "how much work did the sweep do this tick."
         "sandbox_swept": 0,
         "lifecycle": 0,
+        "toolchain_advanced": 0,
         "audit_chained": 0,
         "outbox_dispatched": 0,
         "reports_fired": 0,
@@ -930,6 +1092,12 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
     )
 
     counts["lifecycle"] = await sync_lifecycle_tick(runtime)
+
+    # Step 6: runs AFTER the lifecycle sync only because both read the same
+    # verdicts and this one is the cheaper of the two to repeat - it is not
+    # ordered relative to it. It deliberately does NOT read lifecycle events at
+    # all; reeval's own rescans never write one (see its docstring).
+    counts["toolchain_advanced"] = await advance_scanned_toolchain_digests(runtime)
 
     if runtime.audit_session_factory is not None:
         counts["audit_chained"] = len(await drain_pending_intents(runtime.audit_session_factory))

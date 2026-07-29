@@ -12,7 +12,6 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from skillscan_core import toolchain_digest as compute_toolchain_digest
 from sqlalchemy import select
 
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
@@ -58,17 +57,13 @@ def _require_reeval_session_factory(runtime: ScanRuntime) -> Any:
     return runtime.reeval_session_factory
 
 
-def _current_toolchain_digest(runtime: ScanRuntime) -> str:
-    return compute_toolchain_digest(runtime.engine_metadatas, runtime.policy.version)
-
-
 @router.get("/reeval")
 async def list_reeval_status(
     session: SessionContext = Depends(_reeval_reader),
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> dict[str, Any]:
     session_factory = _require_reeval_session_factory(runtime)
-    current_digest = _current_toolchain_digest(runtime)
+    current_digest = runtime.current_toolchain_digest()
     async with session_factory() as db_session:
         statuses = await list_published_toolchain_statuses(db_session)
     return {
@@ -168,7 +163,7 @@ async def trigger_reeval(
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> dict[str, Any]:
     session_factory = _require_reeval_session_factory(runtime)
-    current_digest = _current_toolchain_digest(runtime)
+    current_digest = runtime.current_toolchain_digest()
     async with session_factory() as db_session, db_session.begin():
         statuses = await list_published_toolchain_statuses(db_session)
         targets = [s for s in statuses if s.skill_id == skill_id]

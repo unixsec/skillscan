@@ -24,11 +24,12 @@ function useNextPath(): string {
   return safeNextPath(searchParams.get('next'))
 }
 
-// NOTE: normal SSO (OIDC/SAML) has no login-callback endpoint wired yet in
-// this backend (see docs/stories/BACKLOG.md's M8 status note). Two working
-// session-creation paths exist: break-glass (emergency, four-eyes, admin
-// only) and local account (2026-07-13 addition, standing username/password
-// path covering all four roles - see apps/monolith/modules/admin/local_auth.py).
+// NOTE: this page offers the two session-creation paths a user can drive from
+// here - break-glass (emergency, four-eyes, admin only) and local account (a
+// standing username/password path covering all four roles; see
+// apps/monolith/modules/admin/local_auth.py). OIDC/SAML are wired on the
+// backend (gateway/auth/login_router.py) but are entered from the IdP side and
+// have no form to render here, which is why there is no third tab.
 type LoginTab = 'breakglass' | 'local'
 
 function BreakglassForm() {

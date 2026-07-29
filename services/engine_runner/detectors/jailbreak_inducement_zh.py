@@ -1,6 +1,7 @@
 """Chinese-language jailbreak/inducement phrase detector (coding spec D5
-PROMPT-04, floor tier). See docs/superpowers/specs/2026-07-22-chinese-
-prompt-injection-detectors-design.md for the full design rationale.
+PROMPT-04, floor tier). Written in house because every vendored engine that
+covers this category is English-only; `vendor/VENDOR.md` records the candidate
+that was evaluated for the gap and never vendored.
 
 Distinct from prompt_injection_zh.py (PROMPT-01, direct instruction
 override): this covers the checklist's PROMPT-04 category specifically -

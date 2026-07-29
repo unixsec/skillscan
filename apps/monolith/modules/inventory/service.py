@@ -146,6 +146,50 @@ async def genesis_actors(session: AsyncSession, *, skill_ids: Sequence[str]) -> 
     return actors
 
 
+async def identity_appears_in_inventory(session: AsyncSession, *, identity: str) -> bool:
+    """Has this exact identity string ever appeared in inventory's own records -
+    as the actor of any lifecycle event, or as the owner of any skill?
+
+    ADVISORY ONLY (2026-07-29 residual triage). `skill.owner` is free text and
+    deliberately unvalidated: identities arrive from local accounts AND from
+    OIDC/SAML, so there is no complete roster and a hard check would refuse
+    every legitimate federated owner who has not signed in yet (see
+    `ownership.validate_owner_assignment`). What a typo actually costs is
+    silence: the assignment succeeds, the skill stays admin-only because
+    `authorize_skill_write` compares verbatim, and nobody finds out until the
+    real owner's next submission 403s. This is the evidence that lets the
+    console SAY SO at assignment time without blocking anything.
+
+    A FALSE ANSWER IS NOT AN ERROR, and callers must treat it that way. "Never
+    seen here" is the expected state for a real person being handed their first
+    skill. It earns a sentence, never a refusal.
+
+    Inventory's OWN tables only - `skill_lifecycle_event.actor` covers every
+    submission (`register_skill_version` records the submitter there) plus every
+    admin action, and `skill.owner` covers anyone already trusted with a skill.
+    Local accounts are `admin`'s table and are checked by the router through
+    `LocalAccountStore`, the accessor built for it - not by widening this
+    module's grants for a hint.
+
+    Two `EXISTS`-shaped queries rather than one join: they touch different
+    tables and either one alone is a sufficient answer, so the second is only
+    ever run when the first found nothing.
+    """
+    seen_as_actor = (
+        await session.execute(
+            select(SkillLifecycleEventRow.id)
+            .where(SkillLifecycleEventRow.actor == identity)
+            .limit(1)
+        )
+    ).first()
+    if seen_as_actor is not None:
+        return True
+    seen_as_owner = (
+        await session.execute(select(SkillRow.skill_id).where(SkillRow.owner == identity).limit(1))
+    ).first()
+    return seen_as_owner is not None
+
+
 async def list_unowned_skills(
     session: AsyncSession, *, limit: int, offset: int
 ) -> list[UnownedSkill]:

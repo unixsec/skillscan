@@ -12,6 +12,7 @@ into "policy loaded fine, just with fewer rules than intended".
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +177,9 @@ def tier_direction(policy: GatePolicy, *, requested: str | None, judged: str | N
     A hint, not a claim about the past: it is computed from the policy loaded
     NOW, while the verdict was reached under whatever policy version was loaded
     then. Both tiers are always returned verbatim alongside it, so a consumer
-    is never dependent on this field being the last word.
+    is never dependent on this field being the last word. `tier_divergence`
+    below is what says WHICH policy a given answer was computed under - use it
+    at any surface that shows this to a human.
 
     LIVES HERE, not in `gateway.router` where Task 14 first wrote it (Task 18):
     two surfaces now disclose the divergence - the console's
@@ -211,3 +214,72 @@ def tier_direction(policy: GatePolicy, *, requested: str | None, judged: str | N
     if judged_threshold < requested_threshold:
         return "stricter"
     return "equivalent"
+
+
+@dataclass(frozen=True, slots=True)
+class TierDivergence:
+    """`tier_direction` plus the one fact that makes it honest: which policy it
+    was computed under.
+
+    `basis` is `None` exactly when `direction` is - there is nothing to
+    qualify. Otherwise:
+
+      * `"signing_policy"` - the verdict's own `policy_version` is the version
+        this process has loaded, so the direction describes the adjudication as
+        it actually happened.
+      * `"current_policy"` - it does not (or there is no verdict yet, so
+        nothing has been signed at all). The direction is still computed and
+        still useful, but it describes TODAY's thresholds, not the ones in
+        force when the verdict was signed.
+    """
+
+    direction: str | None
+    basis: str | None
+
+
+def tier_divergence(
+    policy: GatePolicy,
+    *,
+    requested: str | None,
+    judged: str | None,
+    signed_policy_version: str | None,
+) -> TierDivergence:
+    """`tier_direction`, qualified by whether it could be computed under the
+    policy the verdict was actually signed under.
+
+    THE PROBLEM (2026-07-29, milestones E+F residual triage). `tier_direction`
+    reads `GatePolicy.block_threshold` off whatever policy this process has
+    loaded right now. Strictness lives in `tier_block_overrides`, and an
+    approved `policy_proposal` can change those between the moment a verdict is
+    signed and the moment somebody looks at it - so a historical verdict could
+    be relabelled: a divergence shown that did not exist when the adjudication
+    happened, or a real one hidden.
+
+    WHAT IS ACTUALLY RECOVERABLE, and what is therefore NOT invented here.
+    `verdict.policy_version` is recorded on every verdict (gate.models.
+    VerdictRow, written by `decide_and_record`), so "was this the same policy
+    VERSION" is answerable. The policy CONTENT at that version is not
+    reconstructible in the general case: `policy_proposal` holds the YAML of
+    policies that arrived as proposals, but the bootstrap policy is a file on
+    disk (policies/gate/v1.yaml) with no row anywhere, and svc_gate's own
+    session is not a policy archive. So this function does NOT re-derive a
+    historical threshold - it says which policy the number in front of you came
+    from and lets the surface caveat it. An accurate caveat beats a confident
+    wrong label.
+
+    KNOWN LIMIT, stated rather than papered over: version equality is not
+    content equality. `policies/gate/v1.yaml` can be edited in place without
+    bumping `version`, and this would then report `"signing_policy"` for a
+    policy whose thresholds have in fact moved. Version is the only handle the
+    verdict row carries; the real fix is a content digest on the verdict, which
+    is a schema change and not one to make silently as part of a display fix.
+
+    `signed_policy_version is None` (no verdict yet) is `"current_policy"`: no
+    adjudication has happened, so the direction describes what today's policy
+    would do - which is exactly what the caveat says.
+    """
+    direction = tier_direction(policy, requested=requested, judged=judged)
+    if direction is None:
+        return TierDivergence(direction=None, basis=None)
+    basis = "signing_policy" if signed_policy_version == policy.version else "current_policy"
+    return TierDivergence(direction=direction, basis=basis)

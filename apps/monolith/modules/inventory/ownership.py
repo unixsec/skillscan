@@ -239,6 +239,13 @@ def validate_owner_assignment(
     verbatim, so a misspelled owner matches nobody and the skill stays
     admin-only - the same fail-closed state it was already in, visible in the
     audit trail, and fixable by assigning again.
+
+    That still leaves the typo SILENT until the real owner's next submission
+    403s, which is why the console warns (2026-07-29 residual triage). The
+    warning lives entirely outside this function - `inventory/router.py`'s
+    `_owner_is_recognized` - and deliberately so: the decision here must stay a
+    shape check that cannot fail on an identity it has simply never seen. An
+    advisory that leaks into the validator is a hard check with extra steps.
     """
     normalized = normalize_owner(new_owner)
     if expect_unowned and recorded_owner is not None:

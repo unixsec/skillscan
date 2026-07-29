@@ -82,6 +82,21 @@ export interface ScanDetail {
   // over-blocking). 'equivalent' means the names differ but the policy treats
   // them identically. `null` means no comparison was possible.
   tier_direction: 'looser' | 'stricter' | 'equivalent' | null
+  // WHICH policy `tier_direction` was computed under. Strictness lives in the
+  // policy's `tier_block_overrides`, so a policy approved between signing and
+  // viewing can relabel a historical verdict - showing a divergence that did
+  // not exist when the adjudication happened, or hiding one that did.
+  //
+  // 'signing_policy' - the verdict's own policy_version is the one the server
+  // has loaded, so the direction describes the adjudication as it happened.
+  // 'current_policy' - it does not, or no verdict has been signed yet. The
+  // direction is still the best available reading, but it describes TODAY's
+  // thresholds and the page says so. `null` whenever `tier_direction` is.
+  //
+  // The server deliberately does NOT reconstruct the historical policy to give
+  // a "true" answer: only `verdict.policy_version` is recoverable, not the
+  // thresholds that version carried. See gate/policy.py's `tier_divergence`.
+  tier_direction_basis: 'signing_policy' | 'current_policy' | null
   // Always a list, even for exactly one submitter - never a bare string.
   submitters: string[]
   // 里程碑 F Task 12: the channels this scan arrived through ("console" /
@@ -220,6 +235,13 @@ export interface OwnerAssignmentResult {
   owner: string
   assigned: string[]
   failed: { skill_id: string; error: string }[]
+  // ADVISORY, never a failure. `false` means this identity is neither a local
+  // account nor has ever appeared as a submitter - the shape a typo takes,
+  // and also the shape a brand-new SSO user takes, which is why it warns
+  // instead of blocking. `null` means the check could not run. Nothing in
+  // `assigned`/`failed` depends on it. See inventory/router.py's
+  // `_owner_is_recognized`.
+  owner_recognized: boolean | null
 }
 
 export interface ReevalSkill {

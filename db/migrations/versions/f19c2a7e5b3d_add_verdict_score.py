@@ -1,9 +1,9 @@
 """add verdict.score
 
-2026-07-25: security scoring design doc (docs/superpowers/specs/
-2026-07-24-scoring-marketplace-engine-admin-design.md) - a 0-100 advisory
-score, deterministically derived from the already-decided verdict + its
-findings (never an input to the decision itself, see gate.decide()). Existing
+2026-07-25: a 0-100 advisory score, deterministically derived from the
+already-decided verdict + its findings and never an input to the decision
+itself - `skillscan_core.scoring.security_score`, called from
+`skillscan_core.gate.decide()` after the verdict is fixed. Existing
 rows predate scoring and have no findings recorded to recompute a real score
 from, so they're backfilled to the midpoint of their verdict's band
 (BLOCK=20, REVIEW=57, PASS=87) rather than left NULL - the API always returns

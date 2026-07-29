@@ -77,6 +77,9 @@ function scan(overrides: Partial<ScanDetail> = {}): ScanDetail {
     // verdict was reached at, so nothing is flagged. `tier_direction` is
     // server-computed and null whenever the two agree.
     tier_direction: null,
+    // Null for the same reason: with nothing compared there is no basis to
+    // report. The divergence tests below set both together.
+    tier_direction_basis: null,
     submitters: ['alice'],
     source: ['console'],
     submitter_sources: [{ submitter: 'alice', source: 'console', requested_trust_tier: 'public' }],
@@ -297,6 +300,36 @@ describe('ScanDetail evidence rendering', () => {
     renderScan({ trust_tier: null, judged_at_tier: null, tier_direction: null })
     await waitForLoaded()
     expect(screen.queryByText(/本次请求的信任层级/)).toBeNull()
+  })
+
+  // 2026-07-29 residual triage: `tier_direction` is computed from the policy the
+  // server has loaded NOW, so a policy approved between signing and viewing can
+  // relabel a historical verdict. The direction is still shown - suppressing it
+  // would hide a divergence that may well be real - but the page has to say
+  // which policy it came from.
+  it('caveats a divergence that was compared under the CURRENT policy, not the signing one', async () => {
+    renderScan({
+      trust_tier: 'public',
+      judged_at_tier: 'internal',
+      tier_direction: 'looser',
+      tier_direction_basis: 'current_policy',
+    })
+    await waitForLoaded()
+    expect(screen.getByText(/当前生效的门禁策略/)).toBeInTheDocument()
+  })
+
+  it('makes no such caveat when the verdict was signed under the policy in force', async () => {
+    // The caveat must stay rare, or it becomes the sentence everybody skips -
+    // including on the scan where the comparison really is retrospective.
+    renderScan({
+      trust_tier: 'public',
+      judged_at_tier: 'internal',
+      tier_direction: 'looser',
+      tier_direction_basis: 'signing_policy',
+    })
+    await waitForLoaded()
+    expect(screen.getByText(/更宽松/)).toBeInTheDocument()
+    expect(screen.queryByText(/当前生效的门禁策略/)).toBeNull()
   })
 
   it('answers "is this safe" in plain language, and admits when it does not know', async () => {

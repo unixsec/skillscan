@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from common.log import get_logger
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -36,12 +37,15 @@ from .service import (
     assign_skill_owner,
     count_unowned_skills,
     current_state,
+    identity_appears_in_inventory,
     list_unowned_skills,
     set_baseline,
     transition_skill,
 )
 
 router = APIRouter(prefix="/v1/inventory")
+
+_logger = get_logger("skillscan.inventory.router")
 
 _reader = require_role("approver", "auditor", "admin")
 _admin_only = require_role("admin")
@@ -66,6 +70,54 @@ def _require_inventory_session_factory(runtime: ScanRuntime) -> Any:
     if runtime.inventory_session_factory is None:
         raise HTTPException(status_code=500, detail="inventory module is not configured")
     return runtime.inventory_session_factory
+
+
+async def _owner_is_recognized(runtime: ScanRuntime, *, owner: str) -> bool | None:
+    """ADVISORY: has this identity been seen before, anywhere this system can
+    cheaply look? `True` = yes, `False` = nowhere, `None` = could not check.
+
+    2026-07-29 residual triage. `skill.owner` is free text with no roster to
+    validate against - local accounts and OIDC/SAML identities both land in the
+    same column - so a hard check would refuse legitimate federated owners and
+    `ownership.validate_owner_assignment` is right to shape-check only. But a
+    typo fails SILENTLY: the write succeeds, the skill stays admin-only because
+    `authorize_skill_write` compares verbatim, and the mistake surfaces at the
+    real owner's next 403.
+
+    So: warn, never block. This follows `/admin/ownership`'s own precedent
+    rather than inventing a second style - that page already puts the genesis
+    actor in front of the admin as evidence and pointedly refuses to act on it.
+    Same shape here: a fact next to the decision, the decision still theirs.
+
+    FALSE IS NOT AN ERROR. A brand-new SSO user being handed their first skill
+    is exactly this case, and the console's wording says so.
+
+    FAIL-SOFT to `None`, never a 500: this is a hint attached to a privilege
+    change that has already been authorized. An advisory that can fail the
+    request it decorates is worse than no advisory - same posture as
+    `marketplace_api._record_fetch`'s audit write.
+
+    Two sources, either sufficient: inventory's own history (every submitter and
+    every current owner - `service.identity_appears_in_inventory`) and the local
+    account table, read through `LocalAccountStore`, the accessor built for it.
+    Only usernames are compared; the store returns password hashes and none of
+    them goes anywhere near a response or a log.
+    """
+    session_factory = _require_inventory_session_factory(runtime)
+    try:
+        async with session_factory() as db_session:
+            if await identity_appears_in_inventory(db_session, identity=owner):
+                return True
+        store = runtime.local_account_store
+        if store is None:
+            # Local auth is not configured at all, so "not a local account" is
+            # not a finding about this identity - inventory history above is the
+            # whole of what this deployment can say.
+            return False
+        return any(account.username == owner for account in await store.fetch_accounts())
+    except Exception:
+        _logger.exception("owner recognition check failed - assignment is unaffected")
+        return None
 
 
 class _TransitionBody(BaseModel):
@@ -208,6 +260,11 @@ async def assign_owner_bulk(
         normalize_owner(body.owner)
     except InvalidOwnerError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # ADVISORY, computed BEFORE any write so it cannot describe a half-applied
+    # batch, and never a reason to refuse one - see `_owner_is_recognized`. A
+    # typo here is the realistic mistake and it fails silently: every row goes
+    # through, and nobody learns otherwise until the real owner's next 403.
+    owner_recognized = await _owner_is_recognized(runtime, owner=body.owner.strip())
     # Deduplicated, order preserved: the same skill twice in one batch would
     # otherwise write two audit rows for one decision, the second of them a
     # 409 against the change the first just made.
@@ -232,7 +289,14 @@ async def assign_owner_bulk(
             failed.append({"skill_id": skill_id, "error": str(exc)})
         else:
             assigned.append(skill_id)
-    return {"owner": body.owner.strip(), "assigned": assigned, "failed": failed}
+    return {
+        "owner": body.owner.strip(),
+        "assigned": assigned,
+        "failed": failed,
+        # true = seen before, false = seen nowhere (worth a second look, not an
+        # error), null = the check could not run. Never affects `assigned`.
+        "owner_recognized": owner_recognized,
+    }
 
 
 @router.get("/{skill_id}")
@@ -430,6 +494,10 @@ async def set_skill_owner(
     saying it intends to take the skill from its current owner.
     """
     session_factory = _require_inventory_session_factory(runtime)
+    # ADVISORY, and read BEFORE the write for one reason: afterwards the owner
+    # IS in `skill.owner` and the check would recognize the very typo it exists
+    # to catch. See `_owner_is_recognized`.
+    owner_recognized = await _owner_is_recognized(runtime, owner=body.owner.strip())
     try:
         async with session_factory() as db_session, db_session.begin():
             previous_owner = await assign_skill_owner(
@@ -455,6 +523,8 @@ async def set_skill_owner(
         "skill_id": skill_id,
         "owner": body.owner.strip(),
         "previous_owner": previous_owner,
+        # Same advisory the bulk route returns, same three meanings.
+        "owner_recognized": owner_recognized,
     }
 
 

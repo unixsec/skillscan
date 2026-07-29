@@ -163,6 +163,12 @@ const zh: Dict = {
     '在你请求的层级上本可放行的发现项，这里可能被判为拦截。',
   'scanDetail.tierMismatchEquivalent':
     '两个层级名称不同，但当前门禁策略对它们使用相同的拦截阈值，因此本次判定结论不受影响。',
+  // 上面这句“宽松 / 严格 / 等价”的判断，是用当前加载的门禁策略算出来的；
+  // 而判定本身是在签发时那一版策略下作出的。两者不一致时必须说清楚，
+  // 否则策略一改，历史判定就会被贴上一个当时并不成立的标签。
+  'scanDetail.tierDirectionCurrentPolicy':
+    '（该对比使用的是当前生效的门禁策略，而非本次判定签发时的那一版；' +
+    '若此后策略调整过拦截阈值，此处结论可能与当时的实际情况不同。）',
   'scanDetail.signals': '扫描级信号',
   'scanDetail.hardGateHits': '硬门禁命中（不可豁免）：',
   'scanDetail.trifectaSignals': '致命三元组信号：',
@@ -389,6 +395,16 @@ const zh: Dict = {
   'ownership.confirmTitle': '确认指派归属人？',
   'ownership.confirmDescription':
     '将把 {count} 个 Skill 的归属人设为 {owner}。这是一次权限变更，会写入审计链。',
+  // 只提示、不拦截。归属人是自由文本，本来就没有可以校验的完整名册
+  // （本地账号 + OIDC/SAML 都写进同一列），硬校验会误拒合法的联合身份用户；
+  // 但拼错了又是「静默失败」——写入成功，Skill 继续只有 admin 能提交，
+  // 直到真正的归属人下次提交被 403 才暴露。所以这里把「没见过这个身份」说出来。
+  'ownership.ownerUnrecognized':
+    '提醒：系统中没有见过身份 {owner}（既不是本地账号，也从未提交过任何 Skill）。' +
+    '指派已经完成，不影响结果。如果对方是首次接入的 SSO 用户，这是正常的；' +
+    '否则请核对拼写后重新指派。',
+  'ownership.ownerRecognitionUnavailable':
+    '未能核对身份 {owner} 是否在系统中出现过（检查本身失败了）。指派已经完成，不影响结果。',
 
   'reeval.title': '重评 / 漂移',
   'reeval.triggerFailed': '触发重评失败',
@@ -791,6 +807,12 @@ const en: Dict = {
     'This verdict was reached under a STRICTER tier than you requested. That is the safe direction, but it can over-block: a finding that would have been allowed at the tier you asked for may have been blocked here.',
   'scanDetail.tierMismatchEquivalent':
     'The two tier names differ, but the current gate policy applies the same block threshold to both, so this verdict is unaffected.',
+  // The looser/stricter/equivalent judgement above is computed from the policy
+  // loaded RIGHT NOW, while the verdict was signed under whichever policy was
+  // loaded then. When those differ it has to be said out loud - otherwise a
+  // policy change silently relabels a historical verdict.
+  'scanDetail.tierDirectionCurrentPolicy':
+    '(This comparison uses the gate policy in force now, not the one this verdict was signed under - if the block thresholds have changed since, the conclusion above may not describe what actually happened.)',
   'scanDetail.signals': 'Scan-level signals',
   'scanDetail.hardGateHits': 'Hard-gate hits (unwaivable):',
   'scanDetail.trifectaSignals': 'Fatal-trifecta signals:',
@@ -1022,6 +1044,15 @@ const en: Dict = {
   'ownership.confirmTitle': 'Assign this owner?',
   'ownership.confirmDescription':
     'Sets the owner of {count} skills to {owner}. This is a privilege change and is written to the audit chain.',
+  // Advisory, never blocking. Owner is free text with no roster to validate
+  // against (local accounts and OIDC/SAML land in the same column), so a hard
+  // check would refuse legitimate federated identities - but a typo fails
+  // SILENTLY: the write succeeds, the skill stays admin-only, and nobody finds
+  // out until the real owner's next submission 403s.
+  'ownership.ownerUnrecognized':
+    'Heads up: this system has never seen the identity {owner} - it is not a local account and has never submitted a skill. The assignment went through and is unaffected. That is normal for an SSO user who has not signed in yet; otherwise check the spelling and assign again.',
+  'ownership.ownerRecognitionUnavailable':
+    'Could not check whether the identity {owner} has been seen in this system (the check itself failed). The assignment went through and is unaffected.',
 
   'reeval.title': 'Reeval / Drift',
   'reeval.triggerFailed': 'trigger failed',

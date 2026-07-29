@@ -291,7 +291,7 @@ class TestCsrfCoversEverySessionCookie:
     registered cookie stops triggering CSRF - the two ways the old copied
     enumeration silently rotted (a new cookie-authenticated session type added
     without CSRF coverage = fail-OPEN, which already happened once to
-    break-glass; docs/stories/BACKLOG.md's S8 note).
+    break-glass and was caught only by real browser testing).
     """
 
     def test_registry_matches_all_declared_session_cookie_constants(self) -> None:

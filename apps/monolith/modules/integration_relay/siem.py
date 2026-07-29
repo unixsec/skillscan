@@ -14,12 +14,11 @@ WIRING STATUS: `apps/monolith/main.py`'s `_build_siem_notifier()` constructs
 this when `SKILLSCAN_SIEM_ENDPOINT` is set and stores it on
 `ScanRuntime.siem_notifier`; `integration_relay.service.drain_one`/
 `drain_pending_outbox` accept it as an optional `notifier` parameter and call
-`emit()` for `verdict_issued` rows alongside marketplace writeback. This is
-the SAME position `ScanRuntime.marketplace` has always been in: nothing in
-this codebase yet runs `drain_pending_outbox` as a live, recurring process
-(the scan-decision worker loop and outbox drain are both "real code, no live
-caller" - see docs/stories/BACKLOG.md's worker-loop status note) - once that
-loop exists, both ports are already correctly threaded through and ready.
+`emit()` for `verdict_issued` rows alongside marketplace writeback. Both this
+port and `ScanRuntime.marketplace` spent a long time as "real code, no live
+caller"; that is over - `worker.worker_tick` runs `drain_pending_outbox` on
+every tick, and `worker.run_due_report_schedules` emits scheduled-report
+events through this notifier too.
 
 DESIGN - endpoint shape: `Settings.siem_endpoint` (apps/monolith/config.py)
 is validated through the SAME `require_internal_endpoint` every other

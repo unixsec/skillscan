@@ -159,10 +159,12 @@ function TrustTierLine({
   trustTier,
   judgedAtTier,
   tierDirection,
+  tierDirectionBasis,
 }: {
   trustTier: string | null
   judgedAtTier: string | null
   tierDirection: ScanDetail['tier_direction']
+  tierDirectionBasis: ScanDetail['tier_direction_basis']
 }) {
   const { t } = useI18n()
   // Both null means the scan records no tier at all (legacy rows - see
@@ -197,6 +199,18 @@ function TrustTierLine({
         {tierLabel(judgedAtTier)}
       </span>
       {mismatch && <> — {mismatchMessage}</>}
+      {/* The caveat, and only when it is one. `tier_direction` is computed from
+          the policy the server has loaded NOW, while the verdict was signed
+          under whichever policy was loaded then - so on 'current_policy' the
+          sentence above describes today's thresholds, not necessarily the
+          adjudication that happened. Printing this on every scan would train
+          readers to skip it, so it is shown only when the comparison really is
+          retrospective. The server does not reconstruct the historical policy
+          to remove the caveat: only the verdict's policy_version survives, not
+          the thresholds it carried. */}
+      {mismatch && tierDirectionBasis === 'current_policy' && (
+        <> {t('scanDetail.tierDirectionCurrentPolicy')}</>
+      )}
     </p>
   )
 }
@@ -440,6 +454,7 @@ export function ScanDetailContent({ scanId }: { scanId: string }) {
             trustTier={data.trust_tier}
             judgedAtTier={data.judged_at_tier}
             tierDirection={data.tier_direction ?? null}
+            tierDirectionBasis={data.tier_direction_basis ?? null}
           />
 
           {data.required_ok === false && (

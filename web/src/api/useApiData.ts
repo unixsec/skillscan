@@ -26,6 +26,14 @@ interface ApiDataState<T> {
   // paragraph forever, on top of data that kept refreshing successfully
   // underneath it (it was cleared only on the initial load). Both fields are
   // cleared by ANY successful load, poll included.
+  //
+  // CALLERS: only a polling caller can ever see this - it is written on the
+  // poll path only, and no timers exist without `pollWhile` below - so the
+  // non-polling pages are correct to ignore it. If you ADD `pollWhile` to a
+  // page, you also own this field: render it next to the data (Scans.tsx),
+  // never through `DataState`, which would blank the whole page on one
+  // transient 503. `src/pollErrorRendering.test.ts` fails on exactly that
+  // omission, so this paragraph is a pointer rather than the only defence.
   pollError: string | null
   reload: () => void
 }

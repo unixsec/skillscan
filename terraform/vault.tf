@@ -3,8 +3,10 @@
 # self-built - same "int" convention as MySQL/Redis/MinIO). Mirrors exactly
 # what was manually verified against a real local Vault dev instance during
 # M6 development (transit secrets engine, rsa-2048 key, a policy scoping
-# access to sign/read-key on that one key only) - see docs/stories/
-# BACKLOG.md's M6 status note for that verification's own history.
+# access to sign/read-key on that one key only). That dev instance was torn
+# down afterwards and no live Vault has been re-authorized since, so the
+# automated suite exercises the client against a fake - see
+# apps/monolith/tests/test_gate_signer.py's `_FakeHvacTransit`.
 resource "vault_mount" "transit" {
   path = "transit"
   type = "transit"

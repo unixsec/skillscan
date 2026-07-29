@@ -10,11 +10,11 @@ JSON (a list of intranet-only SIEM/email destinations, coding spec §16.2:
 one destination.
 
 SECURITY: this table stores the DECLARATIVE schedule only ("what to send,
-how often, where") - actually firing on the cron schedule and delivering to
-those destinations requires a live background worker process this
-environment cannot stand up or verify (same class of gap as M6's live
-marketplace push / M7's live DR drill; see docs/stories/BACKLOG.md's S8
-status note).
+how often, where"). Firing on the cron is `worker.run_due_report_schedules`,
+which reads these rows every tick and delivers via the SIEM notifier. Email
+targets are carried in the emitted event but never actually delivered - there
+is no SMTP relay here, and that function's docstring says so rather than
+implying otherwise.
 
 Revision ID: def77a3f2f08
 Revises: 52ff865d36f6

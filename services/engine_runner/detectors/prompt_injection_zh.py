@@ -1,6 +1,7 @@
 """Chinese-language direct instruction-override detector (coding spec D5
-PROMPT-01, floor tier). See docs/superpowers/specs/2026-07-22-chinese-
-prompt-injection-detectors-design.md for the full design rationale.
+PROMPT-01, floor tier). Written in house because every vendored engine that
+covers this category is English-only; `vendor/VENDOR.md` records the candidate
+that was evaluated for the gap and never vendored.
 
 SECURITY: SkillSpector's own static_patterns_prompt_injection.py (P1-P4)
 covers this exact category, but every one of its regexes is English-only -
