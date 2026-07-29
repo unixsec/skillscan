@@ -4,8 +4,12 @@
 skillscan ships nginx.conf TWICE, deliberately not from one shared source:
 
   - web/nginx.conf: baked into the web image, what docker-compose serves.
-    Talks to `monolith:8000` on :80, runs as nginx's own root-ish default
-    user.
+    Talks to `monolith:8000` on :80. It runs as the image's own non-root
+    `skillscan` user - NOT, as this docstring claimed until 2026-07-29,
+    "nginx's own root-ish default user". That wrong belief is why this file
+    shipped for months without relocating nginx's temp paths and could not
+    start at all under compose, while the chart's own copy (which does
+    relocate them) kept the K8s path healthy and the divergence invisible.
   - deploy/helm/skillscan/templates/web.yaml (the `skillscan-web-nginx`
     ConfigMap): what the Helm chart mounts over the baked-in file. Talks to
     `skillscan-monolith:{{ .Values.web.monolithServicePort }}`, runs as a

@@ -23,17 +23,39 @@
 > | 构建期仍然需要联网取的东西 | 出现在哪 |
 > |---|---|
 > | 基础镜像（`FROM ...`） | 三个 Dockerfile 全部 |
-> | `go mod download` / `go build` | `services/engine_runner/Dockerfile` |
-> | `apt-get`（编译 yara 等所需的系统包） | `services/engine_runner/Dockerfile` |
-> | PyPI（`uv sync` / `uv pip install`） | `apps/monolith/Dockerfile`、`services/engine_runner/Dockerfile` |
+> | `go mod download`（osv-scanner 的 **Go 依赖图**） | `services/engine_runner/Dockerfile` |
+> | `apt-get`：yara 的**编译工具链**（autoconf/automake/libtool/bison/flex/gcc + libjansson-dev/libmagic-dev/libssl-dev）与运行期共享库（libjansson4/libmagic1） | `services/engine_runner/Dockerfile`、`deploy/engines/yara/Dockerfile` |
+> | PyPI：`uv sync` 的项目依赖，以及 **bandit / skillspector / aig-mcp-scan 各自的依赖图**（bandit 需要 pbr、PyYAML、stevedore、rich） | `apps/monolith/Dockerfile`、`services/engine_runner/Dockerfile` |
 > | npm（`npm ci`） | `web/Dockerfile` |
+>
+> **2026-07-29 起五个引擎全部从 `vendor/` 构建**（此前 bandit 走 PyPI、yara 走 Debian
+> 源）。请注意这消除的是哪一类联网需求：**引擎自身的源码**不再需要外网，但**引擎的依赖图
+> 不等于引擎的源码**——vendor 了 osv-scanner 的源码不等于 vendor 了它的 Go module，
+> vendor 了 bandit 的源码不等于 vendor 了 pbr/PyYAML/stevedore/rich。上表第 2、4 行
+> 正是这个区别，不要误读成"已经不需要索引源了"。
+>
+> 另外 bandit 的打包用 `pbr`，版本号从 **git tag** 推导，而 vendor 子树只有源码没有
+> git 历史——所以构建时由 `PBR_VERSION` 从 `vendor/engines.lock.yaml` 注入。
 >
 > 这些都**不在**仓库里。如果隔离侧有完整的内网镜像源，可以用 `PIP_INDEX_URL`、
 > `GOPROXY`、`NPM_CONFIG_REGISTRY`（三个 Dockerfile 都已参数化）在内网自建；否则
 > 就走离线镜像包——**它送过去的是构建完成的镜像，不是一次构建**，隔离侧因此一个都不需要。
 >
+> **同一张表也适用于 §2 的 docker-compose 一键部署**：它构建的就是这三个 Dockerfile
+> （2026-07-29 起包含 `engine-runner`），所以它需要的联网项与上表逐行相同。compose 侧
+> 把这三个参数暴露为 `SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_GOPROXY` /
+> `SKILLSCAN_NPM_REGISTRY`。**compose 路径不是离线包，也不具备离线包的性质**——它在目标
+> 机器上真做一次完整构建。
+>
 > committed vendor 源码要解决的是另一件事：可审计（对得上
 > `vendor/engines.lock.yaml` 的 commit/tree pin）与可自建，不是替代离线包。
+>
+> **版本一致性是构建期强制的，不是靠注释。** 每个产出引擎二进制的 Dockerfile 都有一步
+> 断言：镜像里 `yara --version` / `bandit --version` / `osv-scanner --version` 必须等于
+> `vendor/engines.lock.yaml` 钉的版本，不等就构建失败（`scripts/vendor_pinned_version.sh`）。
+> 这是 INV-7 的直接要求——`toolchain_digest`（以及其下的 `cache_key`）由该 lock 文件推导，
+> 若镜像里的引擎与它不一致，摘要指纹的就是一套从未真正运行过的工具链。旧镜像正是如此：
+> lock 记 v4.5.7、实际跑 4.2.3，而这个缺口当时只被写在一句诚实的注释里。
 
 ---
 
@@ -70,10 +92,9 @@ cd web && npm run dev   # http://localhost:5173
 （见 `apps/monolith/main.py` 自己的文档字符串），`SKILLSCAN_BREAKGLASS_ENABLED` 默认为
 `false`，除非真的需要且已接好真实 Vault 才手动开启。
 
-## 2. 容器化生产部署（docker-compose）⚠未在本环境验证构建
+## 2. 容器化生产部署（docker-compose）✅已在 dev VM 验证
 
-**前置条件：** Docker + docker compose 插件（本机开发环境没有 Docker daemon，以下命令
-未在此实际运行过——`docker-compose.yml` 本身已通过 YAML 语法校验）。
+**前置条件：** Docker + docker compose 插件。
 
 ```bash
 cp .env.example .env
@@ -81,13 +102,65 @@ cp .env.example .env
 ./scripts/one_click_deploy_docker.sh
 ```
 
-这会构建并启动：MySQL 8 + Redis + 一次性 `migrate`（迁移+GRANT）+ 单体后端（`monolith`，
-端口 8000）+ Web 控制台（`web`，nginx 反向代理到单体，端口 80，同源 BFF——见 §5 安全说明）。
+这会构建并启动：MySQL 8 + Redis + 一次性 `migrate`（迁移+GRANT）+ 一次性
+`blobstore-init`（准备共享卷权限）+ 单体后端（`monolith`，端口 8000）+
+**`engine-runner`（五个真实 OSS 检测引擎）** + Web 控制台（`web`，nginx 反向代理到单体，
+端口 80，同源 BFF——见 §5 安全说明）。
+
+**2026-07-29 之前这个文件里没有 `engine-runner`。** 照着本节部署出来的系统只跑单体进程内
+的 floor 引擎，整个 sandbox 引擎层静默缺席——不报任何错，扫描照常出结论，只是引擎比操作者
+有任何理由预期的要少。现在补上了，并在 dev VM 上真实提交了一个 skill 包、从
+`scan_engine_health` 读回 sandbox 引擎 `report_state='reported'` 验证过。
+
+**这条路径是从源码构建的，联网需求与"把仓库 clone 过去"完全相同**（就是 §0 那张表：基础
+镜像、`go mod download`、`apt-get`、PyPI、npm），因为构建的正是那三个 Dockerfile。
+`engine-runner` 会用 autotools 编译 `vendor/yara`、用 Go 构建 `vendor/osv-scanner`，冷缓存
+下需要数分钟，并且**版本与 `vendor/engines.lock.yaml` 不一致时构建直接失败**。内网可以用
+`SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_GOPROXY` / `SKILLSCAN_NPM_REGISTRY` 指向自建镜像
+源。**它不是离线包，也不具备离线包的性质**——离线包（§6）送过去的是构建完成的镜像，隔离侧
+一次构建都不做；本节则是在目标机器上真做一次完整构建。真隔离网请走 §6。
+
+**拓扑说明（诚实版）：** 这里的 `engine-runner` 是与单体同一台 Docker 宿主机上的普通容器，
+**不是** Helm chart（拓扑 A）里那个 gVisor RuntimeClass + 独立命名空间 + NetworkPolicy
+围起来的部署。引擎完全一样，围着引擎的隔离更弱。以"不可信 skill 包"为威胁模型时应选拓扑 A。
+
+**共享 blobstore 是这里最容易静默出错的地方。** 单体写 `artifacts/<hash>/pkg.tar`，
+engine-runner 读它、写回 `findings/<scan_id>/<engine>.json`，单体再读回来。两边不是同一个
+存储时**什么错都不会报**：容器全是 Running、`/healthz` 全是 200、日志干干净净，扫描永远停在
+`running`。compose 里用一个具名卷同时挂给两个服务，路径与两个 `SKILLSCAN_BLOBSTORE_ROOT`
+共用同一个 YAML 锚点；两个进程 uid 不同（10001/10002），靠 `group_add: 10000` 这个共享附加组
++ 一次性 `blobstore-init` 把卷根设成 `root:10000 2770` 才能互相写。一键脚本最后会**实际等待
+并断言** engine-runner 的 `/readyz` 变健康（对端探针文件可见），不是假设挂载成功了——注意
+它的 `start_period` 是 90 秒，因为 60 秒宽限期内 `/readyz` 无论如何都返回 200，比这更早的
+检查测的是宽限期而不是共享。
+
+**验证引擎真的跑了（不要看日志，读表）：** `GET /v1/admin/engines/health` 背后的
+`scan_engine_health` 按 scan × engine 记录 `report_state` / `engine_status` /
+`analyze_duration_ms`。"从未上报"和"上报了但 ERROR"是两种不同状态，这张表能区分。
+2026-07-29 在 dev VM 上真实提交一个包后读到的就是（省略 11 个 inhouse/floor 引擎）：
+
+| engine | report_state | engine_status | 耗时 | findings |
+|---|---|---|---|---|
+| bandit | reported | ok | 84ms | 4 |
+| yara | reported | ok | 4ms | 1 |
+| skillspector | reported | ok | 6113ms | 4 |
+| osv-scanner | reported | **error** | 19ms | 0 |
+| aig-mcp-scan | **not_reported** | — | — | — |
+
+**后两行是预期状态，不是故障，而且是两种不同的情况：**
+
+- `osv-scanner` 真的跑了并 fail-closed 了，错误是 `no offline version of the OSV database
+  is available`。镜像**故意不去下载** Google 的 OSV 离线库（那是一次真实的外部数据拉取），
+  所以它宁可诚实报错也不去连 `api.osv.dev`（INV-14）。要让它出结果，需自行提供离线库并设
+  `OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY`。Helm 路径用的是同一个镜像，行为完全一样。
+- `aig-mcp-scan` 根本没被构造（没配 `SKILLSCAN_VLLM_BASE_URL`），所以它连"跑过"都算不上。
 
 **没有 Docker 的最小可替代路径：** 直接在一台已装好 Python/Node/MySQL/Redis 的宿主机上，
 参照编译指南 §2/§3 构建，再用 §4 的环境变量表配置后运行
 `uvicorn monolith.main:create_app --factory --host 0.0.0.0 --port 8000`（对应 SAD §3.4
-"拓扑 B2：docker-compose + systemd" 中不使用容器的等价形态）。
+"拓扑 B2：docker-compose + systemd" 中不使用容器的等价形态）。注意这条路径同样要**另外**
+起一个 `python -m engine_runner.main`，并让它与单体看到同一个 `SKILLSCAN_BLOBSTORE_ROOT`，
+否则就退化成"只有 floor 引擎"的那种静默缺席。
 
 ### `.env` 环境变量表（`.env.example` 是权威模板，逐项都已在此列出）
 
@@ -104,7 +177,12 @@ cp .env.example .env
 | SIEM | `SKILLSCAN_SIEM_ENDPOINT` | 否 | **审计修复(2026-07-06)新增：** 留空则 SIEM 转发禁用（市场回写仍正常） |
 | M2M | `SKILLSCAN_M2M_ALLOWED_SERVICE_ACCOUNTS` | 否 | 逗号分隔 client_id 白名单 |
 | 情报 | `SKILLSCAN_INTEL_TRUSTED_KEYS_DIR` | 否 | 留空则离线导入 fail-closed 拒绝一切 |
-| 构建期 | `SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_NPM_REGISTRY` | 内网构建需要 | INV-14 零外部出站在构建期的延伸 |
+| 沙箱引擎 | `SKILLSCAN_VLLM_BASE_URL` | 否 | **单体与 engine-runner 共用同一个值**（compose 里是一个 YAML 锚点）。只设一边＝静默脑裂：引擎跑了但单体不等它，结果被丢弃。留空则 skillspector 退到静态模式、aig-mcp-scan 根本不构造。INV-14：必须内网可解析 |
+| 沙箱引擎 | `SKILLSCAN_LLM_API_KEY` / `SKILLSCAN_LLM_MODEL` | 否 | 仅在上面设了内网端点、且该端点自带鉴权/指定模型时需要。只给 engine-runner（INV-10：单体不需要） |
+| 沙箱引擎 | `SKILLSCAN_OSV_SOURCE` | 否，默认 `offline` | 非 `offline` 时按内网端点校验；osv-scanner adapter 自身固定 `--offline`，不消费此值 |
+| 时间预算 | `SKILLSCAN_SCAN_DEADLINE_S` | 否，默认 `300` | 一次扫描的总墙钟。单体**执行**它，engine-runner 只读来在启动时告警"每引擎超时之和装不下"。设了 `SKILLSCAN_VLLM_BASE_URL` 后总和是 480s > 300s，需一并抬到 ≥480（同时抬 `SKILLSCAN_SANDBOX_WAIT_TIMEOUT_S`，两者刻意保持相等） |
+| 时间预算 | `SKILLSCAN_ENGINE_TIMEOUT_S` / `SKILLSCAN_ENGINE_TIMEOUTS_JSON` | 否 | 每引擎子进程超时；留空＝内置表（60s，aig-mcp-scan 240s）。JSON 里出现不认识的引擎名会让 engine-runner 启动即失败，而不是被静默忽略 |
+| 构建期 | `SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_NPM_REGISTRY` / `SKILLSCAN_GOPROXY` | 内网构建需要 | INV-14 零外部出站在构建期的延伸；`GOPROXY` 是 osv-scanner 的 Go 依赖图（见 §0 表第 2 行） |
 
 **未配置 Vault + OIDC/SAML 时：** 单体正常启动、健康检查通过，但没有任何登录路径可用
 （除非显式设置 `SKILLSCAN_BREAKGLASS_ENABLED=true` 且 Vault 可达）——这是刻意的

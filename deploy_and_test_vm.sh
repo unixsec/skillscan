@@ -289,24 +289,35 @@ echo "$pytest_out" | tail -100
 # each submodule's own HEAD; the engines are committed source now, but the
 # dependency on a real git checkout is unchanged.)
 #
-# CAVEAT, learned 2026-07-29: this filter is per-FILE, not per-test, so it also
-# suppresses failures in test_vendor_engines.py that have nothing to do with
-# `.git` - one stale assertion sat green-by-omission here for months. If that
-# file grows non-pin tests, narrow this to the pin tests by name.
+# NARROWED 2026-07-29 from per-FILE to per-TEST, and this is not a cleanup - the
+# old blanket `grep -v test_vendor_engines\.py` was actively hiding a real
+# failure. `test_status_command_runs_against_real_lock_file` asserted aig's
+# `adapter_status=not_built`, which stopped being true on 2026-07-09 when
+# mcp-scan got a real adapter. It failed on every run for months and this filter
+# swallowed every one of them, in a file nobody expected to be green anyway.
+#
+# Only these two tests genuinely cannot pass here, and the reason is an
+# environment fact rather than a regression: both shell out to
+# `git -C <repo> rev-parse HEAD:vendor/<x>` to compare the committed tree
+# against engines.lock.yaml's `tree:`, and this VM's checkout arrives by rsync
+# with `--exclude=.git`. (`test_drifted_tree_detected` is deliberately NOT
+# listed: it builds its own self-contained git repo under tmp_path, so it must
+# pass here, and listing it would re-open the same hole.)
 #
 # Filtering them out is what makes this script's exit code a TRUSTWORTHY signal:
 # leaving them in meant every single run exited non-zero, so a red exit code
 # carried no information and got ignored - exactly the failure mode that let the
 # old `| tee` exit-code bug hide for as long as it did. Any OTHER failure still
-# fails the run.
+# fails the run, INCLUDING any other failure in test_vendor_engines.py.
+KNOWN_NO_GIT_TESTS='test_real_vendored_source_matches_its_recorded_pin|test_verify_pins_command_succeeds_against_real_repo_state'
 if [ "$pytest_rc" -ne 0 ]; then
-  unexpected=$(echo "$pytest_out" | grep '^FAILED' | grep -v 'test_vendor_engines\.py' || true)
+  unexpected=$(echo "$pytest_out" | grep '^FAILED' | grep -Ev "$KNOWN_NO_GIT_TESTS" || true)
   if [ -n "$unexpected" ]; then
     echo "!!! UNEXPECTED test failures (not the known vendor-pin ones):"
     echo "$unexpected"
     exit 1
   fi
-  known=$(echo "$pytest_out" | grep -c '^FAILED apps/monolith/tests/test_vendor_engines\.py' || true)
+  known=$(echo "$pytest_out" | grep '^FAILED' | grep -Ec "$KNOWN_NO_GIT_TESTS" || true)
   echo "--- $known known environment-only vendor-pin failure(s) (VM checkout has no .git) - not a regression"
 fi
 

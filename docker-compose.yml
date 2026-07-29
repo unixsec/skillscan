@@ -1,12 +1,38 @@
 # Production-shaped one-click deployment (coding spec §4.3 docker-compose /
 # VM topology B2). Brings up MySQL 8 + Redis + the monolith (BFF API) + the
-# web console behind an nginx reverse proxy, applying migrations/GRANTs once
-# via a one-shot `migrate` service before the monolith starts.
+# engine-runner (the five real OSS detection engines) + the web console behind
+# an nginx reverse proxy, applying migrations/GRANTs once via a one-shot
+# `migrate` service before the monolith starts.
 #
-# NOT VERIFIED: no Docker daemon is available in this development environment
-# - this compose file (and the images it builds) has never been run here,
-# same honestly-labeled posture as apps/monolith/Dockerfile,
-# deploy/engines/*/Dockerfile, and web/Dockerfile individually.
+# VERIFIED 2026-07-29 on the dev VM (10.211.55.10): built from source
+# (`yara 4.5.7 = pinned`, `bandit 1.9.4`, `osv-scanner 2.4.0`, all asserted in
+# the build), brought up, a real skill package submitted through the running
+# stack, and `scan_engine_health` read back rather than the logs:
+#
+#   bandit        reported / ok     /   84 ms / 4 findings
+#   yara          reported / ok     /    4 ms / 1 finding
+#   skillspector  reported / ok     / 6113 ms / 4 findings
+#   osv-scanner   reported / error  /   19 ms / "no offline version of the OSV
+#                                                database is available"
+#   aig-mcp-scan  not_reported      /      -  / not constructed (no LLM endpoint)
+#
+# The last two are the EXPECTED states, not defects, and they are two different
+# ones: osv-scanner ran and failed closed because this image deliberately does
+# not fetch Google's OSV database (INV-14 - it fails honestly rather than
+# reaching api.osv.dev; set OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY to change
+# that), while aig-mcp-scan never ran at all because it is only constructed
+# when SKILLSCAN_VLLM_BASE_URL is set. Both are identical on the Helm path,
+# which builds the same image.
+#
+# Before that date this file shipped NO engine-runner at all - the documented
+# one-click path produced a system where only the monolith's in-process floor
+# engines ran and every sandbox engine was silently absent (nothing errored;
+# scans simply completed with fewer engines than the operator had any reason to
+# expect). Bringing it up for the first time also surfaced three defects that
+# had made this file unrunnable in ANY configuration, each fixed in place and
+# commented where it lives: the monolith's three policy PATH variables, the
+# `migrate` service's missing .env (it created every DB account with the
+# published dev password), and web/nginx.conf's unrelocated temp paths.
 #
 # SECURITY: no default/dev credentials anywhere in this file - every secret
 # comes from .env (copy .env.example -> .env and fill in real values first;
@@ -16,10 +42,73 @@
 # on for you). This is the real production-shaped target; for local dev/demo
 # without any of that, use scripts/one_click_dev.sh instead.
 #
-# This does NOT include services/engine-runner (real OSS detection engines) -
-# see deploy/helm/skillscan for the full K8s topology (coding spec §4.3
-# Topology A) that also runs engine-runner in a separate, gVisor-sandboxed
-# namespace; this compose file targets Topology B2 (single/few-VM, no K8s).
+# TOPOLOGY, stated honestly: this is coding spec §4.3 Topology B2 (single/few-
+# VM, no K8s). The engine-runner here is a plain container on the same Docker
+# host as the monolith - it is NOT the gVisor-sandboxed, separate-namespace,
+# NetworkPolicy-fenced deployment that `deploy/helm/skillscan` (Topology A)
+# gives it. The engines are identical; the isolation around them is weaker.
+# Choose Topology A when untrusted skill packages are the threat model.
+
+# ---------------------------------------------------------------------------
+# Shared anchors. Everything below that BOTH the monolith and the engine-runner
+# have to agree about is defined exactly once, here, and referenced from both -
+# not restated in two places that render fine while disagreeing.
+# ---------------------------------------------------------------------------
+
+# ⚠ LOAD-BEARING (milestone E design §4). The monolith writes
+# `artifacts/<hash>/pkg.tar`; the engine-runner reads it and writes
+# `findings/<scan_id>/<engine>.json`; the monolith reads THAT back. If the two
+# are not on the same store, NOTHING ERRORS - both containers stay Running,
+# both /healthz are 200, every log is clean, and every scan sits in RUNNING
+# forever. This anchor is both services' `SKILLSCAN_BLOBSTORE_ROOT` *and* both
+# services' volume mount target, so a typo cannot make one of the four
+# disagree with the other three. The startup peer probe (see the healthchecks
+# below) is what proves it actually worked.
+x-blobstore-root: &blobstore-root /app/var/blobstore
+
+# ⚠ LOAD-BEARING with the above. The two processes run as DIFFERENT uids
+# (monolith 10001, engine-runner 10002 - see their Dockerfiles' `useradd`) and
+# write into the same directory tree, so "same volume" is not sufficient:
+# whoever creates a directory level first would own it at its own umask and the
+# other process's write would fail closed with EACCES. `common.blobstore.
+# LocalFilesystemBlobStore._fix_permissions` handles that by chgrp'ing every
+# directory it creates to the first SUPPLEMENTARY group the process has and
+# chmod'ing it 2770 (setgid, group rwx, deliberately not world-writable) - so
+# both containers must carry one shared supplementary group, which is what
+# `group_add` below supplies. 10000 is the same gid the Helm chart uses as
+# `fsGroup` on both Deployments, kept identical on purpose.
+x-blobstore-gid: &blobstore-gid "10000"
+
+# ⚠ LOAD-BEARING (measured on the dev VM, 2026-07-29). These are the settings
+# that are WRONG WHEN ONLY ONE SIDE HAS THEM, so they are set from one `.env`
+# value on both services rather than left to each side's own default:
+#
+#   SKILLSCAN_VLLM_BASE_URL - decides whether the engine-runner CONSTRUCTS the
+#     LLM-gated engines (`sandbox_engines()` omits aig-mcp-scan entirely when
+#     it is empty) AND whether the monolith WAITS for them
+#     (`worker._waited_sandbox_engines`). Set on the engine-runner but not the
+#     monolith it produced a real split-brain: aig ran, the monolith never
+#     waited for it, its result was dropped, and the console asserted the
+#     engine was not built while the same row showed `failed 2`.
+#   SKILLSCAN_SCAN_DEADLINE_S - the monolith ENFORCES it (it stamps the budget
+#     onto every scan message); the engine-runner only reads it to warn at
+#     startup when the per-engine timeouts cannot all fit inside it. A
+#     disagreement therefore costs a wrong warning, never a wrong timeout - but
+#     a wrong warning about this specific thing is exactly the kind that gets
+#     ignored, so keep them equal.
+#   SKILLSCAN_OSV_SOURCE - validated by the monolith's own config
+#     (`require_internal_endpoint` for anything that is not the literal
+#     "offline"), read by the engine-runner.
+#
+# NOTE the engine-runner deliberately does NOT get `env_file: .env` the way the
+# monolith does: that file holds the DB passwords, the Vault token and the IdP
+# client secrets, and INV-10 requires this process to hold none of them. One
+# anchor interpolated from the same `.env` gives the two sides one source of
+# truth WITHOUT handing the sandbox tier the monolith's credentials.
+x-shared-engine-env: &shared-engine-env
+  SKILLSCAN_VLLM_BASE_URL: "${SKILLSCAN_VLLM_BASE_URL:-}"
+  SKILLSCAN_OSV_SOURCE: "${SKILLSCAN_OSV_SOURCE:-offline}"
+  SKILLSCAN_SCAN_DEADLINE_S: "${SKILLSCAN_SCAN_DEADLINE_S:-300}"
 
 services:
   mysql:
@@ -59,10 +148,70 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    # ⚠ SECURITY, and missing from this file until 2026-07-29.
+    # `db/setup_grants.py` reads each module account's password from the env
+    # var named in policies/grants/manifest.yaml (`password_env`) and falls
+    # back to the literal `local-dev-only-not-a-secret` when it is unset. This
+    # service had no `env_file`, so the DOCUMENTED PRODUCTION ONE-CLICK PATH
+    # created all seven least-privilege MySQL accounts with that published
+    # dev password, and then the monolith - which does read .env - could not
+    # authenticate as any of them. Measured, not reasoned about: /readyz
+    # reported `orchestration_db: false` and every worker tick failed with
+    # `Access denied for user 'svc_gate'`. The visible symptom (nothing works)
+    # is the lesser half of that defect; the invisible half is a production
+    # database whose service accounts have a password anyone can read in this
+    # repository.
+    env_file:
+      - .env
     environment:
       SKILLSCAN_MIGRATION_DB_URL: "mysql+aiomysql://root:${SKILLSCAN_MYSQL_ROOT_PASSWORD}@mysql/skillscan"
       SKILLSCAN_ADMIN_DB_DSN: "mysql://root:${SKILLSCAN_MYSQL_ROOT_PASSWORD}@mysql/skillscan"
     entrypoint: ["sh", "-c", "alembic upgrade head && python db/setup_grants.py"]
+
+  # One-shot: make the shared blobstore volume writable by BOTH service uids,
+  # then exit. Kubernetes does this with `fsGroup`; compose has no equivalent,
+  # so it is done explicitly here.
+  #
+  # WHY IT CANNOT BE LEFT TO THE APPLICATION. Docker creates a named volume's
+  # mount point as root:root 0755 when the path does not exist in the image
+  # (neither image creates `/app/var/blobstore`). Both services then run as
+  # non-root, so the FIRST `mkdir` of `artifacts/` or `findings/` under that
+  # root fails with EACCES - and it fails inside a worker tick that leaves the
+  # message unacked for redelivery, so the container stays up, the log fills
+  # with identical tracebacks, and the scan sits in RUNNING. Doing it here
+  # instead of in the two Dockerfiles also removes the ordering hazard: relying
+  # on Docker to copy ownership from an image directory only works if the
+  # container whose image carries it happens to be the one that initializes the
+  # volume first.
+  #
+  # SECURITY: this is the only container in the file that runs as root, it runs
+  # for the length of three syscalls, it holds no credential of any kind, and
+  # it exits before the monolith starts. 2770 (not 0777): only the two
+  # processes carrying gid 10000 may write here, not every process on the host.
+  # setgid so directories created underneath inherit the group rather than the
+  # creating uid's own primary group.
+  blobstore-init:
+    build:
+      context: .
+      dockerfile: apps/monolith/Dockerfile
+      args:
+        PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+    user: "0:0"
+    volumes:
+      - type: volume
+        source: blobstore_data
+        target: *blobstore-root
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p "$$0"
+        chgrp "$$1" "$$0"
+        chmod 2770 "$$0"
+        ls -ld "$$0"
+      - *blobstore-root
+      - *blobstore-gid
 
   monolith:
     build:
@@ -78,18 +227,45 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      blobstore-init:
+        condition: service_completed_successfully
     env_file:
       - .env
+    # See x-blobstore-gid: the shared supplementary group that makes the
+    # blobstore writable by this uid AND by the engine-runner's.
+    group_add:
+      - *blobstore-gid
     environment:
+      <<: *shared-engine-env
       SKILLSCAN_DB_HOST: mysql
       SKILLSCAN_REDIS_URL: redis://redis:6379/0
-      SKILLSCAN_BLOBSTORE_ROOT: /app/var/blobstore
-      # Background worker (apps/monolith/worker.py): scan execution, verdicts,
-      # lifecycle, audit/outbox drains, report schedules. Override to "false"
-      # only if a separate dedicated worker deployment runs these loops.
+      SKILLSCAN_BLOBSTORE_ROOT: *blobstore-root
+      # ⚠ REQUIRED, and missing from this file until 2026-07-29 - the monolith
+      # container crash-looped on `cannot read policy file
+      # /app/.venv/lib/python3.12/policies/gate/v1.yaml` before these were
+      # added (measured, not reasoned about). The code's defaults are computed
+      # relative to the SOURCE TREE, which lands inside site-packages once the
+      # project is installed into a venv; the real files are at /app. The Helm
+      # chart has always set all three (see templates/configmap.yaml) - this
+      # file simply never did, which is why the documented one-click path could
+      # not start at all. The first two are fail-CLOSED (startup crashes rather
+      # than fall back to an empty policy or an empty role map); the third is
+      # fail-soft (the console's engine panel silently shows no data).
+      SKILLSCAN_GATE_POLICY_PATH: /app/policies/gate/v1.yaml
+      SKILLSCAN_RBAC_GROUP_ROLE_MAP_PATH: /app/policies/rbac/group_role_map.yaml
+      SKILLSCAN_ENGINES_LOCK_PATH: /app/vendor/engines.lock.yaml
+      # ⚠ Without this, results are never collected: scans stay at `queued`,
+      # nothing errors, and the console shows a queue that never drains. It
+      # defaults to FALSE in code (deliberately - the test suite drives every
+      # tick explicitly and must not race a background consumer), so a
+      # deployment that leaves the key out gets the wrong value silently.
+      # Override to "false" only if a separate dedicated worker deployment runs
+      # these loops.
       SKILLSCAN_WORKER_ENABLED: "${SKILLSCAN_WORKER_ENABLED:-true}"
     volumes:
-      - blobstore_data:/app/var/blobstore
+      - type: volume
+        source: blobstore_data
+        target: *blobstore-root
     ports:
       - "8000:8000"
     healthcheck:
@@ -97,6 +273,83 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # The five real OSS detection engines (yara, bandit, osv-scanner,
+  # skillspector, aig-mcp-scan), all compiled/installed from the source
+  # committed under `vendor/` and asserted against `vendor/engines.lock.yaml`
+  # inside the build itself. Without this service the stack still runs and
+  # still returns verdicts - from the monolith's in-process floor engines
+  # alone, with the whole sandbox tier silently absent.
+  #
+  # SECURITY (INV-10): no `env_file`, no DB DSN, no Vault address, no IdP
+  # config - this process reaches the rest of the system only through the
+  # airlock (Redis control plane + the shared blob store). See the
+  # x-shared-engine-env anchor for why the handful of keys it does get are
+  # defined once and shared rather than restated here.
+  engine-runner:
+    build:
+      context: .
+      dockerfile: services/engine_runner/Dockerfile
+      args:
+        PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+        # osv-scanner's Go dependency graph. Vendoring osv-scanner's SOURCE did
+        # not vendor its Go modules - see docs/DEPLOYMENT_GUIDE.md §0's table.
+        GOPROXY: "${SKILLSCAN_GOPROXY:-}"
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      blobstore-init:
+        condition: service_completed_successfully
+    group_add:
+      - *blobstore-gid
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      <<: *shared-engine-env
+      SKILLSCAN_REDIS_URL: redis://redis:6379/0
+      SKILLSCAN_BLOBSTORE_ROOT: *blobstore-root
+      SKILLSCAN_ENGINE_RUNNER_READY_PORT: "8080"
+      # Optional, and only meaningful once SKILLSCAN_VLLM_BASE_URL is set: an
+      # internal model deployment that enforces its own auth and/or serves a
+      # specific named model. Not in the shared anchor - the monolith has no
+      # use for either, and INV-10 keeps this process's environment minimal.
+      SKILLSCAN_LLM_API_KEY: "${SKILLSCAN_LLM_API_KEY:-}"
+      SKILLSCAN_LLM_MODEL: "${SKILLSCAN_LLM_MODEL:-}"
+      # Per-engine subprocess timeouts. Left EMPTY on purpose, which means the
+      # built-in table (60s per engine, 240s for aig-mcp-scan). With no LLM
+      # endpoint configured - this file's default - aig-mcp-scan is not
+      # constructed at all, so the total is 4 x 60 = 240s against a 300s
+      # SKILLSCAN_SCAN_DEADLINE_S and the engine-runner's startup budget check
+      # stays quiet. Configure SKILLSCAN_VLLM_BASE_URL and the total becomes
+      # 480s > 300s, and it will say so at every start until
+      # SKILLSCAN_SCAN_DEADLINE_S is raised to match (>= 480) - which the
+      # shared anchor above then applies to BOTH processes at once, since
+      # raising it on the engine-runner alone only silences the warning without
+      # giving any engine more time.
+      SKILLSCAN_ENGINE_TIMEOUT_S: "${SKILLSCAN_ENGINE_TIMEOUT_S:-}"
+      SKILLSCAN_ENGINE_TIMEOUTS_JSON: "${SKILLSCAN_ENGINE_TIMEOUTS_JSON:-}"
+    volumes:
+      - type: volume
+        source: blobstore_data
+        target: *blobstore-root
+    # ⚠ This is what makes the shared-blobstore self-check observable instead
+    # of merely computed - the compose equivalent of the Helm chart's
+    # readinessProbe on the same endpoint. /readyz returns 503 once this
+    # process has been up past its grace window without seeing the monolith's
+    # probe file, which turns "the volume is not really shared" from a queue
+    # that never drains into an `unhealthy` line in `docker compose ps`.
+    #
+    # `start_period` is 90s deliberately: `SHARE_PROBE_GRACE_S` is 60s and
+    # /readyz answers 200 for the whole of it (the two processes never come up
+    # at the same instant), so a shorter window would only ever be measuring
+    # the grace period. Anything before 90s is not evidence of sharing.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
 
   web:
     build:

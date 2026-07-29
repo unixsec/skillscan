@@ -50,5 +50,23 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /scan
 COPY --from=builder /src/osv-scanner /usr/local/bin/osv-scanner
+# The pin manifest and its reader, for the guard below only - removed with it.
+COPY vendor/engines.lock.yaml /tmp/engines.lock.yaml
+COPY scripts/vendor_pinned_version.sh /usr/local/bin/vendor_pinned_version.sh
+
+# VERSION GUARD (INV-7), the same one services/engine_runner/Dockerfile applies
+# to the combined image - see that file's header for why this is a build step
+# and not a comment. This stage is why the helper is POSIX `sh` + `awk` rather
+# than bash: alpine has no bash, and a guard that cannot run in one of the four
+# engine images is a guard that gets quietly dropped from it.
+RUN set -eu; \
+    pin="$(vendor_pinned_version.sh /tmp/engines.lock.yaml osv_scanner)"; \
+    built="$(/usr/local/bin/osv-scanner --version 2>&1 | head -1 | awk '{print $3}')"; \
+    echo "osv-scanner  built=${built}  pinned=${pin}"; \
+    if [ "$built" != "$pin" ]; then \
+        echo "!!! osv-scanner ${built} != vendor/engines.lock.yaml's pinned ${pin}. Refusing." >&2; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/engines.lock.yaml /usr/local/bin/vendor_pinned_version.sh
 
 ENTRYPOINT ["/usr/local/bin/osv-scanner"]
