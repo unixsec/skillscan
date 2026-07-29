@@ -46,8 +46,7 @@ Both are idempotent and safe to run more often than hourly if a tighter RPO
 is ever needed - **not verified end-to-end in this environment** (no real
 MinIO `mc` CLI target / backup bucket available here beyond the local dev
 MinIO used for M3+ testing) - honestly labeled, same posture as this
-project's other environment-blocked verification gaps (see docs/stories/
-BACKLOG.md).
+project's other environment-blocked verification gaps.
 
 ## Restore (RTO 4h)
 

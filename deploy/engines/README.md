@@ -20,9 +20,11 @@ Go engines).
   `services/engine_runner/adapters/aig.py` — its real interface is a
   network-service scanner (`--target http://host:port` against a running
   inference endpoint), not a local file-bundle scanner, so it cannot serve
-  skillscan's actual need. See `vendor/VENDOR.md` and `docs/stories/
-  BACKLOG.md`'s S5 section for the full reasoning. With no adapter to run it,
-  there is no reason to build a runnable image for it here.
+  skillscan's actual need. Its `mcp-scan` subsystem does accept a local
+  directory and is adapted separately. See `vendor/VENDOR.md` and
+  `services/engine_runner/adapters/aig.py`'s module docstring for the full
+  reasoning. With no adapter to run it, there is no reason to build a runnable
+  image for it here.
 
 **No `cisco_skill_scanner/` directory, permanently:** it was never vendored
 (official repo unconfirmed across multiple research passes); its
@@ -30,7 +32,8 @@ Go engines).
 confirmed permanent. Its one real capability gap (multilingual/Chinese
 prompt-injection detection) is now covered by two in-house floor detectors
 instead (`inhouse-prompt-injection-zh`/`inhouse-jailbreak-inducement-zh`) —
-see `docs/superpowers/specs/2026-07-22-chinese-prompt-injection-detectors-design.md`.
+see `services/engine_runner/detectors/prompt_injection_zh.py` and
+`jailbreak_inducement_zh.py`, which cover PROMPT-01 and PROMPT-04.
 
 **Not verified:** no Docker daemon is available in this development
 environment, so none of these Dockerfiles have been built here — same
