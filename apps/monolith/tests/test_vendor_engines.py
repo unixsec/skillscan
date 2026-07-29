@@ -4,10 +4,10 @@ installed package surface - loaded here directly by file path rather than
 via a package import.
 
 Exercised against the REAL `vendor/engines.lock.yaml` and the REAL vendored
-git submodules already checked out in this repo (no mocking) wherever a
-test's whole point is to catch real drift/license regressions against
-actual vendor/submodule state (`verify-pins`/`license-scan` below) - a test
-against fake fixtures would prove nothing there. `TestVendoredEngines`'s
+engine source committed in this repo (no mocking) wherever a test's whole
+point is to catch real drift/license regressions against actual vendored
+state (`verify-pins`/`license-scan` below) - a test against fake fixtures
+would prove nothing there. `TestVendoredEngines`'s
 TBD-repo/missing-commit exclusion tests are the one exception: they exercise
 `vendored_engines()`'s pure filter logic itself, not any real vendor state,
 so a synthetic in-memory fixture is the more direct test.
@@ -89,46 +89,69 @@ class TestVendoredEngines:
         assert {"skillspector", "aig", "bandit", "osv_scanner", "yara"} <= set(vendored)
 
 
-class TestVerifyPinsAgainstRealSubmodules:
-    def test_real_vendored_submodules_match_their_recorded_pin(
+class TestVerifyPinsAgainstRealVendoredSource:
+    def test_real_vendored_source_matches_its_recorded_pin(
         self, real_engines: dict[str, dict[str, object]]
     ) -> None:
         failures = vendor_engines.verify_pins(real_engines)
         assert failures == []
 
-    def test_missing_submodule_directory_reported(
+    def test_missing_vendor_directory_reported(
         self, real_engines: dict[str, dict[str, object]], tmp_path: Path
     ) -> None:
         failures = vendor_engines.verify_pins(real_engines, vendor_dir=tmp_path)
         assert len(failures) == len(vendor_engines.vendored_engines(real_engines))
         assert all("does not exist" in f for f in failures)
 
-    def test_drifted_commit_detected(
+    def test_drifted_tree_detected(
         self, real_engines: dict[str, dict[str, object]], tmp_path: Path
     ) -> None:
         import subprocess
 
-        # A real, empty git repo checked out to a DIFFERENT commit than the
-        # one recorded in engines.lock.yaml for "bandit" - proves drift
-        # detection fires on a genuine mismatch, not just a missing directory.
-        bandit_dir = tmp_path / "bandit"
-        bandit_dir.mkdir()
-        subprocess.run(["git", "init", "-q"], cwd=bandit_dir, check=True)
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.com"], cwd=bandit_dir, check=True
-        )
-        subprocess.run(["git", "config", "user.name", "test"], cwd=bandit_dir, check=True)
-        (bandit_dir / "placeholder.txt").write_text("x")
-        subprocess.run(["git", "add", "."], cwd=bandit_dir, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "placeholder"], cwd=bandit_dir, check=True)
+        # A real, self-contained git repo whose committed vendor/bandit/ holds
+        # CONTENT DIFFERENT from the tree recorded in engines.lock.yaml -
+        # proves drift detection fires on a genuine content mismatch, not just
+        # on a missing directory.
+        #
+        # Deliberately built from scratch here rather than pointed at the outer
+        # checkout: this test then needs nothing from its environment and keeps
+        # passing where the repo arrives without `.git` (the dev VM's rsync).
+        bandit_dir = tmp_path / "vendor" / "bandit"
+        bandit_dir.mkdir(parents=True)
+        (bandit_dir / "placeholder.txt").write_text("not the real bandit source")
+        for argv in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "test@example.com"],
+            ["git", "config", "user.name", "test"],
+            ["git", "add", "."],
+            ["git", "commit", "-q", "-m", "placeholder"],
+        ):
+            subprocess.run(argv, cwd=tmp_path, check=True)
 
         single_engine = {"bandit": real_engines["bandit"]}
-        failures = vendor_engines.verify_pins(single_engine, vendor_dir=tmp_path)
+        failures = vendor_engines.verify_pins(
+            single_engine, vendor_dir=tmp_path / "vendor", repo_root=tmp_path
+        )
         assert len(failures) == 1
         assert "DRIFT" in failures[0]
 
+    def test_missing_tree_pin_reported(
+        self, real_engines: dict[str, dict[str, object]], tmp_path: Path
+    ) -> None:
+        # An engine recorded WITHOUT a `tree:` must be reported, never silently
+        # treated as verified - the whole point of the pin is fail-closed.
+        bandit_dir = tmp_path / "vendor" / "bandit"
+        bandit_dir.mkdir(parents=True)
+        spec = dict(real_engines["bandit"])
+        spec.pop("tree", None)
+        failures = vendor_engines.verify_pins(
+            {"bandit": spec}, vendor_dir=tmp_path / "vendor", repo_root=tmp_path
+        )
+        assert len(failures) == 1
+        assert "no `tree:` recorded" in failures[0]
 
-class TestLicenseScanAgainstRealSubmodules:
+
+class TestLicenseScanAgainstRealVendoredSource:
     def test_real_vendored_engines_pass_license_scan(
         self, real_engines: dict[str, dict[str, object]]
     ) -> None:
@@ -177,8 +200,18 @@ class TestCliCommands:
         exit_code = vendor_engines.main(["status"])
         assert exit_code == 0
         out = capsys.readouterr().out
+        # PRE-EXISTING FAILURE, fixed 2026-07-29: this asserted
+        # "adapter_status=not_built" for aig, true only until 2026-07-09, when
+        # the mcp-scan subsystem got a real adapter and engines.lock.yaml moved
+        # aig to `built` (VENDOR.md's "Adapter status" section records the same
+        # correction). The assertion has been wrong ever since and nobody saw
+        # it: deploy_and_test_vm.sh filters out EVERY test_vendor_engines.py
+        # failure, because the pin checks can never pass on a VM checkout that
+        # arrives without `.git`. A blanket per-file filter hides unrelated
+        # regressions in that file too - that is the real lesson here.
         assert "aig" in out
-        assert "adapter_status=not_built" in out
+        for engine in ("skillspector", "aig", "bandit", "osv_scanner", "yara"):
+            assert f"{engine:<12}  role=mandatory   adapter_status=built" in out
 
     def test_verify_pins_command_succeeds_against_real_repo_state(
         self, capsys: pytest.CaptureFixture[str]

@@ -1,0 +1,168 @@
+// Package config manages the configuration for osv-scanner.
+package config
+
+import (
+	"slices"
+	"time"
+
+	"github.com/google/osv-scalibr/extractor"
+	"github.com/google/osv-scanner/v2/internal/cachedregexp"
+	"github.com/google/osv-scanner/v2/internal/cmdlogger"
+	"github.com/google/osv-scanner/v2/internal/imodels"
+)
+
+var OSVScannerConfigName = "osv-scanner.toml"
+
+type Config struct {
+	IgnoredVulns      []*IgnoreEntry         `toml:"IgnoredVulns"`
+	PackageOverrides  []PackageOverrideEntry `toml:"PackageOverrides"`
+	GoVersionOverride string                 `toml:"GoVersionOverride"`
+	ScanGoModVersion  bool                   `toml:"ScanGoModVersion"`
+	// The path to config file that this config was loaded from,
+	// set by the scanner after having successfully parsed the file
+	LoadPath string `toml:"-"`
+}
+
+type IgnoreEntry struct {
+	ID          string    `toml:"id"`
+	IgnoreUntil time.Time `toml:"ignoreUntil"`
+	Reason      string    `toml:"reason"`
+
+	Used bool `toml:"-"`
+}
+
+func (ie *IgnoreEntry) MarkAsUsed() {
+	ie.Used = true
+}
+
+type PackageOverrideEntry struct {
+	Name string `toml:"name"`
+	// If the version is empty, the entry applies to all versions.
+	Version        string        `toml:"version"`
+	Ecosystem      string        `toml:"ecosystem"`
+	Group          string        `toml:"group"`
+	NameIsRegex    bool          `toml:"nameIsRegex"`
+	Ignore         bool          `toml:"ignore"`
+	Vulnerability  Vulnerability `toml:"vulnerability"`
+	License        License       `toml:"license"`
+	EffectiveUntil time.Time     `toml:"effectiveUntil"`
+	Reason         string        `toml:"reason"`
+}
+
+func (e PackageOverrideEntry) matches(pkg *extractor.Package) bool {
+	if e.Name != "" {
+		if e.NameIsRegex {
+			re, err := cachedregexp.Compile("^" + e.Name + "$")
+			if err != nil {
+				// This should not happen as regex is validated at config load time
+				return false
+			}
+			if !re.MatchString(imodels.Name(pkg)) {
+				return false
+			}
+		} else if e.Name != imodels.Name(pkg) {
+			return false
+		}
+	}
+	if e.Version != "" && e.Version != imodels.Version(pkg) {
+		return false
+	}
+	// If there is an ecosystem filter, the filter must not match both the:
+	//  - Full ecosystem + suffix
+	//  - The base ecosystem
+	if e.Ecosystem != "" && (e.Ecosystem != imodels.Ecosystem(pkg).String() && e.Ecosystem != string(imodels.Ecosystem(pkg).Ecosystem)) {
+		return false
+	}
+	if e.Group != "" && !slices.Contains(imodels.DepGroups(pkg), e.Group) {
+		return false
+	}
+
+	return true
+}
+
+type Vulnerability struct {
+	Ignore bool `toml:"ignore"`
+}
+
+type License struct {
+	Override []string `toml:"override"`
+	Ignore   bool     `toml:"ignore"`
+}
+
+func (c *Config) UnusedIgnoredVulns() []*IgnoreEntry {
+	unused := make([]*IgnoreEntry, 0, len(c.IgnoredVulns))
+
+	for _, entry := range c.IgnoredVulns {
+		if !entry.Used {
+			unused = append(unused, entry)
+		}
+	}
+
+	return unused
+}
+
+func (c *Config) ShouldIgnore(vulnID string) (bool, *IgnoreEntry) {
+	index := slices.IndexFunc(c.IgnoredVulns, func(e *IgnoreEntry) bool { return e.ID == vulnID })
+	if index == -1 {
+		return false, &IgnoreEntry{}
+	}
+	ignoredLine := c.IgnoredVulns[index]
+
+	return shouldIgnoreTimestamp(ignoredLine.IgnoreUntil), ignoredLine
+}
+
+func (c *Config) filterPackageVersionEntries(pkg *extractor.Package, condition func(PackageOverrideEntry) bool) (bool, PackageOverrideEntry) {
+	index := slices.IndexFunc(c.PackageOverrides, func(e PackageOverrideEntry) bool {
+		return e.matches(pkg) && condition(e)
+	})
+	if index == -1 {
+		return false, PackageOverrideEntry{}
+	}
+	ignoredLine := c.PackageOverrides[index]
+
+	return shouldIgnoreTimestamp(ignoredLine.EffectiveUntil), ignoredLine
+}
+
+// ShouldIgnorePackage determines if the given package should be ignored based on override entries in the config
+func (c *Config) ShouldIgnorePackage(pkg *extractor.Package) (bool, PackageOverrideEntry) {
+	return c.filterPackageVersionEntries(pkg, func(e PackageOverrideEntry) bool {
+		return e.Ignore
+	})
+}
+
+// ShouldIgnorePackageVulnerabilities determines if the given package should have its vulnerabilities ignored based on override entries in the config
+func (c *Config) ShouldIgnorePackageVulnerabilities(pkg *extractor.Package) bool {
+	overrides, _ := c.filterPackageVersionEntries(pkg, func(e PackageOverrideEntry) bool {
+		return e.Vulnerability.Ignore
+	})
+
+	return overrides
+}
+
+// ShouldOverridePackageLicense determines if the given package should have its license ignored or changed based on override entries in the config
+func (c *Config) ShouldOverridePackageLicense(pkg *extractor.Package) (bool, PackageOverrideEntry) {
+	return c.filterPackageVersionEntries(pkg, func(e PackageOverrideEntry) bool {
+		return e.License.Ignore || len(e.License.Override) > 0
+	})
+}
+
+func shouldIgnoreTimestamp(ignoreUntil time.Time) bool {
+	if ignoreUntil.IsZero() {
+		// If IgnoreUntil is not set, should ignore.
+		return true
+	}
+	// Should ignore if IgnoreUntil is still after current time
+	// Takes timezone offsets into account if it is specified. otherwise it's using local time
+	return ignoreUntil.After(time.Now())
+}
+
+func (c *Config) warnAboutDuplicates() {
+	seen := make(map[string]struct{})
+
+	for _, vuln := range c.IgnoredVulns {
+		if _, ok := seen[vuln.ID]; ok {
+			cmdlogger.Warnf("warning: %s has multiple ignores for %s - only the first will be used!", c.LoadPath, vuln.ID)
+		}
+		seen[vuln.ID] = struct{}{}
+	}
+}

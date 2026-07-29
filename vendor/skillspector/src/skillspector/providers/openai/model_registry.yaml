@@ -1,0 +1,14 @@
+# Token-budget metadata for the OpenAIProvider (stock api.openai.com or any
+# OpenAI-compatible endpoint via OPENAI_BASE_URL).  Bundled with the
+# package; consulted whenever the active provider is OpenAIProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+
+models:
+  "gpt-5.4":
+    context_length: 1000000
+    max_output_tokens: 128000

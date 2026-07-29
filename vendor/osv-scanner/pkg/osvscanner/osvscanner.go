@@ -1,0 +1,576 @@
+package osvscanner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"net/http"
+	"os"
+	"slices"
+	"sort"
+	"time"
+
+	scalibr "github.com/google/osv-scalibr"
+	"github.com/google/osv-scalibr/artifact/image/layerscanning/image"
+	"github.com/google/osv-scalibr/binary/proto"
+	"github.com/google/osv-scalibr/clients/datasource"
+	"github.com/google/osv-scalibr/extractor"
+	"github.com/google/osv-scalibr/extractor/filesystem/language/golang/gomod"
+	"github.com/google/osv-scalibr/inventory"
+	scalibrlog "github.com/google/osv-scalibr/log"
+	"github.com/google/osv-scalibr/plugin"
+	"github.com/google/osv-scalibr/stats"
+	"github.com/google/osv-scanner/v2/internal/clients/clientimpl/licensematcher"
+	"github.com/google/osv-scanner/v2/internal/clients/clientimpl/localmatcher"
+	"github.com/google/osv-scanner/v2/internal/clients/clientimpl/osvmatcher"
+	"github.com/google/osv-scanner/v2/internal/clients/clientinterfaces"
+	"github.com/google/osv-scanner/v2/internal/cmdlogger"
+	"github.com/google/osv-scanner/v2/internal/config"
+	"github.com/google/osv-scanner/v2/internal/depsdev"
+	"github.com/google/osv-scanner/v2/internal/imodels"
+	"github.com/google/osv-scanner/v2/internal/imodels/results"
+	"github.com/google/osv-scanner/v2/internal/output"
+	"github.com/google/osv-scanner/v2/pkg/models"
+	"github.com/google/osv-scanner/v2/pkg/osvscanner/internal/imagehelpers"
+	"github.com/ossf/osv-schema/bindings/go/osvconstants"
+	"osv.dev/bindings/go/osvdev"
+)
+
+type ScannerActions struct {
+	ExperimentalScannerActions
+
+	LockfilePaths      []string
+	DirectoryPaths     []string
+	GitCommits         []string
+	Recursive          bool
+	IncludeGitRoot     bool
+	NoIgnore           bool
+	Image              string
+	IsImageArchive     bool
+	ConfigOverridePath string
+	CallAnalysisStates map[string]bool
+	ShowAllPackages    bool
+	ShowAllVulns       bool
+
+	// local databases
+	CompareOffline    bool
+	DownloadDatabases bool
+	LocalDBPath       string
+
+	// network-backed plugins
+	PluginNetworkDisabled bool
+
+	// license scanning
+	ScanLicensesSummary   bool
+	ScanLicensesAllowlist []string
+
+	// Deprecated: in favor of LockfilePaths
+	SBOMPaths []string
+}
+
+type ExperimentalScannerActions struct {
+	ExcludePatterns    []string
+	TransitiveScanning TransitiveScanningActions
+
+	PluginsEnabled    []string
+	PluginsDisabled   []string
+	PluginsNoDefaults bool
+
+	// Currently unused.
+	// TODO(another-rex): Use or wrap this
+	StatsCollector stats.Collector
+
+	HTTPClient *http.Client
+
+	// Report deprecated packages as findings
+	FlagDeprecatedPackages bool
+
+	// Allows specifying user agent
+	RequestUserAgent string
+}
+
+type TransitiveScanningActions struct {
+	Disabled         bool
+	NativeDataSource bool
+	MavenRegistry    string
+}
+
+type ExternalAccessors struct {
+	// Matchers
+	VulnMatcher    clientinterfaces.VulnerabilityMatcher
+	LicenseMatcher clientinterfaces.LicenseMatcher
+
+	// Required for vendored Extractor
+	OSVDevClient *osvdev.OSVClient
+}
+
+// ErrNoPackagesFound for when no packages are found during a scan.
+var ErrNoPackagesFound = errors.New("no packages found in scan")
+
+// ErrVulnerabilitiesFound includes vulnerabilities, license violations, and package deprecation,
+// however, will not be raised if only uncalled vulnerabilities are found.
+var ErrVulnerabilitiesFound = errors.New("vulnerabilities found")
+
+// ErrAPIFailed describes errors related to querying API endpoints.
+// TODO(v2): Actually use this error
+var ErrAPIFailed = errors.New("API query failed")
+
+func initializeExternalAccessors(actions ScannerActions) (ExternalAccessors, error) {
+	externalAccessors := ExternalAccessors{}
+	var err error
+
+	userAgent := "osv-scanner-api"
+	if actions.RequestUserAgent != "" {
+		userAgent = actions.RequestUserAgent
+	}
+
+	// Offline Mode
+	// ------------
+	if actions.CompareOffline {
+		// --- Vulnerability Matcher ---
+		externalAccessors.VulnMatcher, err =
+			localmatcher.NewLocalMatcher(actions.LocalDBPath,
+				userAgent, actions.DownloadDatabases)
+		if err != nil {
+			return ExternalAccessors{}, err
+		}
+
+		return externalAccessors, nil
+	}
+
+	// Online Mode
+	// -----------
+	// --- Vulnerability Matcher ---
+	externalAccessors.VulnMatcher = osvmatcher.New(5*time.Minute, userAgent, actions.HTTPClient)
+
+	// --- License Matcher ---
+	if len(actions.ScanLicensesAllowlist) > 0 || actions.ScanLicensesSummary {
+		depsDevAPIClient, err := datasource.NewCachedInsightsClient(depsdev.DepsdevAPI, userAgent)
+		if err != nil {
+			return ExternalAccessors{}, err
+		}
+
+		externalAccessors.LicenseMatcher = &licensematcher.DepsDevLicenseMatcher{
+			Client: depsDevAPIClient,
+		}
+	}
+
+	// --- OSV.dev Client ---
+	// We create a separate client from VulnMatcher to keep things clean.
+	externalAccessors.OSVDevClient = osvdev.DefaultClient()
+	externalAccessors.OSVDevClient.Config.UserAgent = userAgent
+
+	return externalAccessors, nil
+}
+
+// DoScan performs the osv scanner action, with optional reporter to output information
+func DoScan(actions ScannerActions) (models.VulnerabilityResults, error) {
+	// --- Sanity check flags ----
+	// TODO(v2): Move the logic of the offline flag changing other flags into here from the main.go/scan.go
+	if actions.CompareOffline {
+		if actions.ScanLicensesSummary {
+			return models.VulnerabilityResults{}, errors.New("cannot retrieve licenses locally")
+		}
+	}
+
+	if !actions.CompareOffline && actions.DownloadDatabases {
+		return models.VulnerabilityResults{}, errors.New("databases can only be downloaded when running in offline mode")
+	}
+
+	scanResults := results.ScanResults{
+		ConfigManager: config.Manager{
+			DefaultConfig: config.Config{},
+			ConfigMap:     make(map[string]config.Config),
+		},
+	}
+
+	// --- Setup Config ---
+	if actions.ConfigOverridePath != "" {
+		err := scanResults.ConfigManager.UseOverride(actions.ConfigOverridePath)
+		if err != nil {
+			cmdlogger.Errorf("Failed to read config file: %s", err)
+			return models.VulnerabilityResults{}, err
+		}
+	}
+
+	// --- Setup Accessors/Clients ---
+	accessors, err := initializeExternalAccessors(actions)
+	if err != nil {
+		return models.VulnerabilityResults{}, fmt.Errorf("failed to initialize accessors: %w", err)
+	}
+
+	// ----- Perform Scanning -----
+	packagesAndFindings, err := scan(accessors, actions)
+	if err != nil {
+		return models.VulnerabilityResults{}, err
+	}
+
+	scanResults.Inventory = *packagesAndFindings
+
+	// ----- Filtering -----
+	unscannablePackages := filterUnscannablePackages(&scanResults, actions)
+	filterIgnoredPackages(&scanResults)
+
+	// ----- Custom Overrides -----
+	filterAndOverrideGoVersion(&scanResults)
+
+	// --- Make Vulnerability Requests ---
+	if accessors.VulnMatcher != nil {
+		err = makeVulnRequestWithMatcher(&scanResults, accessors.VulnMatcher)
+		if err != nil {
+			return models.VulnerabilityResults{}, err
+		}
+	}
+
+	// --- Make License Requests ---
+	if accessors.LicenseMatcher != nil {
+		err = accessors.LicenseMatcher.MatchLicenses(context.Background(), scanResults.Inventory.Packages)
+		if err != nil {
+			return models.VulnerabilityResults{}, err
+		}
+	}
+
+	// todo: this previously wasn't being applied to Inventory - did we have a bug...?
+	if len(unscannablePackages) > 0 {
+		scanResults.Inventory.Packages = slices.Concat(scanResults.Inventory.Packages, unscannablePackages)
+	}
+
+	return finalizeScanResult(scanResults, actions)
+}
+
+func DoContainerScan(actions ScannerActions) (models.VulnerabilityResults, error) {
+	scanResults := results.ScanResults{
+		ConfigManager: config.Manager{
+			DefaultConfig: config.Config{},
+			ConfigMap:     make(map[string]config.Config),
+		},
+	}
+
+	if actions.ConfigOverridePath != "" {
+		err := scanResults.ConfigManager.UseOverride(actions.ConfigOverridePath)
+		if err != nil {
+			cmdlogger.Errorf("Failed to read config file: %s", err)
+			return models.VulnerabilityResults{}, err
+		}
+	}
+
+	// --- Setup Accessors/Clients ---
+	accessors, err := initializeExternalAccessors(actions)
+	if err != nil {
+		return models.VulnerabilityResults{}, fmt.Errorf("failed to initialize accessors: %w", err)
+	}
+
+	plugins := getPlugins(
+		[]string{"artifact"},
+		accessors,
+		actions,
+	)
+
+	// technically having one detector enabled would also be sufficient, but we're
+	// not mentioning them to avoid confusion since they're still in their infancy
+	if countNotEnrichers(plugins) == 0 {
+		return models.VulnerabilityResults{}, errors.New("at least one extractor must be enabled")
+	}
+
+	// --- Initialize Image To Scan ---'
+
+	// TODO: Setup context at the start of the run
+	ctx := context.TODO()
+
+	var img *image.Image
+	if actions.IsImageArchive {
+		cmdlogger.Infof("Scanning local image tarball %q", actions.Image)
+		img, err = image.FromTarball(actions.Image, image.DefaultConfig())
+	} else if actions.Image != "" {
+		path, exportErr := imagehelpers.ExportDockerImage(ctx, actions.Image)
+		if exportErr != nil {
+			return models.VulnerabilityResults{}, exportErr
+		}
+		defer os.Remove(path)
+
+		img, err = image.FromTarball(path, image.DefaultConfig())
+		// actions.Image is user-controlled; sanitize \r/\n before logging to
+		// prevent GitHub Actions workflow command injection.
+		cmdlogger.Infof("Scanning image %q", output.SanitizeForWorkflowCommand(actions.Image))
+	}
+	if err != nil {
+		return models.VulnerabilityResults{}, err
+	}
+
+	defer func() {
+		err := img.CleanUp()
+		if err != nil {
+			cmdlogger.Errorf("Failed to clean up image: %s", err)
+		}
+	}()
+
+	capabilities := &plugin.Capabilities{
+		DirectFS:           true,
+		RunningSystem:      false,
+		Network:            networkCapability(actions),
+		OS:                 plugin.OSLinux,
+		AllowUnsafePlugins: true,
+	}
+
+	plugins = plugin.FilterByCapabilities(plugins, capabilities)
+
+	// --- Do Scalibr Scan ---
+	scanner := scalibr.New()
+	scalibrSR, err := scanner.ScanContainer(context.Background(), img, &scalibr.ScanConfig{
+		Plugins:           plugins,
+		Capabilities:      capabilities,
+		StoreAbsolutePath: true,
+		ExplicitPlugins:   true,
+	})
+	if err != nil {
+		return models.VulnerabilityResults{}, fmt.Errorf("failed to scan container image: %w", err)
+	}
+
+	if inventoryIsEmpty(scalibrSR.Inventory) {
+		return models.VulnerabilityResults{}, ErrNoPackagesFound
+	}
+
+	// --- Save Scalibr Scan Results ---
+	scanResults.Inventory = scalibrSR.Inventory
+
+	// --- Fill Image Metadata ---
+	pssr, err := proto.ScanResultToProto(scalibrSR)
+	if err != nil {
+		return models.VulnerabilityResults{}, fmt.Errorf("failed to serialize scan results to proto: %w", err)
+	}
+
+	if len(pssr.GetInventory().GetContainerImageMetadata()) > 0 {
+		scanResults.ImageMetadata = pssr.GetInventory().GetContainerImageMetadata()[0]
+	} else {
+		cmdlogger.Warnf("No container image metadata found in scan results")
+	}
+
+	// ----- Filtering -----
+	unscannablePackages := filterUnscannablePackages(&scanResults, actions)
+	filterIgnoredPackages(&scanResults)
+
+	filterNonContainerRelevantPackages(&scanResults)
+
+	// --- Make Vulnerability Requests ---
+	if accessors.VulnMatcher != nil {
+		err = makeVulnRequestWithMatcher(&scanResults, accessors.VulnMatcher)
+		if err != nil {
+			return models.VulnerabilityResults{}, err
+		}
+	}
+
+	// --- Make License Requests ---
+	if accessors.LicenseMatcher != nil {
+		err = accessors.LicenseMatcher.MatchLicenses(context.Background(), scanResults.Inventory.Packages)
+		if err != nil {
+			return models.VulnerabilityResults{}, err
+		}
+	}
+
+	// todo: this previously wasn't being applied to Inventory - did we have a bug...?
+	if len(unscannablePackages) > 0 {
+		scanResults.Inventory.Packages = slices.Concat(scanResults.Inventory.Packages, unscannablePackages)
+	}
+
+	return finalizeScanResult(scanResults, actions)
+}
+
+func finalizeScanResult(scanResult results.ScanResults, actions ScannerActions) (models.VulnerabilityResults, error) {
+	vulnerabilityResults := buildVulnerabilityResults(actions, &scanResult)
+
+	if actions.ScanLicensesSummary {
+		vulnerabilityResults.LicenseSummary = buildLicenseSummary(&scanResult)
+	}
+
+	filtered := filterResults(&vulnerabilityResults, &scanResult.ConfigManager, actions.ShowAllPackages)
+	if filtered > 0 {
+		cmdlogger.Infof(
+			"Filtered %d %s from output",
+			filtered,
+			output.Form(filtered, "vulnerability", "vulnerabilities"),
+		)
+	}
+
+	if unusedIgnoredEntries := scanResult.ConfigManager.GetUnusedIgnoreEntries(); len(unusedIgnoredEntries) != 0 {
+		configFiles := slices.Collect(maps.Keys(unusedIgnoredEntries))
+		slices.Sort(configFiles)
+
+		for _, configFile := range configFiles {
+			cmdlogger.Warnf("%s has unused ignores:", configFile)
+
+			for _, iv := range unusedIgnoredEntries[configFile] {
+				cmdlogger.Warnf(" - %s", iv.ID)
+			}
+		}
+	}
+
+	return vulnerabilityResults, determineReturnErr(vulnerabilityResults, actions.ShowAllVulns)
+}
+
+func buildLicenseSummary(scanResults *results.ScanResults) []models.LicenseCount {
+	var licenseSummary []models.LicenseCount
+
+	counts := make(map[string]int)
+	for _, pkg := range scanResults.Inventory.Packages {
+		for _, l := range pkg.Licenses {
+			counts[l] += 1
+		}
+	}
+
+	if len(counts) == 0 {
+		// No packages found.
+		return []models.LicenseCount{}
+	}
+
+	licenses := slices.AppendSeq(make([]string, 0, len(counts)), maps.Keys(counts))
+
+	// Sort the license count in descending count order with the UNKNOWN
+	// license last.
+	sort.Slice(licenses, func(i, j int) bool {
+		if licenses[i] == "UNKNOWN" {
+			return false
+		}
+		if licenses[j] == "UNKNOWN" {
+			return true
+		}
+		if counts[licenses[i]] == counts[licenses[j]] {
+			return licenses[i] < licenses[j]
+		}
+
+		return counts[licenses[i]] > counts[licenses[j]]
+	})
+
+	licenseSummary = make([]models.LicenseCount, len(licenses))
+	for i, license := range licenses {
+		licenseSummary[i].Name = models.License(license)
+		licenseSummary[i].Count = counts[license]
+	}
+
+	return licenseSummary
+}
+
+// determineReturnErr determines whether we found a "vulnerability" or not,
+// and therefore whether we should return a ErrVulnerabilityFound error.
+func determineReturnErr(vulnResults models.VulnerabilityResults, showAllVulns bool) error {
+	if len(vulnResults.Results) > 0 {
+		var vuln bool
+		onlyUnimportantVuln := true
+		var licenseViolation bool
+		deprecated := false
+		for _, vf := range vulnResults.Flatten() {
+			if vf.Vulnerability != nil && vf.Vulnerability.GetId() != "" {
+				vuln = true
+				// TODO(gongh): rewrite the logic once we support reachability analysis for container scanning.
+				if vf.GroupInfo.IsCalled() && !vf.GroupInfo.IsGroupUnimportant() {
+					onlyUnimportantVuln = false
+				}
+			}
+			if len(vf.LicenseViolations) > 0 {
+				licenseViolation = true
+			}
+			if vf.Deprecated {
+				deprecated = true
+			}
+		}
+
+		if !vuln && !licenseViolation && !deprecated {
+			return nil
+		}
+
+		onlyUnimportantVuln = onlyUnimportantVuln && vuln && !licenseViolation && !deprecated
+
+		// If the user didn't enable showing all vulns and we only found unimportant ones,
+		// we should return without error.
+		if !showAllVulns && onlyUnimportantVuln {
+			// There is no error.
+			return nil
+		}
+
+		return ErrVulnerabilitiesFound
+	}
+
+	return nil
+}
+
+// TODO(V2): Add context
+func makeVulnRequestWithMatcher(
+	scanResults *results.ScanResults,
+	matcher clientinterfaces.VulnerabilityMatcher,
+) error {
+	res, err := matcher.MatchVulnerabilities(context.Background(), scanResults.Inventory.Packages)
+	if err != nil {
+		cmdlogger.Errorf("error when retrieving vulns: %v", err)
+		if res == nil {
+			return err
+		}
+	}
+
+	for i, vulns := range res {
+		for _, vuln := range vulns {
+			scanResults.Inventory.PackageVulns = append(scanResults.Inventory.PackageVulns, &inventory.PackageVuln{
+				Vulnerability: vuln,
+				Package:       scanResults.Inventory.Packages[i],
+			})
+		}
+	}
+
+	return nil
+}
+
+// Filters out Go version or Overrides it using osv-scanner.toml
+func filterAndOverrideGoVersion(scanResults *results.ScanResults) {
+	// Filter inventory packages
+	scanResults.Inventory.Packages = slices.DeleteFunc(scanResults.Inventory.Packages, func(pkg *extractor.Package) bool {
+		if imodels.Name(pkg) == "stdlib" && imodels.Ecosystem(pkg).Ecosystem == osvconstants.EcosystemGo {
+			// Only apply the filter if it's from a go.mod file.
+			// The 'go' directive in go.mod specifies the minimum required language version,
+			// not the actual toolchain version used to build/run, which can lead to false positives.
+			// We still want to scan binary stdlib versions as they represent the actual toolchain used.
+			if slices.Contains(pkg.Plugins, gomod.Name) {
+				configToUse := scanResults.ConfigManager.Get(imodels.Location(pkg))
+
+				return !configToUse.ScanGoModVersion
+			}
+		}
+
+		return false
+	})
+
+	// Override versions for remaining inventory packages
+	for i, pkg := range scanResults.Inventory.Packages {
+		if imodels.Name(pkg) == "stdlib" && imodels.Ecosystem(pkg).Ecosystem == osvconstants.EcosystemGo {
+			configToUse := scanResults.ConfigManager.Get(imodels.Location(pkg))
+			if configToUse.GoVersionOverride != "" {
+				scanResults.Inventory.Packages[i].Version = configToUse.GoVersionOverride
+			}
+		}
+	}
+}
+
+// SetLogger sets the global slog handler for the cmdlogger.
+func SetLogger(handler slog.Handler) {
+	baseHandler := cmdlogger.NewOverride(handler)
+	logger := slog.New(baseHandler)
+	cmdlogger.GlobalLogger = logger
+	scalibrlog.SetLogger(&cmdlogger.ScalibrAdapter{Logger: logger})
+}
+
+// inventoryIsEmpty ignores image metadata when checking if an inventory is empty
+func inventoryIsEmpty(i inventory.Inventory) bool {
+	if len(i.Packages) != 0 {
+		return false
+	}
+	if len(i.PackageVulns) != 0 {
+		return false
+	}
+	if len(i.GenericFindings) != 0 {
+		return false
+	}
+	if len(i.Secrets) != 0 {
+		return false
+	}
+
+	return true
+}

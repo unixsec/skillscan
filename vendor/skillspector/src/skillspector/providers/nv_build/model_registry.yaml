@@ -1,0 +1,28 @@
+# Token-budget metadata for the NvBuildProvider (build.nvidia.com /
+# integrate.api.nvidia.com).  Bundled with the package; consulted whenever
+# the active provider is NvBuildProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+#
+# Add an entry for any model you intend to use against build.nvidia.com.
+# Stock OpenAI IDs (gpt-5.2, gpt-5.3-chat, ...) work transparently when the
+# endpoint proxies to OpenAI; NVIDIA-curated NIMs (e.g. meta/llama-3.1-...)
+# can be added as needed.
+
+models:
+  # NVIDIA-curated NIMs on build.nvidia.com.
+  "deepseek-ai/deepseek-v4-pro":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "deepseek-ai/deepseek-v4-flash":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "openai/gpt-oss-120b":
+    context_length: 128000
+    max_output_tokens: 16384

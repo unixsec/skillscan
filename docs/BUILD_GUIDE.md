@@ -70,20 +70,34 @@ npm run lint    # oxlint（SessionContext.tsx/I18nContext.tsx 的 2-3 条 warnin
 ## 4. OSS 引擎 vendoring（编码规格 §10A）
 
 ```bash
-git submodule update --init --recursive     # 拉取已 vendor 的引擎子模块源码
+# 无需任何 submodule 步骤——引擎源码已直接提交进本仓库，`git clone` 就带着它
 uv run python3 scripts/vendor_engines.py verify-pins    # 核对 vendor/engines.lock.yaml 的 pin
 uv run python3 scripts/vendor_engines.py license-scan   # 许可证扫描（仅 Apache/BSD/MIT 放行）
 uv run python3 scripts/vendor_engines.py status
 ```
 
-5 个引擎已 vendor（skillspector/aig/bandit/osv_scanner/yara）。4 个适配器（bandit/osv/yara/
-skillspector）已实现，AIG 的顶层 CLI 是网络服务扫描器（`--target http://host:port`），不扫本地文件包，
-因此顶层能力**有意不做适配器**；其 `mcp-scan` 子系统确实接受本地目录，已单独适配。Cisco skill-scanner 从未 vendor（官方仓库地址从未确认），其
-候选能力缺口（多语言/非英文提示词注入检测）已由自研中文 floor 检测器填补
-（`services/engine_runner/detectors/prompt_injection_zh.py`、`jailbreak_inducement_zh.py`）。
+**2026-07-29 起 `vendor/<engine>/` 不再是 git submodule**，五个引擎的源码直接提交在本仓库
+里（企业部署目标是隔离网，`git submodule update --init --recursive` 需要能访问 github.com，
+所以那条路走不通）。pin 没有变：提交进来的树就是 `engines.lock.yaml` 里原本记录的那些
+commit 的树。`verify-pins` 现在比对的是 **tree hash**（`git rev-parse HEAD:vendor/<engine>`
+对上 lock 文件里的 `tree:` 字段），不再是 submodule 的 HEAD——tree hash 覆盖目录下每一个
+路径、模式和字节，因此连"改过 vendor 源码"（§10A.1 明令禁止）也一并能查出来。它需要一个
+真实的 git checkout：源码导出包（无 `.git`）跑不了这个检查，会明确报错而不是假装通过。
 
-`scripts/vendor_engines.py` **有意不**自动化 `git submodule add` 本身——拉入新的第三方源码
-是一次性、需要人工确认的网络操作，不应被脚本静默执行。
+升级 pin 的完整步骤见 `vendor/VENDOR.md`——**不要**用 `cp`/`rsync` + `git add` 替换 vendor
+目录，macOS 的大小写不敏感文件系统会静默丢文件（仅 aig 就有 466 个只差大小写的路径）。
+
+5 个引擎已 vendor（skillspector/aig/bandit/osv_scanner/yara），5 个适配器均已实现。其中 AIG
+是**部分适配**：其顶层 CLI（`ai-infra-guard scan`）确实是网络服务扫描器、无法用于本地文件包
+扫描，但 `mcp-scan/main.py --repo <dir>` 是另一个子系统，接受本地目录并输出可解析结果，
+2026-07-09 起已有适配器（`services/engine_runner/adapters/aig.py`，仅在配置了内网推理端点时
+构造，INV-14）。详见 `vendor/VENDOR.md` 的 "Adapter status" 一节。Cisco skill-scanner 从未
+vendor（官方仓库地址从未确认），其候选能力缺口（多语言/非英文提示词注入检测）已由自研中文
+floor 检测器填补（`services/engine_runner/detectors/prompt_injection_zh.py`、
+`jailbreak_inducement_zh.py`）。
+
+`scripts/vendor_engines.py` **有意不**自动化"拉入新上游源码"这个动作本身——那是一次性、需要
+项目所有者确认的网络操作，不应被脚本静默执行。
 
 **审计修复（2026-07-06）：** skillspector 引擎适配器新增 `osv_proxy_url` 可选参数
 (`services/engine_runner/adapters/skillspector.py`)——vendored 的 `osv_client.py` 内部用

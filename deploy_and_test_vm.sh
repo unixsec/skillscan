@@ -281,10 +281,18 @@ pytest_rc=$?
 set -e
 echo "$pytest_out" | tail -100
 
-# test_vendor_engines.py's pin checks compare each vendored submodule against
-# its recorded commit via `git -C vendor/<x> rev-parse HEAD`. This VM's checkout
-# arrives by rsync with `--exclude=.git`, so those three tests can NEVER pass
-# here - they are an environment fact, not a regression.
+# test_vendor_engines.py's pin checks compare the committed git tree of each
+# vendor/<engine>/ against the `tree:` recorded in engines.lock.yaml, via
+# `git -C <repo> rev-parse HEAD:vendor/<x>`. This VM's checkout arrives by rsync
+# with `--exclude=.git`, so those tests can NEVER pass here - they are an
+# environment fact, not a regression. (Before 2026-07-29 the same checks read
+# each submodule's own HEAD; the engines are committed source now, but the
+# dependency on a real git checkout is unchanged.)
+#
+# CAVEAT, learned 2026-07-29: this filter is per-FILE, not per-test, so it also
+# suppresses failures in test_vendor_engines.py that have nothing to do with
+# `.git` - one stale assertion sat green-by-omission here for months. If that
+# file grows non-pin tests, narrow this to the pin tests by name.
 #
 # Filtering them out is what makes this script's exit code a TRUSTWORTHY signal:
 # leaving them in meant every single run exited non-zero, so a red exit code

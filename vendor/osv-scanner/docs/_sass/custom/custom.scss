@@ -1,0 +1,60 @@
+// Always show child pages in the navigation menu
+// https://github.com/just-the-docs/just-the-docs/issues/245#issuecomment-656334333
+.nav-list .nav-list-item > .nav-list {
+  display: block !important;
+}
+
+// Hide the child page expand arrow, since it doesn't do anything
+.nav-list .nav-list-expander {
+  display: none !important;
+}
+
+:not(pre, figure) code {
+  padding: 0.2rem 0.35rem !important;
+  font-size: 0.85em;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family:
+    "Overpass",
+    system-ui,
+    -apple-system,
+    sans-serif;
+}
+
+table {
+  border-collapse: collapse;
+
+  th {
+    border-bottom-width: 2px;
+  }
+}
+
+.site-title {
+  padding-top: 15px !important;
+}
+
+// Fix callout styling regression introduced in just-the-docs v0.11.0 which
+// replaced the colored background fill with an all-sides border outline.
+
+@mixin callout-fix($bg-color, $border-color) {
+  border: none;
+  border-left: $border-radius solid $border-color;
+  background: rgba($bg-color, 0.2);
+}
+
+p.note,
+blockquote.note {
+  @include callout-fix($purple-000, $purple-300);
+}
+p.warning,
+blockquote.warning {
+  @include callout-fix($red-000, $red-300);
+}
+p.highlight,
+blockquote.highlight {
+  @include callout-fix($yellow-000, $yellow-300);
+}

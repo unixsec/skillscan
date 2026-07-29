@@ -1,0 +1,42 @@
+# Model registry — context window and output token limits.
+#
+# Point SKILLSPECTOR_MODEL_REGISTRY at this file (or your own) so the tool
+# knows each model's token budget.  This is the fallback when the dynamic
+# metadata API is unavailable (e.g. open-source deployments).
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+
+models:
+  # Stock OpenAI model IDs (for direct api.openai.com or compatible endpoints).
+  "gpt-5.2":
+    context_length: 400000
+    max_output_tokens: 128000
+
+  "gpt-5.3-chat":
+    context_length: 128000
+    max_output_tokens: 16384
+
+  # Provider-prefixed IDs for inference gateways that accept them.
+  "azure/anthropic/claude-opus-4-5":
+    context_length: 200000
+    max_output_tokens: 64000
+
+  "azure/anthropic/claude-sonnet-4-6":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "azure/anthropic/claude-opus-4-6":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "openai/openai/gpt-5.2":
+    context_length: 400000
+    max_output_tokens: 128000
+
+  "openai/openai/gpt-5.3-chat":
+    context_length: 128000
+    max_output_tokens: 16384

@@ -1,0 +1,130 @@
+---
+layout: page
+permalink: /configuration/
+nav_order: 5
+---
+
+# Configuration
+
+To configure scanning, place an osv-scanner.toml file in the scanned file's directory. This does not propagate to child directories.
+
+**Example:**
+
+```
+/Cargo.lock
+/osv-scanner.toml (1)
+/child-dir/go.mod
+/child-dir/osv-scanner.toml (2)
+/child-dir/nested-dir/package-lock.json
+```
+
+`osv-scanner.toml (1)` will only apply to `Cargo.lock`, `osv-scanner.toml (2)` will only apply to `go.mod`, and no config will apply to `package-lock.json`.
+
+To override `osv-scanner.toml` files, pass the `--config=/path/to/config.toml` flag with the path to the configuration you want to apply instead, this will apply `config.toml` to all files parsed, and ignore `osv-scanner.toml` in all directories.
+
+## Ignore vulnerabilities by ID
+
+To ignore a vulnerability, enter the ID under the `IgnoreVulns` key. Optionally, add an expiry date or reason.
+
+### Example
+
+```toml
+[[IgnoredVulns]]
+id = "GO-2022-0968"
+# ignoreUntil = 2022-11-09 # Optional exception expiry date
+reason = "No ssh servers are connected to or hosted in Go lang"
+
+[[IgnoredVulns]]
+id = "GO-2022-1059"
+# ignoreUntil = 2022-11-09 # Optional exception expiry date
+reason = "No external http servers are written in Go lang."
+```
+
+Ignoring a vulnerability will also ignore vulnerabilities that are considered aliases of that vulnerability.
+
+## Override packages
+
+You can specify overrides for particular packages to have them either ignored entirely or to set their license using the `PackageOverrides` key:
+
+```toml
+[[PackageOverrides]]
+# One or more fields to match each package against:
+name = "lib"
+# nameIsRegex = true # Optional: treat name as a regular expression pattern
+version = "1.0.0"
+ecosystem = "Go"
+group = "dev"
+
+# Actions to take for matching packages:
+ignore = true # Ignore this package completely, including both reporting vulnerabilities and license violations
+vulnerability.ignore = true # Ignore vulnerabilities for this package, while still checking the license (if not also ignored)
+license.ignore = true # Ignore the license of the package, while still checking for vulnerabilities (if not also ignored)
+license.override = ["MIT", "0BSD"] # Override the license of the package, if it is not ignored from license scanning completely
+
+effectiveUntil = 2022-11-09 # Optional exception expiry date, after which the override will no longer apply
+reason = "abc" # Optional reason for the override, to explain why it was added
+```
+
+Overrides are applied if all the configured fields match, enabling you to create very broad or very specific overrides based on your needs:
+
+```toml
+# ignore everything in the current directory
+[[PackageOverrides]]
+ignore = true
+
+# ignore a particular group
+[[PackageOverrides]]
+group = "dev"
+ignore = true
+
+# ignore a particular ecosystem
+[[PackageOverrides]]
+ecosystem = "go"
+ignore = true
+
+# ignore packages named "axios" regardless of ecosystem or group
+[[PackageOverrides]]
+name = "axios"
+ignore = true
+
+# ignore packages named "axios" in the npm ecosystem that are in the dev group
+[[PackageOverrides]]
+name = "axios"
+ecosystem = "npm"
+group = "dev"
+ignore = true
+
+# ignore packages matching a regex pattern (e.g. all internal packages)
+[[PackageOverrides]]
+name = "internal-.*"
+nameIsRegex = true
+ignore = true
+reason = "internal packages should not be checked"
+
+# ... and so on
+```
+
+When `nameIsRegex` is set to `true`, the `name` field is treated as a regular expression pattern. The pattern is automatically anchored to match the full package name (i.e. `^pattern$`). Standard [Go regular expression syntax](https://pkg.go.dev/regexp/syntax) is supported. An invalid regex pattern will cause a config loading error.
+
+## Scan Go Mod Version
+
+By default, OSV-Scanner does not scan the Go version from `go.mod` files because the `go` directive specifies the minimum required language version, not necessarily the toolchain version used to build or run the project. This can lead to misleading vulnerabilities.
+
+You can enable scanning the Go version from `go.mod` by setting the `ScanGoModVersion` key to `true`.
+
+### Example
+
+```toml
+ScanGoModVersion = true
+```
+
+## Go Version Override
+
+Use the `GoVersionOverride` key to override the Go version used for scanning. This is useful when the scanner fails to detect the correct Go version or when you want to force a specific version.
+
+### Example
+
+```toml
+# Do not add a prefix (e.g. go1.20.0 is just 1.20.0)
+GoVersionOverride = "1.20.0"
+```

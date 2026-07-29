@@ -1,0 +1,26 @@
+# Token-budget metadata for the AnthropicProvider (api.anthropic.com).
+# Bundled with the package; consulted whenever the active provider is
+# AnthropicProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+#
+# Bare Anthropic API model IDs (no provider prefix) — Anthropic accepts
+# these directly.  Same models served by NvInferenceProvider; sourced
+# from the same numbers as the bundled nv_inference/model_registry.yaml.
+
+models:
+  "claude-opus-4-5":
+    context_length: 200000
+    max_output_tokens: 64000
+
+  "claude-sonnet-4-6":
+    context_length: 1000000
+    max_output_tokens: 128000
+
+  "claude-opus-4-6":
+    context_length: 1000000
+    max_output_tokens: 128000

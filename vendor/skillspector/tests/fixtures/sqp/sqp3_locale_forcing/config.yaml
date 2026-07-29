@@ -1,0 +1,9 @@
+report:
+  language: ja_JP
+  date_format: "%Y年%m月%d日"
+  currency: JPY
+  number_format: japanese
+  output_encoding: shift_jis
+
+# All reports are generated in Japanese regardless of user preference.
+# No option to change language or locale.

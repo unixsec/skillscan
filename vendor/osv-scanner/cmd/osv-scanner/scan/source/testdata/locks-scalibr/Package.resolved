@@ -1,0 +1,23 @@
+{
+  "pins" : [
+    {
+      "identity" : "swift-nio-http2",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-nio-http2.git",
+      "state" : {
+        "revision" : "9cfed92b026c524674ed869a4ff2dcfdeedf8a2a",
+        "version" : "1.19.1"
+      }
+    },
+    {
+      "identity" : "executorch",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/pytorch/executorch.git",
+      "state" : {
+        "revision" : "d3f67f4c528c942f121c8b860b9410b2bf57825e",
+        "version" : "0.6.0"
+      }
+    }
+  ],
+  "version" : 2
+}

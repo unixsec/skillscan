@@ -63,11 +63,20 @@ testpaths = ["apps/monolith/tests"]
 target-version = "py312"
 line-length = 100
 # SECURITY (INV-15): vendor/ holds pinned, license-scanned third-party OSS
-# engine source (git submodules, vendor/engines.lock.yaml) - it must never be
-# reformatted or auto-fixed in place, only consumed via subprocess. Excluding
-# it here means even an unscoped `ruff check .`/`ruff format .` can't drift it
-# away from the audited upstream pinned commit.
+# engine source (committed directly since 2026-07-29, pinned by commit+tree in
+# vendor/engines.lock.yaml) - it must never be reformatted or auto-fixed in
+# place, only consumed via subprocess. Excluding it here means even an unscoped
+# `ruff check .`/`ruff format .` can't drift it away from the audited upstream
+# pinned commit. Measured: `ruff check vendor/` reports 11859 findings and
+# offers to auto-fix 8917 of them, so this exclusion is what stands between an
+# absent-minded `--fix` and a vendored tree that no longer matches its pin.
 extend-exclude = ["vendor"]
+# `extend-exclude` alone does NOT protect a path named explicitly on the command
+# line, and vendor/ became ordinary tracked source in that same conversion - so
+# an editor-on-save action or a `ruff format vendor/<file>` now reaches real
+# upstream files that `extend-exclude` would have covered under `.`.
+# force-exclude closes that, which is what INV-15 above actually claims.
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

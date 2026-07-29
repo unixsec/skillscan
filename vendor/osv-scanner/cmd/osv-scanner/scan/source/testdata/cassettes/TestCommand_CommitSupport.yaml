@@ -1,0 +1,286 @@
+---
+version: 2
+interactions:
+  - request:
+      proto: HTTP/1.1
+      proto_major: 1
+      proto_minor: 1
+      content_length: 1629
+      host: api.osv.dev
+      body: |
+        {
+          "queries": [
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "git://github.com/boostorg/boost"
+              },
+              "version": "boost-1.67.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "github.com/boostorg/boost"
+              },
+              "version": "boost-1.67.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "http://github.com/boostorg/boost"
+              },
+              "version": "boost-1.67.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/Exiv2/exiv2"
+              },
+              "version": "v0.28.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/apache/orc"
+              },
+              "version": "v3.19.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/boostorg/boost"
+              },
+              "version": "boost-1.67.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/capricorn86/happy-dom.git"
+              },
+              "version": "v11.1.0"
+            },
+            {
+              "commit": "45fda76bc1b9fd74d10e85e0ce9b65a12dcc58b0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/openssl/openssl"
+              },
+              "version": "openssl-3.5.0"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/sfackler-fork/rust-openssl"
+              },
+              "version": "openssl-v0.10.23"
+            },
+            {
+              "package": {
+                "ecosystem": "GIT",
+                "name": "https://github.com/sfackler/rust-openssl"
+              },
+              "version": "openssl-v0.8.1"
+            }
+          ]
+        }
+      headers:
+        Content-Type:
+          - application/json
+        X-Test-Name:
+          - TestCommand_CommitSupport/online_uses_git_commits
+      url: https://api.osv.dev/v1/querybatch
+      method: POST
+    response:
+      proto: HTTP/2.0
+      proto_major: 2
+      proto_minor: 0
+      content_length: 2317
+      body: |
+        {
+          "results": [
+            {
+              "vulns": [
+                {
+                  "id": "OSV-2018-389",
+                  "modified": "2022-04-13T03:04:40.912286Z"
+                }
+              ]
+            },
+            {
+              "vulns": [
+                {
+                  "id": "OSV-2018-389",
+                  "modified": "2022-04-13T03:04:40.912286Z"
+                }
+              ]
+            },
+            {
+              "vulns": [
+                {
+                  "id": "OSV-2018-389",
+                  "modified": "2022-04-13T03:04:40.912286Z"
+                }
+              ]
+            },
+            {
+              "vulns": [
+                {
+                  "id": "OSV-2023-1161",
+                  "modified": "2025-03-18T00:34:06.623648Z"
+                },
+                {
+                  "id": "OSV-2024-340",
+                  "modified": "2026-06-17T14:22:21.220057Z"
+                }
+              ]
+            },
+            {},
+            {
+              "vulns": [
+                {
+                  "id": "OSV-2018-389",
+                  "modified": "2022-04-13T03:04:40.912286Z"
+                }
+              ]
+            },
+            {
+              "vulns": [
+                {
+                  "id": "CVE-2024-51757",
+                  "modified": "2026-04-10T05:16:12.150628Z"
+                },
+                {
+                  "id": "CVE-2025-61927",
+                  "modified": "2026-04-10T05:32:48.905580Z"
+                },
+                {
+                  "id": "CVE-2025-62410",
+                  "modified": "2026-04-10T05:33:02.313115Z"
+                },
+                {
+                  "id": "CVE-2026-34226",
+                  "modified": "2026-04-10T05:43:01.477353Z"
+                }
+              ]
+            },
+            {
+              "vulns": [
+                {
+                  "id": "CVE-2024-12797",
+                  "modified": "2026-04-12T08:35:11.848849Z"
+                },
+                {
+                  "id": "CVE-2024-13176",
+                  "modified": "2026-04-16T04:35:29.313942Z"
+                },
+                {
+                  "id": "CVE-2024-9143",
+                  "modified": "2026-04-16T04:33:12.098562Z"
+                },
+                {
+                  "id": "CVE-2025-9230",
+                  "modified": "2026-05-12T18:44:24.110803Z"
+                },
+                {
+                  "id": "CVE-2025-9231",
+                  "modified": "2026-04-12T22:06:21.109259Z"
+                },
+                {
+                  "id": "CVE-2025-9232",
+                  "modified": "2026-04-16T04:32:37.830662Z"
+                }
+              ]
+            },
+            {
+              "vulns": [
+                {
+                  "id": "CVE-2025-11187",
+                  "modified": "2026-06-17T09:29:28.544232Z"
+                },
+                {
+                  "id": "CVE-2025-15467",
+                  "modified": "2026-06-17T09:29:34.311321Z"
+                },
+                {
+                  "id": "CVE-2025-15468",
+                  "modified": "2026-06-17T09:29:27.564360Z"
+                },
+                {
+                  "id": "CVE-2025-15469",
+                  "modified": "2026-04-12T17:59:06.543488Z"
+                },
+                {
+                  "id": "CVE-2025-4575",
+                  "modified": "2026-04-12T16:55:25.712986Z"
+                },
+                {
+                  "id": "CVE-2025-66199",
+                  "modified": "2026-04-12T18:47:05.342848Z"
+                },
+                {
+                  "id": "CVE-2025-68160",
+                  "modified": "2026-04-16T04:31:55.925384Z"
+                },
+                {
+                  "id": "CVE-2025-69418",
+                  "modified": "2026-04-16T04:39:29.408486Z"
+                },
+                {
+                  "id": "CVE-2025-69419",
+                  "modified": "2026-05-26T16:14:28.280291Z"
+                },
+                {
+                  "id": "CVE-2025-69420",
+                  "modified": "2026-04-16T04:31:44.038402Z"
+                },
+                {
+                  "id": "CVE-2025-69421",
+                  "modified": "2026-04-16T04:33:39.665301Z"
+                },
+                {
+                  "id": "CVE-2025-9230",
+                  "modified": "2026-05-12T18:44:24.110803Z"
+                },
+                {
+                  "id": "CVE-2025-9231",
+                  "modified": "2026-04-12T22:06:21.109259Z"
+                },
+                {
+                  "id": "CVE-2025-9232",
+                  "modified": "2026-04-16T04:32:37.830662Z"
+                },
+                {
+                  "id": "CVE-2026-22795",
+                  "modified": "2026-04-16T04:39:04.894264Z"
+                },
+                {
+                  "id": "CVE-2026-22796",
+                  "modified": "2026-04-16T04:33:43.089750Z"
+                },
+                {
+                  "id": "CVE-2026-2673",
+                  "modified": "2026-04-22T18:29:19.138098Z"
+                }
+              ]
+            },
+            {},
+            {
+              "vulns": [
+                {
+                  "id": "CVE-2016-10931",
+                  "modified": "2026-03-14T09:18:29.278606Z"
+                }
+              ]
+            }
+          ]
+        }
+      headers:
+        Content-Length:
+          - "2317"
+        Content-Type:
+          - application/json
+      status: 200 OK
+      code: 200
+      duration: 0s

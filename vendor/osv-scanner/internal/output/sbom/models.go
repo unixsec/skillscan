@@ -1,0 +1,32 @@
+package sbom
+
+import (
+	"github.com/google/osv-scanner/v2/pkg/models"
+	"github.com/ossf/osv-schema/bindings/go/osvschema"
+
+	"github.com/CycloneDX/cyclonedx-go"
+)
+
+var SpecVersionToBomCreator = map[models.CycloneDXVersion]CycloneDXBomCreator{
+	models.CycloneDXVersion14: ToCycloneDX14Bom,
+	models.CycloneDXVersion15: ToCycloneDX15Bom,
+	models.CycloneDXVersion16: ToCycloneDX16Bom,
+	models.CycloneDXVersion17: ToCycloneDX17Bom,
+}
+
+type CycloneDXBomCreator func(packageSources map[string]models.PackageVulns) *cyclonedx.BOM
+
+const (
+	cycloneDx14Schema = "http://cyclonedx.org/schema/bom-1.4.schema.json"
+	cycloneDx15Schema = "http://cyclonedx.org/schema/bom-1.5.schema.json"
+	cycloneDx16Schema = "http://cyclonedx.org/schema/bom-1.6.schema.json"
+	cycloneDx17Schema = "http://cyclonedx.org/schema/bom-1.7.schema.json"
+)
+
+const libraryComponentType = "library"
+
+var SeverityMapper = map[osvschema.Severity_Type]cyclonedx.ScoringMethod{
+	osvschema.Severity_CVSS_V2: cyclonedx.ScoringMethodCVSSv2,
+	osvschema.Severity_CVSS_V3: cyclonedx.ScoringMethodCVSSv3,
+	osvschema.Severity_CVSS_V4: cyclonedx.ScoringMethodCVSSv4,
+}

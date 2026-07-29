@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """§10A vendoring pipeline helper for the OSS engines vendored under
-`vendor/<engine>/` (git submodules, pinned commit/license recorded in
-`vendor/engines.lock.yaml`).
+`vendor/<engine>/` (source committed directly into this repository, pinned
+commit/tree/license recorded in `vendor/engines.lock.yaml`).
 
-SECURITY: this script does NOT fetch or add new vendored source - `git
-submodule add`/`fetch` against a new upstream repo is a deliberate,
-explicitly-authorized, one-time networked action performed directly by an
-operator in a networked session (see `vendor/VENDOR.md`'s introduction log),
-never something this script silently automates on its own. What this script
-DOES automate, and runs with zero network access:
+SECURITY: this script does NOT fetch or add new vendored source - pulling a new
+upstream repo in is a deliberate, explicitly-authorized, one-time networked
+action performed directly by an operator in a networked session (see
+`vendor/VENDOR.md`'s introduction log), never something this script silently
+automates on its own. What this script DOES automate, and runs with zero
+network access:
 
-  verify-pins    confirm each vendored submodule's checked-out commit matches
-                 its recorded pin in engines.lock.yaml (drift detection).
+  verify-pins    confirm the source committed under each `vendor/<engine>/`
+                 still matches its recorded pin in engines.lock.yaml (drift
+                 detection).
   license-scan   confirm each vendored engine's LICENSE/COPYING file is
                  consistent with its recorded license and stays on the
                  permissive allowlist (Apache-2.0/BSD-3-Clause/MIT); fail
@@ -66,10 +67,11 @@ def vendored_engines(engines: dict[str, dict[str, Any]]) -> dict[str, dict[str, 
 
 def submodule_dir_name(name: str, spec: dict[str, Any]) -> str:
     """The real on-disk vendor/ directory for this engine - `vendor_path` when
-    the lock key doesn't match the actual `git submodule add` directory (e.g.
-    `osv_scanner`'s key vs. the real `vendor/osv-scanner/`, per .gitmodules),
-    else the key itself. Never assume key==directory without checking -
-    that's exactly the drift verify-pins/license-scan exist to catch."""
+    the lock key doesn't match the actual directory name (e.g. `osv_scanner`'s
+    key vs. the real `vendor/osv-scanner/`, which kept the upstream repo's own
+    hyphenated name), else the key itself. Never assume key==directory without
+    checking - that's exactly the drift verify-pins/license-scan exist to
+    catch."""
     return str(spec.get("vendor_path", name))
 
 
@@ -81,39 +83,73 @@ def read_license_file(submodule_dir: Path) -> str | None:
     return None
 
 
-def checked_out_commit(submodule_dir: Path) -> str:
+def committed_tree_hash(repo_root: Path, rel_path: str) -> str:
+    """Git tree hash of `rel_path` as committed at HEAD of the repo at `repo_root`.
+
+    HISTORY: this used to be `git -C vendor/<engine> rev-parse HEAD`, valid while
+    each engine was a git submodule with its own `.git`. Since the 2026-07-29
+    conversion to committed source there is no inner repository, and that old
+    command does not fail - it walks UP to the superproject and cheerfully
+    returns skillscan's own HEAD, so every engine reports a bogus DRIFT against
+    a hash that has nothing to do with it. A wrong-but-plausible answer is worse
+    than an error, hence the tree hash instead: it is taken from this
+    repository's own HEAD and cannot be confused with anything else.
+
+    Reading HEAD (not the working tree) is deliberate. It verifies what the
+    repository actually ships, and it is immune to case-insensitive filesystems
+    - on macOS 466 of aig's paths collide and simply cannot all exist on disk,
+    so any working-tree-derived hash would be wrong there while the committed
+    tree is correct everywhere.
+    """
     result = subprocess.run(  # noqa: S603 - fixed argv, no untrusted input
-        ["git", "-C", str(submodule_dir), "rev-parse", "HEAD"],
+        ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{rel_path}"],
         capture_output=True,
         text=True,
         check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"`git -C {submodule_dir} rev-parse HEAD` failed: {result.stderr.strip()}"
+            f"`git -C {repo_root} rev-parse HEAD:{rel_path}` failed "
+            f"(needs a real git checkout; a source export without .git cannot be "
+            f"pin-verified): {result.stderr.strip()}"
         )
     return result.stdout.strip()
 
 
-def verify_pins(engines: dict[str, dict[str, Any]], *, vendor_dir: Path = VENDOR_DIR) -> list[str]:
-    """Returns a list of human-readable failure messages; empty means clean."""
+def verify_pins(
+    engines: dict[str, dict[str, Any]],
+    *,
+    vendor_dir: Path = VENDOR_DIR,
+    repo_root: Path = REPO_ROOT,
+) -> list[str]:
+    """Returns a list of human-readable failure messages; empty means clean.
+
+    Compares the git tree hash committed under `vendor/<engine>/` against the
+    `tree:` recorded in engines.lock.yaml. A tree hash covers every path, mode
+    and byte beneath the directory, so this catches both a partial/incomplete
+    vendoring and any edit to upstream source (which §10A.1 forbids outright).
+    """
     failures: list[str] = []
     for name, spec in vendored_engines(engines).items():
         dir_name = submodule_dir_name(name, spec)
-        submodule_dir = vendor_dir / dir_name
-        expected = str(spec["commit"])
-        if not submodule_dir.is_dir():
+        engine_dir = vendor_dir / dir_name
+        expected = str(spec.get("tree") or "")
+        if not engine_dir.is_dir():
+            failures.append(f"{name}: vendor/{dir_name}/ does not exist (expected tree {expected})")
+            continue
+        if not expected:
             failures.append(
-                f"{name}: vendor/{dir_name}/ does not exist (expected commit {expected})"
+                f"{name}: no `tree:` recorded in engines.lock.yaml - cannot verify the "
+                f"committed source against its pin (see that file's header)"
             )
             continue
         try:
-            actual = checked_out_commit(submodule_dir)
+            actual = committed_tree_hash(repo_root, f"vendor/{dir_name}")
         except RuntimeError as exc:
             failures.append(f"{name}: {exc}")
             continue
         if actual != expected:
-            failures.append(f"{name}: checked-out commit {actual} != pinned {expected} (DRIFT)")
+            failures.append(f"{name}: committed tree {actual} != pinned {expected} (DRIFT)")
     return failures
 
 
@@ -186,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     verify_parser = sub.add_parser(
-        "verify-pins", help="confirm vendored submodules match engines.lock.yaml"
+        "verify-pins", help="confirm committed vendor/ source matches engines.lock.yaml"
     )
     verify_parser.set_defaults(func=_cmd_verify_pins)
 

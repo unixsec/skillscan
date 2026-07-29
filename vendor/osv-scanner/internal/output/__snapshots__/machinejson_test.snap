@@ -1,0 +1,3862 @@
+
+[TestPrintJSONResults_WithLicenseViolations/multiple_sources_with_a_mixed_count_of_packages,_no_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/multiple_sources_with_a_mixed_count_of_packages,_some_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "Apache-2.0"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/multiple_sources_with_a_mixed_count_of_packages,_some_license_violations#01 - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT",
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "UNKNOWN"
+          ],
+          "license_violations": [
+            "UNKNOWN"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "Apache-2.0"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "Apache-2.0"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/multiple_sources_with_a_mixed_count_of_packages_across_ecosystems,_some_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "author1/mine1",
+            "version": "1.2.3",
+            "ecosystem": "Packagist"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "Apache-2.0"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "NuGet"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        },
+        {
+          "package": {
+            "name": "author1/mine1",
+            "version": "1.2.3",
+            "ecosystem": "Packagist"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/multiple_sources_with_a_mixed_count_of_packages_and_groups,_some_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev",
+            "optional"
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev",
+            "optional"
+          ],
+          "licenses": [
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "Apache-2.0"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "build"
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/multiple_sources_with_no_packages - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": []
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": []
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": []
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/no_sources - 1]
+{
+  "results": [],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_no_packages - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": []
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package,_no_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package,_no_licenses - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package_and_an_unknown_license - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "UNKNOWN"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package_and_multiple_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT",
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "MIT",
+            "Apache-2.0"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package_and_one_license_violation_(dev) - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package_with_both_a_version_and_a_commit_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm",
+            "commit": "abc123"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/one_source_with_one_package_with_just_a_commit_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "",
+            "ecosystem": "npm",
+            "commit": "abc123"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithLicenseViolations/two_sources_with_packages,_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "5.9.0",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/multiple_sources_with_a_mixed_count_of_packages,_some_called_vulnerabilities_and_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": "7.8"
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-2": {
+                  "called": true,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "ISC"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "Apache-2.0"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/multiple_sources_with_a_mixed_count_of_packages,_some_vulnerabilities_and_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "ISC"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "Apache-2.0"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/multiple_sources_with_a_mixed_count_of_packages_with_versions_and_commits,_some_vulnerabilities_and_license_violations - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm",
+            "commit": "abcxzy"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "",
+            "ecosystem": "npm",
+            "commit": "abc123"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "ISC"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "ISC"
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "Apache-2.0"
+          ],
+          "license_violations": [
+            "Apache-2.0"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/one_source_in_working_directory_with_one_package,_one_vulnerability,_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/one_source_with_one_deprecated_package - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "deprecated-pkg",
+            "version": "1.0.0",
+            "ecosystem": "npm",
+            "deprecated": true
+          }
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/one_source_with_one_package,_one_called_vulnerability,_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": true,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/one_source_with_one_package,_one_uncalled_vulnerability,_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/one_source_with_one_package,_one_vulnerability,_and_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithMixedIssues/two_sources_with_packages,_one_vulnerability,_one_license_violation - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "licenses": [
+            "ISC"
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "5.9.0",
+            "ecosystem": "npm"
+          },
+          "licenses": [
+            "MIT"
+          ],
+          "license_violations": [
+            "MIT"
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": [
+        "ISC"
+      ]
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_grouped_packages,_and_multiple_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev",
+            "optional"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.2",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "build"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-3"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-3",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something mildly scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_packages,_and_multiple_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.2",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-3"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-3",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something mildly scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_packages,_no_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          }
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          }
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_packages,_some_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.4.1",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.3.5",
+            "ecosystem": "npm"
+          }
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_packages_across_ecosystems,_and_multiple_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "author1/mine1",
+            "version": "1.2.3",
+            "ecosystem": "Packagist"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.2",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "NuGet"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "author3/mine3",
+            "version": "0.4.1",
+            "ecosystem": "Packagist"
+          },
+          "dependency_groups": [
+            "build"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-3"
+              ],
+              "aliases": null,
+              "max_severity": "4.3"
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-3",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something mildly scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_packages_across_ecosystems,_and_multiple_vulnerabilities,_but_some_uncalled - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "author1/mine1",
+            "version": "1.2.3",
+            "ecosystem": "Packagist"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-5": {
+                  "called": true,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.2",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "NuGet"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "author3/mine3",
+            "version": "0.4.1",
+            "ecosystem": "Packagist"
+          },
+          "dependency_groups": [
+            "build"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-3"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-3": {
+                  "called": true,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-3",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something mildly scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_a_mixed_count_of_packages_across_ecosystems_using_commits_and_version,_and_multiple_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "author1/mine1",
+            "version": "1.2.3",
+            "ecosystem": "Packagist",
+            "commit": "123abc"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine1",
+            "version": "",
+            "ecosystem": "npm",
+            "commit": "abcxyz"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "3.2.5",
+            "ecosystem": "NuGet"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something less scary!"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "author3/mine3",
+            "version": "0.4.1",
+            "ecosystem": "Packagist"
+          },
+          "dependency_groups": [
+            "build"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-3"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "OSV-5"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-3",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something mildly scary!"
+            },
+            {
+              "id": "OSV-5",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/multiple_sources_with_no_packages - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": []
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": []
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/third/lockfile",
+        "type": "unknown"
+      },
+      "packages": []
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/no_sources - 1]
+{
+  "results": [],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_no_packages - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": []
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package,_no_vulnerabilities - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package,_one_uncalled_vulnerability,_and_one_called_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": true,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            },
+            {
+              "ids": [
+                "GHSA-123"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "GHSA-123": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "id": "GHSA-123",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scarier!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package,_one_vulnerability,_and_a_max_severity - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": "9"
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_one_called_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": true,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_one_uncalled_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_one_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_one_vulnerability_(dev) - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_two_aliases_of_a_single_uncalled_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1",
+                "GHSA-123"
+              ],
+              "aliases": [
+                "OSV-1",
+                "GHSA-123"
+              ],
+              "experimental_analysis": {
+                "OSV-1": {
+                  "called": false,
+                  "unimportant": false
+                }
+              },
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "aliases": [
+                "OSV-1"
+              ],
+              "id": "GHSA-123",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_two_aliases_of_a_single_vulnerability_with_a_max_severity - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1",
+                "GHSA-123"
+              ],
+              "aliases": [
+                "OSV-1",
+                "GHSA-123"
+              ],
+              "max_severity": "8.3"
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "aliases": [
+                "OSV-1"
+              ],
+              "id": "GHSA-123",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_and_two_aliases_of_a_single_vulnerability_without_a_max_severity - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1",
+                "GHSA-123"
+              ],
+              "aliases": [
+                "OSV-1",
+                "GHSA-123"
+              ],
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            },
+            {
+              "aliases": [
+                "OSV-1"
+              ],
+              "id": "GHSA-123",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_with_both_a_version_and_commit_and_one_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm",
+            "commit": "abc123"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_one_package_with_just_a_commit_and_one_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "",
+            "ecosystem": "npm",
+            "commit": "abc123"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_vulnerabilities,_some_missing_content - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "details": "This vulnerability allows for some very scary stuff to happen - seriously, you'd not believe it!",
+              "id": "OSV-1"
+            }
+          ]
+        },
+        {
+          "package": {
+            "name": "mine3",
+            "version": "0.10.2-rc",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-2"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-2"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/one_source_with_workflow_command_injection_attempt_in_path - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "dir/r::stop-commands::T/r::error::INJECTED/n::warning::pwn/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "summary": "Test vulnerability"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/two_sources_with_packages,_one_vulnerability - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine2",
+            "version": "5.9.0",
+            "ecosystem": "npm"
+          }
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---
+
+[TestPrintJSONResults_WithVulnerabilities/two_sources_with_the_same_vulnerable_package - 1]
+{
+  "results": [
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/first/lockfile",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "source": {
+        "path": "<rootdir>/path/to/my/second/lockfile",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "mine1",
+            "version": "1.2.3",
+            "ecosystem": "npm"
+          },
+          "dependency_groups": [
+            "dev"
+          ],
+          "groups": [
+            {
+              "ids": [
+                "OSV-1"
+              ],
+              "aliases": null,
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "OSV-1",
+              "severity": [
+                {
+                  "score": "1"
+                }
+              ],
+              "summary": "Something scary!"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}
+
+---

@@ -1,0 +1,7 @@
+# Locale is fixed to Japanese per FSA regulatory requirement (金融庁告示第52号).
+# See SKILL.md for justification.
+report:
+  language: ja_JP
+  date_format: "%Y年%m月%d日"
+  currency: JPY
+  regulatory_framework: fsa_japan

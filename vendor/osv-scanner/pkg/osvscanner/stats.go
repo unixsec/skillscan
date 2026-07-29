@@ -1,0 +1,40 @@
+package osvscanner
+
+import (
+	"path/filepath"
+
+	"github.com/google/osv-scalibr/stats"
+	"github.com/google/osv-scanner/v2/internal/cmdlogger"
+	"github.com/google/osv-scanner/v2/internal/output"
+)
+
+type fileOpenedPrinter struct {
+	stats.NoopCollector
+
+	filesExtracted map[string]struct{}
+}
+
+var _ stats.Collector = &fileOpenedPrinter{}
+
+func (c *fileOpenedPrinter) AfterExtractorRun(_ string, extractorstats *stats.AfterExtractorStats) {
+	if c.filesExtracted == nil {
+		c.filesExtracted = make(map[string]struct{})
+	}
+
+	systemPath := filepath.Join(extractorstats.Root, filepath.FromSlash(extractorstats.Path))
+	c.filesExtracted[systemPath] = struct{}{}
+	if extractorstats.Error != nil { // Don't log scanned if error occurred
+		return
+	}
+
+	pkgsFound := len(extractorstats.Inventory.Packages)
+
+	// systemPath is user-controlled; sanitize \r/\n before logging to prevent
+	// GitHub Actions workflow command injection.
+	cmdlogger.Infof(
+		"Scanned %s file and found %d %s",
+		output.SanitizeForWorkflowCommand(systemPath),
+		pkgsFound,
+		output.Form(pkgsFound, "package", "packages"),
+	)
+}

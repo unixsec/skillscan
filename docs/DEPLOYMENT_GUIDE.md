@@ -9,6 +9,32 @@
 | **Kubernetes** | 集群规模生产部署 | `deploy/helm/skillscan`（Helm chart） | 同上 |
 | **Kubernetes（隔离网）** | 无外网、无 registry 的隔离集群 | `scripts/build_offline_bundle.sh` + `helm install`——**完整步骤见 §6** | 本地账号 / OIDC / SAML，需手工配置（§6.9） |
 
+> ### 隔离网部署的唯一推荐路径：离线镜像包（§6）
+>
+> 面向企业隔离网交付时，**请走 §6 的离线镜像包**：有网侧
+> `scripts/build_offline_bundle.sh` 打出 `dist/skillscan-offline-<tag>-<arch>/`
+> （`images.tar` + `manifest.txt` + `SHA256SUMS` + `import_offline_bundle.sh`），
+> 隔离侧导入镜像 + 一条 `helm install`，全程零对外连接、不需要任何 registry。
+>
+> **需要说清楚的一点：把仓库 clone 过去是不够的。** 2026-07-29 起五个引擎的源码已直接
+> 提交进本仓库（不再是 git submodule），所以 `git clone` 确实不再需要访问 github.com 去
+> 取**引擎源码**了——但这只解决了"源码从哪来"，没有解决"怎么构建"：
+>
+> | 构建期仍然需要联网取的东西 | 出现在哪 |
+> |---|---|
+> | 基础镜像（`FROM ...`） | 三个 Dockerfile 全部 |
+> | `go mod download` / `go build` | `services/engine_runner/Dockerfile` |
+> | `apt-get`（编译 yara 等所需的系统包） | `services/engine_runner/Dockerfile` |
+> | PyPI（`uv sync` / `uv pip install`） | `apps/monolith/Dockerfile`、`services/engine_runner/Dockerfile` |
+> | npm（`npm ci`） | `web/Dockerfile` |
+>
+> 这些都**不在**仓库里。如果隔离侧有完整的内网镜像源，可以用 `PIP_INDEX_URL`、
+> `GOPROXY`、`NPM_CONFIG_REGISTRY`（三个 Dockerfile 都已参数化）在内网自建；否则
+> 就走离线镜像包——**它送过去的是构建完成的镜像，不是一次构建**，隔离侧因此一个都不需要。
+>
+> committed vendor 源码要解决的是另一件事：可审计（对得上
+> `vendor/engines.lock.yaml` 的 commit/tree pin）与可自建，不是替代离线包。
+
 ---
 
 ## 1. 本地开发/演示部署 ✅已验证
@@ -278,7 +304,10 @@ deploy/helm/skillscan-kyverno-policies/render.sh -n <你的 namespace> \
 **⑦ 要传进隔离网的东西（三份，缺一不可）**
 
 1. 离线镜像包目录（§6.2 产出，几百 MB）
-2. 本仓库源码——chart 在 `deploy/helm/skillscan`，离线包里**不含** chart
+2. 本仓库源码——chart 在 `deploy/helm/skillscan`，离线包里**不含** chart。
+   注意体积：2026-07-29 起 `vendor/` 里是五个引擎的完整源码（约 134 MB / 6273 个文件，
+   不再是空的 submodule 目录），所以源码这一份比以前大得多；好处是它自带引擎源码，
+   拷过去不需要再做任何 `git submodule` 步骤
 3. `deploy/networkpolicy/`、`deploy/helm/skillscan-kyverno-policies/`
    （如果要用，随源码一起——都已在 1 份源码里，不是额外的传输动作）
 

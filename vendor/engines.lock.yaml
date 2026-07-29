@@ -6,6 +6,27 @@
 #
 # Vendored 2026-07-05 in a networked coding session per §10A.3; all refs verified to
 # exist upstream via `git ls-remote` immediately before `git submodule add`.
+#
+# 2026-07-29 - SUBMODULES CONVERTED TO COMMITTED SOURCE. `vendor/<engine>/` is no
+# longer a git submodule; each engine's source is committed directly into this
+# repository so that a plain `git clone` (no `git submodule update`, no reachable
+# github.com) carries the engine source. The pins below did NOT move - the trees
+# committed are exactly the trees of the commits already recorded here.
+#
+# What the two hash fields mean now:
+#   commit:  PROVENANCE. The upstream commit this source was taken from. It is no
+#            longer a fetch instruction (nothing resolves it at build time) - it is
+#            how a reviewer re-derives this tree from upstream:
+#              git clone <repo> && git -C <clone> rev-parse <commit>^{tree}
+#            must print the `tree` value below.
+#   tree:    THE VERIFIABLE ANCHOR, and what `scripts/vendor_engines.py verify-pins`
+#            actually checks, offline, with no network and no upstream clone:
+#              git rev-parse HEAD:vendor/<vendor_path or key>
+#            must equal it. A git tree hash covers every path, mode and byte under
+#            the directory, so this detects any edit to vendored source - which
+#            §10A.1 forbids outright - as well as accidental partial vendoring.
+#            Recorded 2026-07-29; each value was verified equal to the corresponding
+#            upstream `<commit>^{tree}` at conversion time.
 
 engines:
   skillspector:
@@ -15,6 +36,7 @@ engines:
     # posture than a signed/tagged release, noted here explicitly).
     ref_type: commit
     commit: dde36f258729b5aec7c835295a9556e64a2def0c
+    tree: 736249c4655290b524067c74d029c7b0209076db
     license: Apache-2.0
     role: mandatory
     adapter_status: built
@@ -28,6 +50,16 @@ engines:
     ref_type: tag
     tag: v4.1.15
     commit: 31b2184b0b5656f44b3cb2eb5164775dc750c46f
+    tree: aa5027605d65aaf52e5d685326733398ad07bb82
+    # NOTE (macOS): this tree contains 466 pairs of paths that differ only in case
+    # (e.g. `data/vuln/LiteLLM/...` vs `data/vuln/litellm/...`). On a case-insensitive
+    # filesystem only one of each pair can exist on disk, so `find vendor/aig -type f`
+    # reports ~4094 where the committed tree holds 4551. That is a filesystem limit,
+    # not missing content: all 4551 are committed and a Linux checkout (the build and
+    # deploy target) materialises every one. Both members of all 466 pairs were
+    # verified to hold byte-identical content, so the macOS working tree is not
+    # ambiguous either - it just deduplicates. Do NOT "fix" this by re-adding
+    # vendor/aig from the working tree; that is exactly what would drop the 466.
     license: Apache-2.0  # migrated from MIT in 2026; NOTICE file retained per attribution terms
     role: mandatory
     # UPDATED 2026-07-09 - the 2026-07-05 finding below (AIG's top-level `scan`
@@ -68,6 +100,7 @@ engines:
     ref_type: tag
     tag: "1.9.4"
     commit: 92ae8b82fb422a639f0ed8d99e96cea769594e08
+    tree: 6bd9ddc4f2499bddbf256b2263ff18c700b77b5b
     license: Apache-2.0
     role: mandatory
     adapter_status: built
@@ -81,6 +114,7 @@ engines:
     ref_type: tag
     tag: v2.4.0
     commit: b56b5191101d5f27d4787d5583d8d01e9518a7af
+    tree: 49eec0dfe57061d2c6331c29df79aa9f9594ab06
     license: Apache-2.0
     role: mandatory
     adapter_status: built
@@ -100,6 +134,7 @@ engines:
     ref_type: tag
     tag: v4.5.7
     commit: d72b85f09fcd86583836eb8c4f349cb269ec875d
+    tree: 2aded4ee95ea609c8b73fbd6540ae4f7d7a5c8ed
     license: BSD-3-Clause
     role: mandatory
     adapter_status: built
