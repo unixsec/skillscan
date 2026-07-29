@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from common.blobstore import ShareProbeMonitor
 from common.log import get_logger
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import text
@@ -60,6 +61,20 @@ async def readyz(request: Request, response: Response) -> dict[str, Any]:
         checks["orchestration_db"] = True
     except Exception:  # noqa: BLE001 - any DB failure means not-ready, never a crash here
         checks["orchestration_db"] = False
+
+    # 里程碑 E spec §4.3: the monolith and the engine-runner MUST see the same
+    # blob store. When they don't, nothing errors - every pod is Running, this
+    # endpoint's other two checks pass, and scans just sit at RUNNING forever.
+    # `main.create_app` runs the probe in the background and parks the monitor
+    # here; a `None` monitor means the check isn't running in this process
+    # (e.g. a test-built app, or a non-filesystem store), which is not evidence
+    # that sharing is broken - so it is left out of `checks` entirely rather
+    # than reported as a passing check that never ran.
+    share_monitor: ShareProbeMonitor | None = getattr(
+        request.app.state, "blobstore_share_monitor", None
+    )
+    if share_monitor is not None:
+        checks["blobstore_shared"] = share_monitor.status.ready
 
     ready = all(checks.values())
     response.status_code = 200 if ready else 503

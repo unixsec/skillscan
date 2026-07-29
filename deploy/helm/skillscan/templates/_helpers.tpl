@@ -8,7 +8,13 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{/* Call as: include "skillscan.image" (dict "root" $ "repo" .Values.image.monolithRepository)
      `$`/`.` inside an included template are rebound to whatever is passed in,
-     so the caller's root context must be threaded through explicitly. */}}
+     so the caller's root context must be threaded through explicitly.
+
+     An empty image.registry emits NO prefix at all (not a leading "/"), which
+     is what the air-gapped default needs: side-loaded images are named
+     `skillscan/monolith:<tag>` with no registry component, and
+     `/skillscan/monolith:<tag>` is not the same reference - it is an invalid
+     one. See values.yaml's image.registry comment. */}}
 {{- define "skillscan.image" -}}
-{{ .root.Values.image.registry }}/{{ .repo }}:{{ .root.Values.image.tag }}
+{{ with .root.Values.image.registry }}{{ . }}/{{ end }}{{ .repo }}:{{ .root.Values.image.tag }}
 {{- end -}}

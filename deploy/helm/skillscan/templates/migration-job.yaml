@@ -1,0 +1,114 @@
+# 迁移 Job (coding spec §7.2, M-E design §5): schema migration + per-module
+# GRANT manifest as a Helm hook, run exactly once per install/upgrade - a
+# Helm hook rather than an initContainer, because N replicas of an
+# initContainer would run this same DDL/GRANT concurrently.
+#
+# ⚠ 本 Job 是里程碑 D 与 B' 两次真实事故的产品化：两次都是"迁移/授权只在一次性
+# 测试库上跑、从不在部署库上跑"，表现为"全绿的测试 + 静默失效的生产"（milestone D
+# 让部署库缺了一列，1103 个测试全绿都没发现；milestone B' 本会让 svc_marketplace
+# 从未被创建，表现为系统看起来健康、审计表却永久空着）。所以这里不只是执行 alembic
+# 和 setup_grants.py - 执行完必须验证：比对 alembic_version 与 repo head、比对
+# mysql.user 与 policies/grants/manifest.yaml 里的每一个 svc_* 用户，不一致就让
+# Job 失败，Job 失败就让整个 helm install/upgrade 失败。执行是动作，验证才是保证。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  # MySQL 首次启动慢，需要重试；但不能无限重试掩盖真实失败。
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "skillscan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # SECURITY: same shape as monolith-deployment.yaml's own securityContext,
+      # for the same reason (found live-applying against the real k3s cluster,
+      # not by inspection): `runAsNonRoot: true` with no explicit `runAsUser`
+      # fails closed - this Job runs the monolith image, whose Dockerfile sets
+      # `USER skillscan` (a name, not a uid) via `useradd --uid 10001`, so the
+      # numeric uid must be given explicitly here too.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: migrate
+          image: {{ include "skillscan.image" (dict "root" $ "repo" .Values.image.monolithRepository) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+          resources:
+            {{- toYaml .Values.resources.migration | nindent 12 }}
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretRefs.name }}
+                  key: MYSQL_ROOT_PASSWORD
+            - name: MYSQL_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: skillscan-config
+                  key: SKILLSCAN_DB_HOST
+            - name: MYSQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: skillscan-config
+                  key: SKILLSCAN_DB_NAME
+            # alembic (db/migrations/env.py) and db/setup_grants.py each read
+            # their own privileged-connection DSN env var (same names
+            # deploy_and_test_vm.sh's hand-run steps and docker-compose.yml's
+            # `migrate` service already use) - built here from the three
+            # values above via k8s's $(VAR) env expansion, same technique
+            # monolith-deployment.yaml uses to splice REDIS_PASSWORD into
+            # SKILLSCAN_REDIS_URL. Both need the root/admin connection: schema
+            # DDL and CREATE USER/GRANT are privileged operations the
+            # per-module svc_* accounts this Job is about to create must never
+            # be able to do themselves.
+            - name: SKILLSCAN_MIGRATION_DB_URL
+              value: "mysql+aiomysql://root:$(MYSQL_ROOT_PASSWORD)@$(MYSQL_HOST)/$(MYSQL_DATABASE)"
+            - name: SKILLSCAN_ADMIN_DB_DSN
+              value: "mysql://root:$(MYSQL_ROOT_PASSWORD)@$(MYSQL_HOST)/$(MYSQL_DATABASE)"
+          envFrom:
+            - configMapRef:
+                name: skillscan-config
+            - secretRef:
+                name: {{ .Values.secretRefs.name }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              # `python3 -m alembic`, not bare `alembic`: the console-script
+              # wrapper resolves via PATH but its own shebang is a separate
+              # matter (see apps/monolith/Dockerfile's fix note, found live
+              # against this VM) - -m sidesteps that entirely by never
+              # exec'ing the wrapper script at all.
+              python3 -m alembic upgrade head
+              python3 db/setup_grants.py
+
+              # 执行是动作，验证才是保证。里程碑 D 与 B' 各因缺这一步出过一次事故：
+              # 迁移/授权"跑过了"，而部署库其实没有那一列/那个账号，
+              # 症状是应用正常启动、只有写入静默失败。
+              expected=$(python3 -m alembic heads | awk '{print $1}' | head -1)
+              actual=$(mysql -h "$MYSQL_HOST" -uroot -p"$MYSQL_ROOT_PASSWORD" -N \
+                       -e "SELECT version_num FROM ${MYSQL_DATABASE}.alembic_version;")
+              [ "$actual" = "$expected" ] || { echo "!!! schema at $actual, repo head is $expected"; exit 1; }
+
+              missing=""
+              for u in $(grep -oE '^\s{2}svc_[a-z_]+' policies/grants/manifest.yaml | tr -d ' :' | sort -u); do
+                n=$(mysql -h "$MYSQL_HOST" -uroot -p"$MYSQL_ROOT_PASSWORD" -N \
+                    -e "SELECT COUNT(*) FROM mysql.user WHERE user='$u';")
+                [ "$n" = "0" ] && missing="$missing $u"
+              done
+              [ -z "$missing" ] || { echo "!!! module users missing:$missing"; exit 1; }
+              echo "migration verified: schema at head, all module users present"

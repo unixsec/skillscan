@@ -5,14 +5,16 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: skillscan-config
-  namespace: skillscan
   labels:
     {{- include "skillscan.labels" . | nindent 4 }}
 data:
   SKILLSCAN_DB_HOST: {{ .Values.config.mysqlHost | quote }}
   SKILLSCAN_DB_NAME: {{ .Values.config.mysqlDatabase | quote }}
   SKILLSCAN_REDIS_URL: {{ .Values.config.redisUrl | quote }}
-  SKILLSCAN_BLOBSTORE_ROOT: "/var/lib/skillscan/blobstore"
+  # Must equal the mountPath BOTH Deployments mount the skillscan-blobstore
+  # PVC at - hence one value, consumed in all three places (see values.yaml's
+  # persistence.blobstore.mountPath for what a disagreement costs).
+  SKILLSCAN_BLOBSTORE_ROOT: {{ .Values.persistence.blobstore.mountPath | quote }}
   SKILLSCAN_VLLM_BASE_URL: {{ .Values.config.vllmBaseUrl | quote }}
   SKILLSCAN_LLM_MODEL: {{ .Values.config.llmModel | quote }}
   SKILLSCAN_OSV_SOURCE: {{ .Values.config.osvSource | quote }}
@@ -21,4 +23,42 @@ data:
   SKILLSCAN_MARKETPLACE_API_BASE_URL: {{ .Values.config.marketplaceApiBaseUrl | quote }}
   SKILLSCAN_RECONCILIATION_POLL_ENABLED: {{ .Values.config.reconciliationPollEnabled | quote }}
   SKILLSCAN_RECONCILIATION_PUSH_ENABLED: {{ .Values.config.reconciliationPushEnabled | quote }}
-  SKILLSCAN_GATE_POLICY_PATH: "/etc/skillscan/policies/gate/v1.yaml"
+  # /app/policies, not /etc/skillscan: that path exists nowhere - not in the
+  # image, not as a mounted volume - and _load_policy() is deliberately
+  # fail-closed on a missing policy file, so the monolith CrashLooped on the
+  # very first install. The images copy policies/ to /app/policies (see
+  # apps/monolith/Dockerfile), verified against the running container.
+  SKILLSCAN_GATE_POLICY_PATH: "/app/policies/gate/v1.yaml"
+
+  # The gate policy was not the only path derived from the SOURCE TREE's shape.
+  # Both defaults in main.py are `Path(__file__).parents[2] / "policies" / ...`,
+  # which is the repo root from apps/monolith/main.py and
+  # /app/.venv/lib/python3.12 from an installed package - so with this key
+  # unset the monolith died at startup with
+  #   cannot read group_role_map file
+  #   /app/.venv/lib/python3.12/policies/rbac/group_role_map.yaml
+  # (measured, install #2 on the dev VM). load_group_role_map is fail-closed
+  # like _load_policy: no group->role mapping means no authorization data, and
+  # guessing an empty map would silently strip everyone's roles.
+  SKILLSCAN_RBAC_GROUP_ROLE_MAP_PATH: "/app/policies/rbac/group_role_map.yaml"
+
+  # Third instance of the same shape, and the quietest: reporting/service.py's
+  # default is Path(__file__).parents[4] / "vendor" / "engines.lock.yaml" =
+  # /app/.venv/lib/python3.12/vendor/... . Unlike the two above this one is
+  # fail-soft (an informational dashboard panel must not 500 the dashboard),
+  # so the only symptom was the console's engine panel rendering
+  # dashboard.noEngineData forever - measured as total_engines: 0, rows: []
+  # against the deployed monolith. apps/monolith/Dockerfile now ships the file
+  # at the path below.
+  SKILLSCAN_ENGINES_LOCK_PATH: "/app/vendor/engines.lock.yaml"
+
+  # Without this the worker loop never starts (config.py defaults it to false),
+  # so every submitted scan sits in `queued` forever while every pod reports
+  # healthy. docker-compose.yml turns it on; the chart simply never did.
+  SKILLSCAN_WORKER_ENABLED: {{ .Values.config.workerEnabled | quote }}
+
+  # Nothing in this chart configured any way to authenticate, so a completed
+  # install had no path to a first login at all. Local accounts are the only
+  # mechanism that needs no external IdP; the seed itself is a Secret key
+  # (see secret.yaml), never a value in this ConfigMap.
+  SKILLSCAN_LOCAL_AUTH_ENABLED: {{ .Values.config.localAuthEnabled | quote }}

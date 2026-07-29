@@ -2,9 +2,37 @@ skillscan {{ .Chart.AppVersion }} deployed to namespace {{ .Release.Namespace }}
 
 Apply alongside this release (not templated into it - these are cluster-scoped
 or namespace-scoped-but-independent-lifecycle resources):
-  kubectl apply -f deploy/networkpolicy/
-  kubectl apply -f deploy/kyverno/
+
+  kubectl apply -n {{ .Release.Namespace }} -f deploy/networkpolicy/
+      -n is REQUIRED. These are default-deny policies; without it they land in
+      whatever namespace your current context points at. Apply the WHOLE
+      directory or none of it - the allowlists are additive on top of
+      default-deny, and a partial apply leaves this release running but
+      unreachable (DEPLOYMENT_GUIDE 6.8 item 12 lists the exact symptoms).
+
+  deploy/helm/skillscan-kyverno-policies/render.sh -n {{ .Release.Namespace }} \
+      [-k <your-cosign-public-key.pem>] | kubectl apply -f -
+      pod-security-baseline, require-gvisor-sandbox-runtimeclass, and
+      require-signed-images all template their match namespace from `-n`
+      (must be THIS release's namespace, above) - no more silent
+      zero-enforcement from a hardcoded `skillscan`. The first two are on by
+      default; the signing-key policy is opt-in via `-k`, and render.sh
+      validates the key with openssl before rendering, so a
+      placeholder/garbage key fails here instead of shipping a policy that
+      accepts it and then rejects every image at admission.
 
 Verify:
   kubectl -n {{ .Release.Namespace }} get pods
-  kubectl -n {{ .Release.Namespace }} exec deploy/skillscan-monolith -- curl -s localhost:8000/healthz
+
+  POD=$(kubectl -n {{ .Release.Namespace }} get pod \
+        -l job-name={{ .Release.Name }}-migrate-{{ .Release.Revision }} \
+        --field-selector=status.phase=Succeeded -o name | head -1)
+  kubectl -n {{ .Release.Namespace }} logs "$POD" | tail -1
+      expect: migration verified: schema at head, all module users present
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/skillscan-web 8080:80
+      then open http://localhost:8080 in a browser. Session cookies carry
+      Secure, and only a browser treats http://localhost as a secure context -
+      a plain-http curl login returns 200 and silently keeps no session.
+
+(No `kubectl exec ... curl` here on purpose: there is no curl in these images.)

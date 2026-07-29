@@ -1,0 +1,39 @@
+# Migration Job egress allowlist (deploy/helm/skillscan/templates/migration-job.yaml).
+#
+# The Job is a pod like any other, so default-deny-all selects it too. It runs
+# once per install/upgrade, before anyone looks at the cluster, and it needs
+# exactly two things: DNS, and the MySQL server it migrates. Without this the
+# Job's own retries all fail with `Can't connect to MySQL server on 'mysql'`,
+# backoffLimit is exhausted, and `helm install` itself fails - a policy layer
+# applied after a working install would break the NEXT upgrade, not this one,
+# which is the kind of delay that makes the cause hard to find.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: migration-egress-allowlist
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: migration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: mysql
+      ports:
+        - protocol: TCP
+          port: 3306

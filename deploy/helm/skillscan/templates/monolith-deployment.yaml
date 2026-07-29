@@ -5,7 +5,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: skillscan-monolith
-  namespace: skillscan
   labels:
     {{- include "skillscan.labels" . | nindent 4 }}
     app.kubernetes.io/component: core-monolith
@@ -63,6 +62,25 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+          {{- if .Values.redis.enabled }}
+          # SECURITY: the chart's own Redis requires auth (see redis.yaml) -
+          # override the plain SKILLSCAN_REDIS_URL that skillscan-config's
+          # ConfigMap carries (deliberately credential-free, ConfigMaps are
+          # not for secrets) with one built from the same host/port/db plus
+          # this Secret's password. An explicit `env` entry here always wins
+          # over the same-named key arriving via `envFrom` below, regardless
+          # of block order - app code needs no change, config.py just reads
+          # whichever SKILLSCAN_REDIS_URL value the container actually got.
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretRefs.name }}
+                  key: SKILLSCAN_REDIS_PASSWORD
+            {{- $redisUrl := urlParse .Values.config.redisUrl }}
+            - name: SKILLSCAN_REDIS_URL
+              value: "{{ $redisUrl.scheme }}://:$(REDIS_PASSWORD)@{{ $redisUrl.host }}{{ $redisUrl.path }}"
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: skillscan-config
@@ -70,7 +88,28 @@ spec:
                 name: {{ .Values.secretRefs.name }}
           resources:
             {{- toYaml .Values.resources.monolith | nindent 12 }}
+          # The shared blobstore (M-E design §4). This mount, the identical one
+          # in engine-runner-deployment.yaml, and skillscan-config's
+          # SKILLSCAN_BLOBSTORE_ROOT all resolve from
+          # persistence.blobstore.mountPath - the three MUST agree, and nothing
+          # at runtime will tell you if they do not.
+          #
+          # Also the reason readOnlyRootFilesystem above is survivable: this is
+          # the only path this process needs to write to.
+          volumeMounts:
+            - name: blobstore
+              mountPath: {{ .Values.persistence.blobstore.mountPath }}
           livenessProbe:
             httpGet: { path: /healthz, port: http }
           readinessProbe:
+            # Includes the blobstore_shared self-check (M-E design §4.3,
+            # modules/gateway/infra_router.py) - if this pod cannot see the
+            # engine-runner's probe file in the volume mounted above, this
+            # returns 503 and a rolling update stalls here, which is strictly
+            # better than shipping a deployment that accepts scans and never
+            # finishes any of them.
             httpGet: { path: /readyz, port: http }
+      volumes:
+        - name: blobstore
+          persistentVolumeClaim:
+            claimName: skillscan-blobstore

@@ -1,0 +1,52 @@
+{{- if .Values.requireSignedImages.enabled }}
+{{- $key := required "requireSignedImages.cosignPublicKey is required when requireSignedImages.enabled=true. An empty or placeholder key used to be silently accepted by Kyverno here and then reject EVERY image at admission with \"PEM decoding failed\" - that failure mode is why this now refuses to render instead of shipping a placeholder. Use render.sh (it validates the key with openssl before ever reaching here), or pass a real PEM with --set-file requireSignedImages.cosignPublicKey=<file>." .Values.requireSignedImages.cosignPublicKey }}
+# Admission: reject unsigned images (coding spec §11.7: "准入: 签名镜像...";
+# §SAD 7.2 CI license/signing gate - cosign signs every image this project
+# builds, including each pin-digest OSS-engine image from M5's
+# deploy/engines/<name>/Dockerfile).
+#
+# Namespace match is `.Release.Namespace` - see pod-security-baseline.yaml's
+# note. cosignPublicKey has NO default (see values.yaml) - render.sh runs
+# `openssl pkey -pubin -noout` on whatever file you give it before this
+# template ever sees the content, so a placeholder/garbage key fails at
+# render time, not as a whole-deployment-breaking admission surprise later.
+#
+# VERIFIED 2026-07-29 on the dev VM (Kyverno 1.18.2): confirmed the INTENDED
+# failure mode with a deliberate placeholder key still reproduces exactly as
+# before ("PEM decoding failed") when someone bypasses render.sh's check -
+# see task-10-report.md. With a real key + real cosign-signed image this
+# rule is expected to admit the pod (not verified here - no real enterprise
+# signing key available in this environment).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+  annotations:
+    policies.kyverno.io/title: Require Signed Images
+    policies.kyverno.io/description: >-
+      Every image in the skillscan release namespace must be cosign-signed
+      by the enterprise's own signing key - unsigned images are rejected at
+      admission.
+spec:
+  validationFailureAction: {{ .Values.requireSignedImages.validationFailureAction }}
+  background: false
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+      verifyImages:
+        - imageReferences:
+            - "*"
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      {{- $key | trim | nindent 22 }}
+{{- end }}

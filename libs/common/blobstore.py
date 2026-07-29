@@ -11,11 +11,19 @@ local development/testing.
 Bucket layout (both implementations honor the same key structure):
   artifacts/<content_hash>/pkg.tar   - pre-normalization artifact (gateway writes, sandbox reads)
   findings/<scan_id>/<engine>.json  - sandbox writes only this prefix, monolith reads
+  _probe/<identity>                 - shared-store self-check, see `share_probe` below
+
+DEPENDENCIES: stdlib only, deliberately - this module is imported by
+`libs/skillscan_core`-adjacent code and by the engine-runner sandbox, and the
+share probe below has to keep working in both.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -51,6 +59,18 @@ class BlobStorePort(Protocol):
     def exists(self, key: str) -> bool: ...
 
 
+class ShareProbeStore(Protocol):
+    """What `share_probe` needs - deliberately NOT `BlobStorePort` + `delete`:
+    widening `BlobStorePort` itself would hand every consumer of a blob store
+    (orchestration, the engine-runner worker) the ability to delete artifacts
+    and findings, which nothing in this system is allowed to do."""
+
+    def put(self, key: str, data: bytes) -> None: ...
+    def get(self, key: str) -> bytes: ...
+    def list_prefix(self, prefix: str) -> list[str]: ...
+    def delete(self, key: str) -> None: ...
+
+
 def artifact_key(content_hash: str) -> str:
     return f"artifacts/{content_hash}/pkg.tar"
 
@@ -67,8 +87,12 @@ class LocalFilesystemBlobStore:
     file paths). Never point production configuration at this class.
     """
 
-    def __init__(self, root: Path) -> None:
-        self._root = root
+    def __init__(self, root: Path | str) -> None:
+        # `str` accepted as well as `Path` because every real caller starts
+        # from a string (`SKILLSCAN_BLOBSTORE_ROOT`) - passing it straight
+        # through used to blow up on `.exists()` with a bare AttributeError
+        # instead of doing the obvious thing.
+        self._root = Path(root)
         if not self._root.exists():
             self._root.mkdir(parents=True)
             self._fix_permissions(self._root)
@@ -178,3 +202,246 @@ class LocalFilesystemBlobStore:
         if not base.is_dir():
             return []
         return sorted(str(p.relative_to(self._root)) for p in base.rglob("*") if p.is_file())
+
+    def delete(self, key: str) -> None:
+        """Only the share probe needs this (expiring another pod's stale probe
+        file); deleting an artifact or a finding is not something any caller
+        in this system does, by design - the audit trail depends on them."""
+        self._path_for(key).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Shared-store self-check (里程碑 E spec §4.3)
+# ---------------------------------------------------------------------------
+#
+# CORRECTNESS: the monolith writes `artifacts/<hash>/pkg.tar`, the engine-runner
+# reads it and writes `findings/<scan_id>/<engine>.json` back, and the monolith
+# reads THAT. If the two processes are not looking at the same store, NOTHING
+# ERRORS: every pod is Running, /healthz is 200, the logs are clean, and scans
+# simply sit at RUNNING forever - the collector is waiting for a findings blob
+# that is being written somewhere it will never look. On a first air-gapped
+# install (two pods, two PVCs, one typo) that is close to undiagnosable.
+#
+# So each process writes a probe file naming itself and checks whether it can
+# see the other's. Nothing else in this module has an opinion about who else is
+# running; this is the only part that does, deliberately.
+
+PROBE_PREFIX = "_probe"
+SHARE_PROBE_TTL_S = 300.0
+# The grace window is load-bearing, not politeness: the two pods never become
+# ready at the same instant (the engine-runner retries its Redis consumer group
+# for up to 60s before its first tick), so without it EVERY first install goes
+# red before it goes green and the deployment guide has to explain away a
+# failure that is not one.
+SHARE_PROBE_GRACE_S = 60.0
+SHARE_PROBE_INTERVAL_S = 15.0
+
+MONOLITH_PROBE_ROLE = "monolith"
+ENGINE_RUNNER_PROBE_ROLE = "engine-runner"
+
+# The deployment guide's troubleshooting section is indexed by symptom and this
+# exact string is the anchor for its first entry - `kubectl logs ... | grep
+# 'blobstore not shared'`. Do not reword it without updating that section.
+NOT_SHARED_MESSAGE = (
+    "blobstore not shared: no peer probe file is visible in this process's blob "
+    "store, so the monolith and the engine-runner are using DIFFERENT stores - "
+    "scans will stay RUNNING forever without any error being raised"
+)
+
+_UNSAFE_IDENTITY_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def probe_identity(role: str, instance: str) -> str:
+    """`<role>-<instance>`, reduced to something safe to use as a file name.
+
+    Pure: the caller supplies the instance name (pod name / hostname); this
+    never reads the environment and never reads the clock.
+    """
+    safe = _UNSAFE_IDENTITY_CHARS.sub("-", f"{role}-{instance}").strip("-.")
+    return (safe or role)[:120]
+
+
+@dataclass(frozen=True)
+class ShareProbeResult:
+    identity: str
+    peers: frozenset[str]
+    # Peers whose probe file was older than the TTL. Reported rather than
+    # silently dropped so an operator can tell "the other side was never here"
+    # from "the other side was here and stopped".
+    expired: frozenset[str]
+
+
+def share_probe(
+    store: ShareProbeStore,
+    *,
+    identity: str,
+    now: float,
+    ttl_s: float = SHARE_PROBE_TTL_S,
+) -> ShareProbeResult:
+    """Announce this process in the store and report which peers it can see.
+
+    Writes `_probe/<identity>` (content: `now`), then reads every OTHER file in
+    `_probe/`, discarding any written more than `ttl_s` ago - pod names are
+    unique per restart, so without expiry these files would accumulate for the
+    life of the volume and a long-dead pod would keep vouching for a store that
+    nobody is sharing any more. Expired files are deleted (best effort: the
+    peer that wrote one is a different uid, so the unlink may be refused - that
+    is not this process's problem to solve, the TTL already handled the lie).
+
+    `now` is a parameter, never `time.time()` read in here: this has to be
+    testable without sleeping, and both sides have to agree on the same time
+    base (wall clock, since the two processes are in different containers -
+    monotonic clocks are not comparable across them).
+    """
+    # SECURITY: the identity becomes a file name under `_probe/` - reject
+    # anything that isn't, rather than relying on `_path_for`'s traversal check
+    # downstream (a MinIO-backed store wouldn't have that check at all).
+    if not identity or identity in {".", ".."} or _UNSAFE_IDENTITY_CHARS.search(identity):
+        raise ValueError(f"probe identity must be file-name safe: {identity!r}")
+    key = f"{PROBE_PREFIX}/{identity}"
+    store.put(key, f"{now}".encode())
+
+    peers: set[str] = set()
+    expired: set[str] = set()
+    for peer_key in store.list_prefix(PROBE_PREFIX):
+        name = peer_key.rsplit("/", 1)[-1]
+        if name == identity:
+            continue
+        try:
+            written = float(store.get(peer_key).decode("utf-8").strip())
+        except (BlobNotFoundError, OSError, UnicodeDecodeError, ValueError):
+            # Unreadable or half-written: not counted as a peer this round, and
+            # deliberately NOT deleted. A peer rewriting its own probe file can
+            # be read mid-write; deleting on that would take a healthy peer out
+            # of view for a full interval and flap /readyz for no reason. Its
+            # next write makes it readable again, and if the peer is really
+            # gone the TTL below expires it on a later pass.
+            continue
+        if now - written > ttl_s:
+            expired.add(name)
+            try:
+                store.delete(peer_key)
+            except OSError:
+                # A different uid wrote it; the TTL already discounted it,
+                # whether or not this process is allowed to unlink it.
+                pass
+            continue
+        peers.add(name)
+
+    return ShareProbeResult(identity=identity, peers=frozenset(peers), expired=frozenset(expired))
+
+
+@dataclass(frozen=True)
+class ShareStatus:
+    """The readiness view of the probe: `ready` is what `/readyz` reports."""
+
+    identity: str
+    ready: bool
+    peers: frozenset[str]
+    in_grace: bool
+    checked_at: float | None
+    # True when this check flipped `ready` - lets a caller log the recovery
+    # once instead of on every tick.
+    changed: bool
+
+
+class ShareProbeMonitor:
+    """Repeated `share_probe` calls plus the grace window, with no clock of its
+    own - every method that needs the time takes it as an argument, same as
+    `share_probe` itself.
+
+    `peer_role` matters more than it looks: with two monolith replicas on one
+    PVC, "I can see SOME peer" is true even when the engine-runner is mounted
+    somewhere else entirely - which is the exact failure this whole mechanism
+    exists to catch. Each side looks for the OTHER role specifically.
+    """
+
+    def __init__(
+        self,
+        store: ShareProbeStore,
+        *,
+        identity: str,
+        peer_role: str,
+        started_at: float,
+        grace_s: float = SHARE_PROBE_GRACE_S,
+        ttl_s: float = SHARE_PROBE_TTL_S,
+    ) -> None:
+        self._store = store
+        self._identity = identity
+        self._peer_prefix = f"{peer_role}-"
+        self._started_at = started_at
+        self._grace_s = grace_s
+        self._ttl_s = ttl_s
+        # Starts ready: an unchecked store must not take a pod out of rotation
+        # before the first probe has even run.
+        self._status = ShareStatus(
+            identity=identity,
+            ready=True,
+            peers=frozenset(),
+            in_grace=True,
+            checked_at=None,
+            changed=False,
+        )
+
+    @property
+    def identity(self) -> str:
+        return self._identity
+
+    @property
+    def status(self) -> ShareStatus:
+        return self._status
+
+    @property
+    def peer_role(self) -> str:
+        return self._peer_prefix.rstrip("-")
+
+    def check(self, now: float) -> ShareStatus:
+        result = share_probe(self._store, identity=self._identity, now=now, ttl_s=self._ttl_s)
+        peers = frozenset(p for p in result.peers if p.startswith(self._peer_prefix))
+        in_grace = (now - self._started_at) < self._grace_s
+        ready = bool(peers) or in_grace
+        status = ShareStatus(
+            identity=self._identity,
+            ready=ready,
+            peers=peers,
+            in_grace=in_grace,
+            checked_at=now,
+            # The first check counts as a change so that a healthy deployment
+            # says so ONCE in its logs. Without this the happy path is
+            # completely silent, and "no log line" is not something an operator
+            # following the deployment guide can confirm anything from.
+            changed=self._status.checked_at is None or ready != self._status.ready,
+        )
+        self._status = status
+        return status
+
+
+def log_share_status(logger: logging.Logger, status: ShareStatus, *, peer_role: str) -> None:
+    """Emit the one log line the deployment guide tells operators to grep for.
+
+    Lives here rather than in each process's own main so the message text and
+    the level cannot drift apart between the two - the guide indexes the
+    troubleshooting entry by this exact string, in both processes' logs.
+    The logger is passed in so this module keeps importing nothing but stdlib.
+
+    Logged on EVERY failing check, not only on the transition into failure: a
+    deployment that has been silently broken for an hour must still be
+    diagnosable from the last few minutes of logs.
+    """
+    context = {
+        "identity": status.identity,
+        "expected_peer_role": peer_role,
+        "peers_seen": sorted(status.peers),
+    }
+    if not status.ready:
+        logger.error(
+            NOT_SHARED_MESSAGE, extra={"context": {"metric": "blobstore_not_shared", **context}}
+        )
+    elif status.peers and status.changed:
+        # `status.peers` guard: during the grace window a process with no peer
+        # yet is "ready", and announcing sharing it has not observed would be
+        # the exact false reassurance this check exists to prevent.
+        logger.info(
+            "blobstore sharing confirmed",
+            extra={"context": {"metric": "blobstore_shared", **context}},
+        )

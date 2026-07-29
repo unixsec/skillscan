@@ -1,23 +1,31 @@
 # Default-deny-all NetworkPolicy (coding spec §8/§11.7 INV-14: "default-deny
 # egress; sandbox 白名单仅内网...外部出站不可能(边界+NetworkPolicy双重强制)").
 #
-# SECURITY: applies to every pod in the skillscan namespace (empty podSelector
-# matches all pods) - both Ingress and Egress default to deny. Every other
-# NetworkPolicy in this directory is an ADDITIVE allowlist on top of this
-# baseline (Kubernetes NetworkPolicies are purely additive - a pod's
+# SECURITY: applies to every pod in WHATEVER NAMESPACE THIS IS APPLIED TO
+# (empty podSelector matches all pods) - both Ingress and Egress default to
+# deny. Every other NetworkPolicy in this directory is an ADDITIVE allowlist on
+# top of this baseline (Kubernetes NetworkPolicies are purely additive - a pod's
 # effective policy is the union of every NetworkPolicy that selects it), so
 # nothing in this namespace has ANY network access until explicitly granted.
 #
-# NOT VERIFIED: no real Kubernetes cluster is available in this development
-# environment (macOS, no Linux-only CNI enforcement) - this manifest has not
-# been applied/tested here. Coding spec's own acceptance criterion for this
-# invariant is explicit that isolation tests only count when run on Linux
-# ("沙箱相关安全测试仅在真实隔离运行时(Linux)下计入门禁").
+# ⚠ APPLY WITH AN EXPLICIT -n: every file here USED TO carry
+# `namespace: skillscan`, which meant `kubectl apply -f deploy/networkpolicy/`
+# cut off a namespace called skillscan no matter which namespace you had
+# installed the release into - including, on a shared cluster, someone else's
+# running system. The field is gone; `kubectl apply -n <release-ns> -f
+# deploy/networkpolicy/` now lands where you say, and lands nowhere if you
+# forget the flag (it goes to your current context's namespace).
+#
+# VERIFIED 2026-07-29 on the dev VM (k3s v1.36.2), applied to a real release:
+# enforcement is real - a fresh monolith could not reach MySQL and every API
+# call through the console returned 502 until mysql-ingress.yaml,
+# monolith-ingress.yaml, web-allowlist.yaml and migration-egress-allowlist.yaml
+# were added alongside. kubelet's own probe traffic was NOT blocked by this
+# CNI; do not assume that holds on yours.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: default-deny-all
-  namespace: skillscan
 spec:
   podSelector: {}
   policyTypes:

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: skillscan-kyverno-policies
+description: >-
+  Cluster-scoped Kyverno ClusterPolicies for a skillscan release. Rendered
+  separately from deploy/helm/skillscan (ClusterPolicy needs cluster-admin
+  RBAC the app installer may not have, and has an independent lifecycle) -
+  see render.sh.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

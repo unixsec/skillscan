@@ -1,0 +1,59 @@
+# Web console (nginx) ingress + egress.
+#
+# INGRESS IS DELIBERATELY OPEN TO ANY SOURCE. An `ingress` rule with ports but
+# no `from` matches every peer, which is what an internet-facing rule would look
+# like and is NOT what this is: the pod is only reachable through
+# svc/skillscan-web (ClusterIP by default), and the client that must reach it is
+# the cluster's ingress controller, whose namespace and labels differ per
+# cluster (ingress-nginx / traefik / whatever the enterprise runs) and cannot be
+# named in a manifest that ships with the chart. Narrow this to your own
+# controller's namespaceSelector when you know it - that is a real improvement,
+# not a formality.
+#
+# EGRESS is only DNS and this release's own monolith. nginx proxies /v1/* there
+# (templates/web.yaml's ConfigMap) and talks to nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: web
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-egress-allowlist
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: web
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: core-monolith
+      ports:
+        - protocol: TCP
+          port: 8000

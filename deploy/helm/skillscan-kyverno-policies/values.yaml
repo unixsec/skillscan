@@ -1,0 +1,45 @@
+# Render with render.sh (validates input first) or directly with:
+#   helm template deploy/helm/skillscan-kyverno-policies -n <release-namespace> \
+#     [--set requireSignedImages.enabled=true \
+#      --set-file requireSignedImages.cosignPublicKey=<pem-file>] \
+#     | kubectl apply -f -
+#
+# <release-namespace> MUST be the same namespace `deploy/helm/skillscan` was
+# installed into (`.Release.Namespace`, i.e. whatever you pass with `-n`).
+#
+# HISTORY: all three ClusterPolicies below used to hardcode `namespaces:
+# [skillscan]` in their match rules. Installing skillscan into any other
+# namespace got silent zero admission enforcement - no error, `kubectl get
+# clusterpolicy` looked completely normal, the policy just never matched
+# anything. Fixed by templating the match namespace from
+# `.Release.Namespace` instead of a literal. gvisorSandboxRuntimeClass was
+# the last of the three fixed (Task 11) - pod-security-baseline and
+# require-signed-images moved into this chart first (Task 10).
+
+podSecurityBaseline:
+  enabled: true
+  validationFailureAction: Enforce
+
+gvisorSandboxRuntimeClass:
+  # On by default like podSecurityBaseline - this is a real security
+  # boundary (untrusted Skill content execution, INV-10/INV-11), not an
+  # optional add-on. If your cluster has no gVisor RuntimeClass installed,
+  # engine-runner/dynamic-sandbox pods fail regardless of this policy (see
+  # DEPLOYMENT_GUIDE §6.1③) - disabling this policy does not fix that, it
+  # only removes the admission-time signal pointing at the real cause.
+  enabled: true
+  validationFailureAction: Enforce
+
+requireSignedImages:
+  # Optional and OFF by default: unlike podSecurityBaseline this cannot work
+  # without a real, site-specific cosign public key. The old static YAML
+  # shipped a placeholder key that Kyverno accepted without complaint at
+  # `kubectl apply` time and then rejected EVERY image at admission with
+  # "PEM decoding failed" - a hard-to-diagnose, whole-deployment-breaking
+  # failure for anyone who applied it as documented. There is deliberately no
+  # default value that lets this render silently: enabling it with an empty
+  # or placeholder key fails the render instead (see templates/ and
+  # render.sh's openssl check).
+  enabled: false
+  validationFailureAction: Enforce
+  cosignPublicKey: ""

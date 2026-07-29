@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skillscan-mysql-data
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.mysql.size }}
+  {{- with .Values.persistence.mysql.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: skillscan-blobstore
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+  annotations:
+    # SECURITY/CORRECTNESS: ReadWriteMany is load-bearing, not a preference.
+    # The monolith writes artifacts/<hash>/pkg.tar and the engine-runner reads
+    # it, then writes findings back for the monolith to read. If these two pods
+    # do not see the same filesystem NOTHING ERRORS - every pod is Running,
+    # health checks pass, and scans simply stay RUNNING forever. A cluster
+    # without an RWX StorageClass must fail here, at PVC binding, where the
+    # error is legible.
+    "skillscan.io/why-rwx": "monolith and engine-runner share this store; see DEPLOYMENT_GUIDE"
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.blobstore.size }}
+  {{- with .Values.persistence.blobstore.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}

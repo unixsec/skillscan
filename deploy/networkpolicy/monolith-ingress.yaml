@@ -1,0 +1,28 @@
+# Monolith ingress allowlist. The console's nginx (templates/web.yaml) is a
+# same-origin reverse proxy, so EVERY API call arrives here from a web pod.
+#
+# MEASURED on the dev VM: with default-deny-all applied and nothing granting
+# this, the console still loads (nginx serves the built SPA from its own image)
+# and every API call returns 502 - `GET /` 200, `POST /v1/admin/local/login`
+# 502. A newcomer reads that as "the console is up, login is broken".
+#
+# Deliberately NOT open to engine-runner: INV-10 keeps the sandbox off any path
+# to the monolith - it exchanges work through Redis and the blobstore only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monolith-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: core-monolith
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: web
+      ports:
+        - port: 8000
+          protocol: TCP

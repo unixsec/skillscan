@@ -15,13 +15,24 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
+import socket
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
 import redis.asyncio as aioredis
-from common.blobstore import LocalFilesystemBlobStore
+from common.blobstore import (
+    ENGINE_RUNNER_PROBE_ROLE,
+    MONOLITH_PROBE_ROLE,
+    SHARE_PROBE_GRACE_S,
+    SHARE_PROBE_INTERVAL_S,
+    LocalFilesystemBlobStore,
+    ShareProbeMonitor,
+    log_share_status,
+    probe_identity,
+)
 from common.config import (
     MarketplaceSettings,
     OidcSettings,
@@ -140,6 +151,17 @@ def _build_signer(settings: Settings) -> SignerPort:
 
 
 def _build_marketplace() -> MarketplacePort | None:
+    # SECURITY (INV-14): `base_url` is read raw here, same shape as every other
+    # optional-endpoint read in this file - but unlike a bare `os.environ.get`
+    # used directly, it is validated a few lines below, at construction of
+    # `MarketplaceSettings(api_base_url=base_url, ...)`: that class's own
+    # `require_internal_endpoint` model_validator (libs/common/config.py)
+    # fires on ANY non-empty value regardless of source, so this is "validate
+    # at the read site", the same choice `_build_signer`'s `VaultSettings`
+    # construction makes for `SKILLSCAN_VAULT_ADDR`. `monolith.config.Settings`
+    # deliberately carries no `marketplace_api` field of its own - see that
+    # class's docstring for why duplicating a field `MarketplaceSettings`
+    # already owns and validates would just be a second, driftable spelling.
     base_url = os.environ.get("SKILLSCAN_MARKETPLACE_API_BASE_URL")
     if not base_url:
         _logger.warning(
@@ -448,6 +470,78 @@ def _warn_if_marketplace_poll_hint_too_slow(settings: Settings) -> None:
         )
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _logger.warning(
+            f"{name} is not a number - using the default",
+            extra={"context": {"value": raw, "default": default}},
+        )
+        return default
+
+
+def _probe_instance() -> str:
+    # Kubernetes sets HOSTNAME to the pod name; outside k8s the hostname is
+    # still the thing that distinguishes two processes sharing one store.
+    return os.environ.get("HOSTNAME") or socket.gethostname()
+
+
+def _build_share_probe_monitor(scan_runtime: ScanRuntime) -> ShareProbeMonitor | None:
+    """The blobstore share self-check (里程碑 E spec §4.3), or None if it can't
+    or shouldn't run in this process.
+
+    CORRECTNESS: when this monolith and the engine-runner are not looking at the
+    same store, NOTHING errors - both pods are Running, /healthz is 200, the
+    logs are clean, and every scan sits at RUNNING forever waiting for a
+    findings blob written into a store this process never reads. That is why
+    the check is on by default and why turning it off logs a warning.
+    """
+    if _env("SKILLSCAN_BLOBSTORE_SHARE_CHECK", "1").lower() not in {"1", "true", "yes", "on"}:
+        _logger.warning(
+            "blobstore share self-check DISABLED - if this process and the engine-runner "
+            "end up on different volumes, scans will stay RUNNING forever with no error",
+            extra={"context": {"metric": "blobstore_share_check_disabled"}},
+        )
+        return None
+    store = scan_runtime.blobstore
+    if not isinstance(store, LocalFilesystemBlobStore):
+        # Nothing else implements BlobStorePort today; if something ever does,
+        # skipping is the honest answer rather than pretending the check ran.
+        _logger.warning(
+            "blobstore share self-check skipped - store is not filesystem-backed",
+            extra={"context": {"store": type(store).__name__}},
+        )
+        return None
+    return ShareProbeMonitor(
+        store,
+        identity=probe_identity(MONOLITH_PROBE_ROLE, _probe_instance()),
+        peer_role=ENGINE_RUNNER_PROBE_ROLE,
+        started_at=time.time(),
+        grace_s=_env_float("SKILLSCAN_BLOBSTORE_SHARE_GRACE_S", SHARE_PROBE_GRACE_S),
+    )
+
+
+async def _run_share_probe_loop(
+    monitor: ShareProbeMonitor, *, interval_s: float, stop_event: asyncio.Event
+) -> None:
+    """ROBUSTNESS: the probe's filesystem work runs in a thread. The shared
+    store is an RWX volume (NFS in the reference deployment) - a hung server
+    there must degrade readiness, not block this process's event loop and take
+    every HTTP request down with it."""
+    while not stop_event.is_set():
+        try:
+            status = await asyncio.to_thread(monitor.check, time.time())
+            log_share_status(_logger, status, peer_role=monitor.peer_role)
+        except Exception:  # noqa: BLE001 - a probe failure must never kill the loop
+            _logger.exception("blobstore share probe failed - continuing")
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+
+
 def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
     """Returns the runtime plus the SQLAlchemy engines it created, so
     `create_app()`'s lifespan can dispose them on shutdown - only when it
@@ -567,14 +661,34 @@ def create_app(
                     stop_event=stop_event,
                 )
             )
+
+        # 里程碑 E spec §4.3 - shared-blobstore self-check. Started here (not in
+        # create_app's body) so a test-built app, which httpx.ASGITransport
+        # runs WITHOUT a lifespan, never starts a background probe; `/readyz`
+        # leaves the check out entirely when no monitor is parked on app.state.
+        share_monitor = _build_share_probe_monitor(scan_runtime)
+        app.state.blobstore_share_monitor = share_monitor
+        share_task: asyncio.Task[None] | None = None
+        if share_monitor is not None:
+            share_task = asyncio.create_task(
+                _run_share_probe_loop(
+                    share_monitor,
+                    interval_s=_env_float(
+                        "SKILLSCAN_BLOBSTORE_SHARE_INTERVAL_S", SHARE_PROBE_INTERVAL_S
+                    ),
+                    stop_event=stop_event,
+                )
+            )
         try:
             yield
         finally:
-            if worker_task is not None:
-                stop_event.set()
-                worker_task.cancel()
+            stop_event.set()
+            for task in (worker_task, share_task):
+                if task is None:
+                    continue
+                task.cancel()
                 with suppress(asyncio.CancelledError):
-                    await worker_task
+                    await task
             # SECURITY/hygiene: only dispose engines THIS call built - a
             # caller-supplied scan_runtime (tests, mainly) owns its own
             # engines' lifecycle, e.g. a fixture shared across several tests.
@@ -635,19 +749,16 @@ def create_app(
     ):
         _logger.warning(warning, extra={"context": {"metric": "reconciliation_inactive"}})
 
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
-        return {"status": "ok"}
-
-    @app.get("/readyz")
-    async def readyz() -> dict[str, str]:
-        return {"status": "ready"}
-
-    @app.get("/.well-known/jwks.json")
-    async def jwks() -> dict[str, object]:
-        # SECURITY (INV-13): lets the marketplace verify verdict JWS signatures
-        # without any out-of-band key distribution.
-        scan_runtime_state: ScanRuntime = app.state.scan
-        return await scan_runtime_state.signer.jwks()
+    # `/healthz`, `/readyz` and `/.well-known/jwks.json` live in
+    # `modules/gateway/infra_router.py` (coding spec §9), included above.
+    #
+    # BUG (found implementing 里程碑 E's §4.3 readiness check): this file also
+    # carried its own copies of all three, defined AFTER `include_router`.
+    # Starlette matches routes in registration order, so the router's copies
+    # always won and these were dead code that merely looked authoritative -
+    # confirmed by running both registrations against a real app, not by
+    # reading. Adding the share check to the copy here would have shipped a
+    # self-check that never executed: exactly the milestone's recurring shape,
+    # where the path that runs and the path that looks like it runs differ.
 
     return app

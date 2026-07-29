@@ -1,10 +1,17 @@
+{{- if .Values.podSecurityBaseline.enabled }}
 # Admission: 禁特权/资源上限/非 root (coding spec §11.7). Three related pod-
 # security checks bundled in one policy (each its own named rule so a
 # violation report names the SPECIFIC failing check, not just "policy
 # rejected").
 #
-# NOT VERIFIED: see require-signed-images.yaml's own note - no real cluster
-# available in this environment.
+# Namespace match is `.Release.Namespace` (whatever `-n` you render this
+# chart with), not a literal - see values.yaml's HISTORY note for why that
+# matters. It MUST be the same namespace deploy/helm/skillscan was installed
+# into, or this enforces on the wrong namespace.
+#
+# VERIFIED 2026-07-29 on the dev VM (Kyverno 1.18.2, k3s v1.36.2): a
+# non-compliant pod in the rendered namespace is genuinely rejected at
+# admission (not just "looks configured") - see task-10-report.md.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -13,9 +20,9 @@ metadata:
     policies.kyverno.io/title: Pod Security Baseline
     policies.kyverno.io/description: >-
       Disallow privileged containers, require CPU/memory limits, require
-      non-root, for every pod in the skillscan namespace.
+      non-root, for every pod in the skillscan release namespace.
 spec:
-  validationFailureAction: Enforce
+  validationFailureAction: {{ .Values.podSecurityBaseline.validationFailureAction }}
   background: true
   rules:
     - name: disallow-privileged
@@ -25,7 +32,7 @@ spec:
               kinds:
                 - Pod
               namespaces:
-                - skillscan
+                - {{ .Release.Namespace }}
       validate:
         message: "Privileged containers are not allowed."
         pattern:
@@ -41,7 +48,7 @@ spec:
               kinds:
                 - Pod
               namespaces:
-                - skillscan
+                - {{ .Release.Namespace }}
       validate:
         # SECURITY (2026-07-10): container-level securityContext OVERRIDES
         # pod-level (k8s semantics) - a pattern that only checks
@@ -81,7 +88,7 @@ spec:
               kinds:
                 - Pod
               namespaces:
-                - skillscan
+                - {{ .Release.Namespace }}
       validate:
         message: "Every container must declare CPU and memory limits."
         pattern:
@@ -91,3 +98,4 @@ spec:
                   limits:
                     cpu: "?*"
                     memory: "?*"
+{{- end }}

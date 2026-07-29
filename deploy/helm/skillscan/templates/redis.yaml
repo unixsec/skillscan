@@ -1,0 +1,121 @@
+{{- if .Values.redis.enabled }}
+# Redis (coding spec §4.3/§8): the chart's own Redis instance, for a self-
+# contained air-gapped install. `values.redis.enabled: false` lets an
+# operator point `config.redisUrl` at an external instance instead - that
+# path is provided but NOT verified by this milestone (spec §9).
+#
+# DELIBERATELY NO PERSISTENCE - no PVC, no RDB/AOF config. In this system
+# Redis carries exactly two things: the airlock scan/result streams
+# (libs/common/airlock.py) and rate-limit counters. Both are rebuildable
+# runtime state, not a system of record - a lost Redis means in-flight scans
+# need resubmitting and rate-limit windows reset, not lost data. This is
+# intentional, not an oversight: do not "fix" it by adding a PVC here, there
+# is nothing in this Redis that needs to survive a restart. The `/data`
+# emptyDir below exists only so `readOnlyRootFilesystem` can be turned on -
+# it is node-local scratch space, not persistence (gone on every restart or
+# reschedule, same as everything else this Redis holds).
+#
+# SECURITY: `--requirepass` from Task 1's Secret (SKILLSCAN_REDIS_PASSWORD) -
+# deploy/networkpolicy/redis-ingress.yaml already restricts callers by pod
+# label, but this milestone's whole point is a self-contained install that
+# doesn't quietly depend on an enterprise having applied that NetworkPolicy
+# layer too. Auth is the control that still holds if they haven't.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skillscan-redis
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: skillscan
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "skillscan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      # SECURITY: same runAsNonRoot + explicit runAsUser reasoning as
+      # mysql.yaml/monolith-deployment.yaml. The official redis:7-alpine
+      # image's own `redis` user is uid 999 / gid 1000 (confirmed by running
+      # `id redis` inside the image - note the gid does NOT match the uid
+      # here, unlike mysql's image). fsGroup: 1000 matches that gid so the
+      # `/data` emptyDir below (needed for readOnlyRootFilesystem) is
+      # writable by this non-root user.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 1000
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          args:
+            - --requirepass
+            - $(REDIS_PASSWORD)
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretRefs.name }}
+                  key: SKILLSCAN_REDIS_PASSWORD
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            {{- toYaml .Values.resources.redis | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            # `sh -c` here for the same reason as mysql.yaml's probes: probe
+            # exec commands do not get Kubernetes' $(VAR) substitution, so
+            # the shell reads $REDIS_PASSWORD from this container's own
+            # environment instead. --no-auth-warning just silences the
+            # (harmless) stderr warning about passwords on a command line.
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  selector:
+    app.kubernetes.io/name: skillscan
+    app.kubernetes.io/component: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+{{- end }}

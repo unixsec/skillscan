@@ -27,6 +27,10 @@ var/
 # Root-scoped on purpose: web/ may legitimately version image assets later.
 /*.png
 
+# Offline image bundles built by scripts/build_offline_bundle.sh (hundreds of MB
+# of container image blobs - the transfer artifact, never a versioned one)
+/dist/
+
 # Working spreadsheets / binary docs - this repo versions reports as .html/.md only
 /*.xlsx
 /doc/devfile/*.pdf

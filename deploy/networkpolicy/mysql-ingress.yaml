@@ -1,0 +1,34 @@
+# MySQL ingress allowlist - same shape as redis-ingress.yaml, for the database
+# the chart installs (deploy/helm/skillscan/templates/mysql.yaml).
+#
+# MEASURED, not inferred: with default-deny-all applied and no policy naming
+# mysql, an already-running monolith keeps working (its pool is established and
+# conntrack lets the replies through) and a RESTARTED one dies -
+#   (pymysql.err.OperationalError) (2003, "Can't connect to MySQL server on 'mysql'")
+#   ERROR:    Application startup failed. Exiting.
+# - so this gap surfaces at the next pod restart, not when the policies are
+# applied. Observed on the dev VM (k3s v1.36.2) during M-E task 9.
+#
+# The migration Job needs it too: it runs `alembic upgrade head` and
+# db/setup_grants.py against this same server on every install/upgrade.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mysql-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: mysql
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: core-monolith
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: migration
+      ports:
+        - port: 3306
+          protocol: TCP

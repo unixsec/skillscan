@@ -6,7 +6,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: skillscan-engine-runner
-  namespace: skillscan
   labels:
     {{- include "skillscan.labels" . | nindent 4 }}
     app.kubernetes.io/component: engine-runner
@@ -50,9 +49,40 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
           env:
+            {{- if .Values.redis.enabled }}
+            # SECURITY: same override as monolith-deployment.yaml - the
+            # chart's own Redis requires auth (see redis.yaml), so build an
+            # authenticated URL from config.redisUrl's host/port/db plus the
+            # Secret's password rather than using the plain ConfigMap value.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretRefs.name }}
+                  key: SKILLSCAN_REDIS_PASSWORD
+            {{- $redisUrl := urlParse .Values.config.redisUrl }}
+            - name: SKILLSCAN_REDIS_URL
+              value: "{{ $redisUrl.scheme }}://:$(REDIS_PASSWORD)@{{ $redisUrl.host }}{{ $redisUrl.path }}"
+            {{- else }}
             - name: SKILLSCAN_REDIS_URL
               valueFrom:
                 configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_REDIS_URL }
+            {{- end }}
+            # ⚠ LOAD-BEARING (M-E design §4). This Deployment lists its env
+            # individually and has no `envFrom`, so - unlike the monolith,
+            # which picks the key up from skillscan-config wholesale - leaving
+            # this out does NOT produce an error. main.py falls back to a
+            # default root, each pod quietly uses its own directory, monolith
+            # and engine-runner never see each other's blobs, and every scan
+            # sits in RUNNING forever with all pods Running and every health
+            # check green. Sourced from the same ConfigMap key the monolith
+            # gets, so the two cannot drift apart.
+            - name: SKILLSCAN_BLOBSTORE_ROOT
+              valueFrom:
+                configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_BLOBSTORE_ROOT }
+            # Kept explicit rather than left to main.py's default, so this
+            # value and the containerPort/readinessProbe below cannot disagree.
+            - name: SKILLSCAN_ENGINE_RUNNER_READY_PORT
+              value: {{ .Values.engineRunner.readyPort | quote }}
             - name: SKILLSCAN_VLLM_BASE_URL
               valueFrom:
                 configMapKeyRef: { name: skillscan-config, key: SKILLSCAN_VLLM_BASE_URL }
@@ -75,5 +105,61 @@ spec:
                   name: {{ .Values.secretRefs.name }}
                   key: SKILLSCAN_LLM_API_KEY
                   optional: true
+          ports:
+            # This process is a Redis consumer with no HTTP surface of its
+            # own; the listener behind this port serves only GET /healthz and
+            # GET /readyz (services/engine_runner/main.py). It exists so the
+            # shared-blobstore self-check has somewhere to be asked from.
+            - name: readyz
+              containerPort: {{ .Values.engineRunner.readyPort }}
           resources:
             {{- toYaml .Values.resources.engineRunner | nindent 12 }}
+          # The other half of the shared blobstore - same claim, same path as
+          # monolith-deployment.yaml, both from
+          # persistence.blobstore.mountPath. If these two paths ever differ the
+          # manifests still render, still apply, and still run.
+          volumeMounts:
+            - name: blobstore
+              mountPath: {{ .Values.persistence.blobstore.mountPath }}
+            # ⚠ LOAD-BEARING with readOnlyRootFilesystem above. Every engine
+            # adapter unpacks the package into a tempfile.TemporaryDirectory
+            # before spawning its subprocess (adapters/base.py analyze()), and
+            # with a read-only root and no writable /tmp that raises
+            #   FileNotFoundError: No usable temporary directory found in
+            #   ['/tmp', '/var/tmp', '/usr/tmp', '/app']
+            # on EVERY tick. worker.py leaves the message unacked for
+            # redelivery, so the pod stays Running and Ready, the log fills
+            # with identical tracebacks, and the scan sits in `running`
+            # forever - the same visible symptom as an unshared blobstore, from
+            # a completely different cause. Measured on the dev VM; the
+            # hand-built deployment never saw it because it sets no container
+            # securityContext at all.
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            # ⚠ Without this the self-check is inert: it would compute the
+            # right answer and no one would ever ask for it. 503 here takes
+            # this pod out of rotation and stalls a rolling update, which is
+            # how a broken shared volume becomes visible instead of becoming a
+            # queue of scans that never complete.
+            #
+            # No livenessProbe deliberately. /healthz is state-independent by
+            # design (a broken volume must not get the pod killed - restarting
+            # cannot fix a volume), and the readiness listener runs in its own
+            # thread, so a liveness probe on it would report healthy even if
+            # the consumer loop were wedged. It would add restart risk and
+            # detect nothing.
+            httpGet: { path: /readyz, port: readyz }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: blobstore
+          persistentVolumeClaim:
+            claimName: skillscan-blobstore
+        # Scratch space for the engine subprocesses, thrown away with the pod.
+        # NOT the blobstore: nothing here outlives a single analyze() call, and
+        # putting engine scratch on the shared RWX volume would put untrusted
+        # unpacked content where the monolith also reads.
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.engineRunner.tmpSizeLimit }}

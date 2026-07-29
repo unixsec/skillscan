@@ -1,0 +1,135 @@
+{{- if .Values.mysql.enabled }}
+# MySQL (coding spec §4.3): the chart's own MySQL instance, for a self-
+# contained air-gapped install. `values.mysql.enabled: false` lets an
+# operator point `config.mysqlHost` at an external instance instead - that
+# path is provided but NOT verified by this milestone (spec §9).
+#
+# SECURITY: runAsNonRoot + explicit runAsUser + fsGroup, same shape as
+# monolith-deployment.yaml's own securityContext and for the same reason -
+# see the "SECURITY/BUG" comment there, found live against the real k3s
+# cluster: `runAsNonRoot: true` with no explicit `runAsUser` fails closed
+# ("cannot verify user is non-root") since a name-based USER can't be
+# resolved to a uid without an /etc/passwd lookup kubelet doesn't do. The
+# official mysql:8.0 image's own `mysql` user is uid/gid 999 (confirmed by
+# running `id mysql` inside the image) - `fsGroup: 999` is what actually
+# makes non-root work here: it makes k8s chown the mounted PVC to that group
+# on attach, which is what lets mysqld initialize/write the data directory
+# without ever needing to run as root itself to do its own chown.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skillscan-mysql
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mysql
+spec:
+  replicas: 1
+  # The data volume below (skillscan-mysql-data) is ReadWriteOnce. A rolling
+  # update briefly runs the old and new pod together, which would try to bind
+  # the same RWO volume to a second pod - that pod deadlocks Pending forever,
+  # waiting for a volume the old pod still holds. Recreate tears the old pod
+  # down (and frees the volume) before the new one is scheduled.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: skillscan
+      app.kubernetes.io/component: mysql
+  template:
+    metadata:
+      labels:
+        {{- include "skillscan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mysql
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: mysql
+          image: {{ .Values.mysql.image }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem deliberately NOT set: mysqld writes its
+            # error log, socket, and temp tables outside /var/lib/mysql too
+            # (e.g. /var/run/mysqld, /tmp) - the official image was never
+            # built expecting a read-only root, unlike the first-party
+            # monolith/engine-runner images.
+          ports:
+            - name: mysql
+              containerPort: 3306
+          resources:
+            {{- toYaml .Values.resources.mysql | nindent 12 }}
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretRefs.name }}
+                  key: MYSQL_ROOT_PASSWORD
+            # Auto-creates this schema on first boot (official image's
+            # entrypoint behavior) - without it the migration Job's
+            # `alembic upgrade head` has no database to connect to.
+            - name: MYSQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: skillscan-config
+                  key: SKILLSCAN_DB_NAME
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          readinessProbe:
+            # SECURITY/CORRECTNESS: exec `mysqladmin ping`, deliberately NOT a
+            # tcpSocket probe. mysqld starts listening on 3306 well before it
+            # has finished initializing and is actually ready to serve
+            # queries - a tcpSocket probe would report Ready during that
+            # window, and the migration Job (which waits on this readiness
+            # via the Service) would start against a server that refuses
+            # every connection and fail. `mysqladmin ping` only succeeds once
+            # the server can actually complete a login and answer.
+            #
+            # Runs via `sh -c` (not a bare exec array) because Kubernetes
+            # does not expand `$(VAR)`-style references inside probe exec
+            # commands the way it does for a container's own command/args -
+            # the shell here reads $MYSQL_ROOT_PASSWORD from this container's
+            # own environment instead.
+            exec:
+              command:
+                - sh
+                - -c
+                - mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD"
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: skillscan-mysql-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mysql
+spec:
+  selector:
+    app.kubernetes.io/name: skillscan
+    app.kubernetes.io/component: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+{{- end }}

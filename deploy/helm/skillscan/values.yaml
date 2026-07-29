@@ -5,15 +5,50 @@
 # this file alone being correct).
 
 image:
-  registry: internal-registry.example.local
+  # EMPTY BY DEFAULT, and that is the intended air-gapped configuration: the
+  # offline bundle side-loads images under their bare names (skillscan/monolith
+  # :<tag>) straight into the node's container runtime, so there is no registry
+  # to name and `imagePullPolicy: IfNotPresent` never reaches out. Set this
+  # only where the enterprise actually runs an internal registry, e.g.
+  # `--set image.registry=registry.corp.internal`; _helpers.tpl omits the
+  # prefix entirely when it is empty. The previous default was a placeholder
+  # hostname that resolves nowhere - a first install could only ever end in
+  # ImagePullBackOff.
+  #
+  # THE OFFLINE BUNDLE READS THIS BLOCK (and mysql.image / redis.image below).
+  # scripts/build_offline_bundle.sh parses them instead of hardcoding names, so
+  # the bundle cannot ship a tag the chart does not ask for; changing anything
+  # here changes what the next bundle is built as.
+  # (Measured on the dev VM: `docker save` writes
+  # `io.containerd.image.name: docker.io/skillscan/monolith:<tag>` into the
+  # archive and `ctr images import` registers exactly that, while kubelet
+  # normalizes this file's bare `skillscan/monolith:<tag>` the same way - the
+  # two meet at `docker.io/...`, so bare names here are correct and no
+  # `docker.io/` prefix belongs in this file.)
+  #
+  # Unrelated to the bundle: deploy_and_test_vm.sh builds `:dev` images for the
+  # hand-built VM deployment and restarts Deployments directly. That is a
+  # developer loop, not a chart install - it never reads this file, so the two
+  # tags are independent and `:dev` must NOT be copied here.
+  registry: ""
   monolithRepository: skillscan/monolith
   engineRunnerRepository: skillscan/engine-runner
+  webRepository: skillscan/web
   tag: "0.1.0"
   pullPolicy: IfNotPresent
 
 replicaCount:
-  monolith: 2
+  # 1, NOT 2. `SamlRequestTracker` (SP-initiated SAML replay protection) is
+  # in-process memory and is not shared between replicas - MAINTENANCE_GUIDE
+  # §3.3 records this as a known gap, and M-E design §9 puts multi-replica
+  # monolith explicitly out of scope for this milestone. A default of 2 walked
+  # every new deployment straight into that gap by doing nothing wrong. Raise
+  # this only once that state is externalized.
+  monolith: 1
   engineRunner: 3
+  # Stateless nginx (static assets + same-origin reverse proxy), so unlike the
+  # monolith this has nothing in-process to shard.
+  web: 2
 
 resources:
   monolith:
@@ -22,23 +57,203 @@ resources:
   engineRunner:
     requests: { cpu: 500m, memory: 1Gi }
     limits: { cpu: "2", memory: 2Gi }
+  # SECURITY (found live against the VM's Kyverno pod-security-baseline
+  # policy, not by inspection): its require-resource-limits rule rejects any
+  # container with no cpu/memory limits at admission - mysql/redis need
+  # these explicitly, there is no "it's just infra, skip it" exemption.
+  mysql:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  redis:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits: { cpu: "500m", memory: 256Mi }
+  # The migration Job (migration-job.yaml, M-E task 3): a one-shot
+  # `alembic upgrade head` + `db/setup_grants.py` + verification query, not a
+  # long-running service - deliberately smaller than monolith's own profile.
+  migration:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "500m", memory: 512Mi }
+  # nginx serving a built SPA plus a reverse proxy - the smallest profile
+  # here, but it still needs explicit limits (see the mysql/redis note above:
+  # the require-resource-limits rule has no "it's only nginx" exemption).
+  web:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: "500m", memory: 256Mi }
+
+persistence:
+  mysql:
+    size: 20Gi
+    storageClass: ""      # 留空用集群默认
+  blobstore:
+    size: 50Gi
+    storageClass: ""      # 必须支持 ReadWriteMany
+    # THE single source of truth for where this volume lands. Read by
+    # templates/configmap.yaml (which publishes it as SKILLSCAN_BLOBSTORE_ROOT)
+    # and by BOTH Deployments' volumeMounts. Keeping one value rather than
+    # three literals is the point: monolith and engine-runner mounting the same
+    # claim at DIFFERENT paths, or mounting it correctly while the env var
+    # points somewhere else, both render as perfectly valid YAML, pass every
+    # health check, and then leave every scan stuck in RUNNING forever
+    # (M-E design §4.1). The startup self-check exists to catch that; this
+    # value exists so it has less to catch.
+    mountPath: /var/lib/skillscan/blobstore
+
+# The chart's own MySQL/Redis, for a self-contained air-gapped install
+# (coding spec §4.3). `enabled: false` on either points the app at an
+# external instance instead, via config.mysqlHost/config.redisUrl below -
+# that path is provided but NOT verified by this milestone (spec §9).
+#
+# Image tags match the existing pin in docker-compose.yml (the "production-
+# shaped" Topology B2 compose file) rather than a newer default - vendor
+# versions are frozen for this milestone, not upgraded (spec §2/§9).
+# `redis:7-alpine` specifically (not plain `redis:7`) because that smaller,
+# non-Debian base is the pin already in use; swapping it for a larger image
+# would be an unreviewed vendor change, not a stylistic pick.
+#
+# SECURITY: this Redis requires auth (`--requirepass`, see redis.yaml) - the
+# password lives in secretRefs.keys below (SKILLSCAN_REDIS_PASSWORD), not
+# here. deploy/networkpolicy/redis-ingress.yaml already restricts who can
+# reach it, but a self-contained "helm install and it works" deployment
+# should not depend on an enterprise actually having applied that
+# NetworkPolicy layer - auth is the control that still holds if they haven't.
+#
+# These two `image` values go into the offline bundle as well
+# (scripts/build_offline_bundle.sh reads them from here, and skips whichever
+# component has enabled=false). They are public images, which makes them no
+# more pullable inside an isolated network than skillscan's own - a bundle
+# holding only the three skillscan images installs and then strands mysql and
+# redis in ImagePullBackOff, which takes the migration Job and the monolith
+# down with them.
+mysql:
+  enabled: true          # false: use the external instance config.mysqlHost points at (not verified this milestone)
+  image: mysql:8.0
+redis:
+  enabled: true          # false: use the external instance config.redisUrl points at (not verified this milestone)
+  image: redis:7-alpine
+
+# Web 控制台 (templates/web.yaml). The chart supplies its own nginx.conf via a
+# ConfigMap - the one baked into the image targets docker-compose and proxies
+# to a hostname that does not exist in Kubernetes; see web.yaml's own header.
+web:
+  # Deliberately NOT 80. The image's user is a non-root uid, and binding a
+  # privileged port then depends on the cluster's
+  # net.ipv4.ip_unprivileged_port_start default. The Service below still
+  # publishes :80 to callers, so nothing outside the pod sees this number.
+  containerPort: 8080
+  # Port of this chart's own monolith Service (templates/monolith-service.yaml)
+  # - the nginx upstream. Change both together or the console 502s.
+  monolithServicePort: 80
+  # Skill package upload ceiling at the proxy. nginx's own default is 1m,
+  # which rejects larger packages with a 413 that reads like a client bug.
+  maxUploadSize: 64m
+  service:
+    # ClusterIP by default: reach the console through ingress below, or with
+    # `kubectl port-forward svc/skillscan-web 8080:80` where no ingress
+    # controller exists. Set to NodePort for a cluster with neither.
+    type: ClusterIP
+    port: 80
+    nodePort: ""         # only read when type is NodePort; empty = cluster-assigned
+
+# Ingress (M-E design §9). Off by default - an air-gapped cluster may have no
+# ingress controller at all, and an Ingress object nothing reconciles is worse
+# than none (it looks like the console is published when it is not).
+#
+# SECURITY: certificate issuance is the enterprise PKI's job. `tls.secretName`
+# must name a TLS Secret that ALREADY EXISTS in the release namespace; this
+# chart never generates, self-signs, or defaults one. Rendering fails loudly if
+# tls.enabled is set without it.
+ingress:
+  enabled: false
+  className: ""          # e.g. nginx / traefik; empty = cluster default IngressClass
+  host: ""               # required when enabled, e.g. skillscan.corp.internal
+  path: /
+  pathType: Prefix
+  annotations: {}        # controller-specific (ssl-redirect, body size, auth, ...)
+  tls:
+    enabled: false
+    secretName: ""       # pre-existing TLS Secret, issued by the enterprise PKI
 
 # SECURITY (coding spec §11.7/§10): the sandbox runs under gVisor - the
 # monolith deliberately does NOT (INV-11: it never parses untrusted content).
 runtimeClass:
   engineRunner: gvisor
 
+engineRunner:
+  # Port of the minimal readiness listener in services/engine_runner/main.py -
+  # GET /healthz and GET /readyz only, no other surface. Wired to both the
+  # container's own SKILLSCAN_ENGINE_RUNNER_READY_PORT and its containerPort/
+  # readinessProbe so the three cannot drift. The app treats 0 as "no listener
+  # at all"; this chart does not support that, because a readinessProbe is the
+  # only thing that turns the shared-blobstore self-check into something
+  # Kubernetes acts on.
+  readyPort: 8080
+  # Size cap on the writable /tmp this Deployment mounts (an emptyDir - the
+  # container's own root filesystem is read-only). Every engine unpacks the
+  # package it is analysing there, so this must exceed the largest package you
+  # accept (web.maxUploadSize caps that at the proxy, 64m by default). It is a
+  # cap, not a reservation: the space comes from the node's ephemeral storage
+  # and a pod exceeding it is evicted.
+  tmpSizeLimit: 1Gi
+
 # SECURITY: reconciliation.poll defaults true in a real deployment (coding
 # spec §13: poll=off must alert, never be silently the production default).
 config:
-  mysqlHost: mysql.skillscan.svc.cluster.local
+  # Bare service names, NOT fully-qualified ones. Kubernetes DNS resolves a bare
+  # name within the release's own namespace, so these follow the install wherever
+  # it goes. The FQDNs that used to be here (mysql.skillscan.svc.cluster.local)
+  # pinned the chart to a namespace called `skillscan` just as surely as the
+  # hardcoded `namespace:` fields removed from the templates did - every pod would
+  # come up Running and the monolith would simply never reach its database.
+  # The background worker drives every scan from queued to a verdict. Off in
+  # config.py's defaults, so the chart has to say so explicitly.
+  workerEnabled: true
+  # Local accounts bootstrap the first admin without an external IdP. The seed
+  # itself is `localAccounts.seed` below (it becomes a Secret key, never a
+  # ConfigMap value). Turn this off only when an external IdP handles login.
+  localAuthEnabled: true
+  mysqlHost: mysql
   mysqlDatabase: skillscan
-  redisUrl: redis://redis.skillscan.svc.cluster.local:6379/0
-  minioEndpoint: minio.skillscan.svc.cluster.local:9000
-  vllmBaseUrl: http://vllm.skillscan.svc.cluster.local:8000
-  osvSource: http://osv-mirror.skillscan.svc.cluster.local:8080
-  vaultAddr: http://vault.skillscan.svc.cluster.local:8200
-  marketplaceApiBaseUrl: https://marketplace.skillscan.svc.cluster.local
+  redisUrl: redis://redis:6379/0
+  # DEAD CONFIG, kept only because removing a field is a breaking change for
+  # anyone who set it: nothing consumes SKILLSCAN_MINIO_ENDPOINT. The only
+  # blobstore implementation in the codebase is LocalFilesystemBlobStore, shared
+  # between pods via the RWX volume above. Setting this has no effect.
+  minioEndpoint: ""
+  # The four below are EXTERNAL services this chart does not install. Each is
+  # EMPTY (or, for OSV, the string the code itself uses for "no mirror"), which
+  # is the value that means "this integration is off" - not a value that works
+  # by accident. Point them at the enterprise's real internal endpoints to turn
+  # the corresponding feature on; every one of them is re-validated by
+  # require_internal_endpoint at startup (INV-14), so a public address still
+  # fails closed.
+  #
+  # THESE USED TO BE PLACEHOLDER FQDNs (vllm.skillscan.svc.cluster.local etc.)
+  # and that made a default `helm install` impossible: measured on the dev VM,
+  # both the monolith and every engine-runner pod CrashLoopBackOff at startup
+  # with "'vllm.skillscan.svc.cluster.local' does not resolve to an
+  # internal/private address - external endpoints are forbidden (INV-14)".
+  # is_internal_host() is fail-closed on resolution failure, so a hostname that
+  # exists nowhere is indistinguishable from a public one - a placeholder that
+  # "obviously has to be replaced" is not inert, it is a guaranteed crash. The
+  # same held for osvSource (validated whenever it is not the literal
+  # "offline") and vaultAddr.
+  #
+  # What each empty value means:
+  #   vllmBaseUrl   - skillspector runs with use_llm=False (sandbox_engines.py);
+  #                   the other three engines are unaffected.
+  #   osvSource     - "offline" is osv-scanner's own air-gapped mode and the
+  #                   code's own default; an internal OSV mirror URL replaces it.
+  #   vaultAddr     - SECURITY: falls back to LocalDevSigner, which main.py logs
+  #                   a warning about. Verdicts it signs are NOT trustworthy.
+  #                   A production deployment MUST set this to its internal
+  #                   Vault (DEPLOYMENT_GUIDE §6.4 lists it as a decision, not
+  #                   a default).
+  #   marketplaceApiBaseUrl - marketplace writeback/reconciliation disabled;
+  #                   main.py logs that it is not set.
+  vllmBaseUrl: ""
+  osvSource: "offline"
+  vaultAddr: ""
+  marketplaceApiBaseUrl: ""
   reconciliationPollEnabled: true
   reconciliationPushEnabled: false
   # 2026-07-09: for an enterprise privatized model deployment - point
@@ -48,6 +263,33 @@ config:
   # requires one. secretRefs.keys below carries the API key, if that
   # deployment enforces its own auth.
   llmModel: ""  # e.g. an enterprise-internal model's own name/identifier
+
+# The first admin account, for a deployment with no external IdP (the normal
+# air-gapped case). This is the ONE credential the chart cannot invent for you:
+# INV-17 forbids a built-in account or a default password, and each entry
+# carries a scrypt hash that Helm has no way to compute. Empty while
+# config.localAuthEnabled is true stops rendering with an actionable message -
+# earlier than an install that succeeds and then has nobody who can log in.
+#
+# Produce password_hash with the snippet in DEPLOYMENT_GUIDE §6.9 (scrypt,
+# salted; the plaintext never appears here or in the cluster). role is one of
+# admin / approver / auditor / submitter.
+#
+# Consumed ONCE, on the first boot against an empty local_account table
+# ("bootstrap seed", apps/monolith/main.py). After that the database is
+# authoritative and editing this changes nothing - rotate passwords through
+# /v1/admin/accounts/<id>/reset-password instead.
+localAccounts:
+  seed: []
+  # seed:
+  #   - username: admin
+  #     password_hash: "scrypt$<salt-hex>$<digest-hex>"
+  #     role: admin
+
+secrets:
+  # true: chart 生成随机口令（开发/一体化部署）。
+  # false: 假定运维已创建 secretRefs.name 指定的 Secret（生产 + Vault 注入）。
+  create: true
 
 # SECURITY: every *_password_env/*_token/*_secret name below is a REFERENCE to
 # a Kubernetes Secret key (populated from Vault at deploy time, coding spec
@@ -80,6 +322,12 @@ secretRefs:
     - SKILLSCAN_MARKETPLACE_POLL_TOKEN
     - SKILLSCAN_MARKETPLACE_WRITE_TOKEN
     - SKILLSCAN_RECONCILIATION_PUSH_HMAC_SECRET
+    # SECURITY (2026-07-28): auth for the chart's own Redis (redis.yaml's
+    # `--requirepass`) - monolith/engine-runner splice this into
+    # SKILLSCAN_REDIS_URL themselves (see their Deployments), it is never a
+    # literal in the ConfigMap. Only consumed when redis.enabled=true; unused
+    # if a deployment points config.redisUrl at an external instance instead.
+    - SKILLSCAN_REDIS_PASSWORD
     # SECURITY (INV-10 note, 2026-07-09): the one credential this Secret
     # delivers to engine-runner rather than the monolith - a deliberate,
     # documented exception to that Deployment's normal "no DB/Vault
@@ -93,6 +341,13 @@ secretRefs:
     # changes that, it only carries credentials for whatever internal
     # endpoint is already configured there.
     - SKILLSCAN_LLM_API_KEY
+    # NOTE: SKILLSCAN_LOCAL_ACCOUNTS_JSON is deliberately NOT in this list.
+    # Every key here is a random password the chart invents; that one is a JSON
+    # account list with scrypt hashes in it, which the chart cannot invent.
+    # Listed here it was generated as `randAlphaNum 24`, arrived at the monolith
+    # as SKILLSCAN_LOCAL_ACCOUNTS_JSON, and was rejected as "not valid JSON" on
+    # every boot. It comes from localAccounts.seed above instead - templates/
+    # secret.yaml writes it into this same Secret.
 
 networkPolicy:
   # Applies deploy/networkpolicy/*.yaml (non-recursive) - the prod-safe base

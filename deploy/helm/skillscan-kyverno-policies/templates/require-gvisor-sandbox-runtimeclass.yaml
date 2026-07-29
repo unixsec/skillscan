@@ -1,0 +1,63 @@
+{{- if .Values.gvisorSandboxRuntimeClass.enabled }}
+# Admission: engine-runner/dynamic-sandbox pods must run under the gVisor
+# RuntimeClass (coding spec §11.7/§10: "gvisor RuntimeClass"; INV-10/INV-11 -
+# the sandbox is where untrusted Skill content is actually parsed/executed).
+# Scoped only to the sandbox component - the core monolith intentionally runs
+# under the default (non-gVisor) RuntimeClass, since it never parses
+# untrusted content itself (INV-11).
+#
+# Namespace match is `.Release.Namespace` (whatever `-n` you render this
+# chart with), not a literal - see pod-security-baseline.yaml's note and
+# values.yaml's HISTORY note for why that matters. This file used to
+# hardcode `namespaces: [skillscan]` (same defect Task 10 fixed for the
+# other two policies in this chart) and lived standalone in
+# deploy/kyverno/; Task 11 closed the gap rather than leaving it as a
+# pointer comment - moved here for the same reason as the other two.
+#
+# VERIFIED 2026-07-29 on the dev VM (Kyverno 1.18.2, k3s v1.36.2) - see
+# task-9-report.md (Task 11): a non-compliant pod (no runtimeClassName) in
+# the rendered namespace is genuinely rejected at admission with this rule's
+# own message. No gVisor RuntimeClass exists on this node (Linux-only,
+# intentionally not installed here) - a pod that DOES satisfy this policy
+# (runtimeClassName: gvisor) is rejected anyway, but by Kubernetes' own
+# RuntimeClass admission ("RuntimeClass \"gvisor\" not found"), not by this
+# ClusterPolicy - the same failure DEPLOYMENT_GUIDE §6.1③ documents for the
+# real engine-runner Deployment. This means end-to-end "a compliant pod gets
+# admitted" could not be observed in this environment; the policy's own
+# admission-time behavior (reject the non-compliant case, by name) was
+# confirmed directly instead.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-gvisor-sandbox-runtimeclass
+  annotations:
+    policies.kyverno.io/title: Require gVisor RuntimeClass for the Sandbox
+    policies.kyverno.io/description: >-
+      Every engine-runner/dynamic-sandbox pod must set
+      runtimeClassName: gvisor - the boundary that isolates untrusted Skill
+      content execution from the host kernel.
+spec:
+  validationFailureAction: {{ .Values.gvisorSandboxRuntimeClass.validationFailureAction }}
+  background: true
+  rules:
+    - name: require-gvisor-runtimeclass
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - {{ .Release.Namespace }}
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/component
+                    operator: In
+                    values:
+                      - engine-runner
+                      - dynamic-sandbox
+      validate:
+        message: "engine-runner/dynamic-sandbox pods must set runtimeClassName: gvisor."
+        pattern:
+          spec:
+            runtimeClassName: gvisor
+{{- end }}

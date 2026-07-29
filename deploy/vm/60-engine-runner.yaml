@@ -12,6 +12,17 @@ kind: Deployment
 metadata: { name: engine-runner, namespace: skillscan }
 spec:
   replicas: 1
+  # CAPACITY (found live 2026-07-29): the default maxSurge (25% -> 1) starts a
+  # SECOND 500m-request pod before the old one goes away. The dev VM node has
+  # exactly 2 CPUs, and once mysql/redis grew the resource requests that
+  # pod-security-baseline's require-resource-limits demands (they had none, so
+  # they had counted as 0m), the surge no longer fit: the new pod sat Pending
+  # on "Insufficient cpu" and the rollout hung indefinitely. A single-replica
+  # queue consumer has no reason to surge - it reads a Redis consumer group, so
+  # a brief gap just leaves messages unconsumed, it does not drop them.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
   selector: { matchLabels: { app: engine-runner } }
   template:
     # SECURITY: `app.kubernetes.io/component: engine-runner` is REQUIRED, not
@@ -24,10 +35,67 @@ spec:
     metadata: { labels: { app: engine-runner, app.kubernetes.io/component: engine-runner } }
     spec:
       automountServiceAccountToken: false
+      # ADMISSION (found live 2026-07-29, milestone F VM pass): milestone E
+      # installed deploy/helm/skillscan-kyverno-policies as an ENFORCING
+      # ClusterPolicy over this same namespace, and this manifest satisfied
+      # neither `require-non-root` nor `require-resource-limits`. Nothing broke
+      # at install time because the already-running pods were never
+      # re-admitted - the first `kubectl rollout restart` after it was blocked
+      # outright, and the running pod would have been unrecreatable after any
+      # eviction. Values copied from the chart's own engine-runner profile
+      # (deploy/helm/skillscan/values.yaml resources.engineRunner and
+      # templates/engine-runner-deployment.yaml) so the dev/test analogue and
+      # the production-shaped target do not disagree about what compliance
+      # means for THESE two rules.
+      #
+      # The same chart's third rule, require-gvisor-sandbox-runtimeclass
+      # (also Enforce by default), is deliberately NOT satisfied the same
+      # way: this Deployment sets no runtimeClassName, unlike the chart's own
+      # engine-runner-deployment.yaml, which sets `runtimeClassName: gvisor`
+      # unconditionally. That is not the same oversight the first two rules
+      # were - copying the chart's value here was tried and reverted.
+      # `kubectl get runtimeclass` on this node (re-verified 2026-07-29 with
+      # a throwaway-namespace server-side dry-run: a Pod with this exact
+      # spec, no runtimeClassName, IS rejected by
+      # require-gvisor-sandbox-runtimeclass as expected; the same Pod WITH
+      # `runtimeClassName: gvisor` added is rejected anyway, by core
+      # Kubernetes, "RuntimeClass \"gvisor\" not found" - not a Kyverno
+      # denial at all) lists crun/nvidia/wasm*/etc. but no `gvisor`. Copying
+      # the chart's value would not make this Deployment compliant, it would
+      # trade one named admission rejection for a different one that reads
+      # like a cluster bug. The `app.kubernetes.io/component: engine-runner`
+      # label below can't be dropped to dodge the policy's selector either -
+      # see its own comment, the egress NetworkPolicy needs it for DNS to
+      # work at all.
+      #
+      # Resolution: this manifest stays non-compliant with
+      # require-gvisor-sandbox-runtimeclass on THIS VM, by design - the same
+      # mutual exclusivity DEPLOYMENT_GUIDE.md §6.1③/⑦ already documents for
+      # the Helm-deployed engine-runner (`runtimeClass.engineRunner=""` vs
+      # `gvisorSandboxRuntimeClass.enabled=true`) when a cluster has no
+      # gVisor RuntimeClass. If deploy/helm/skillscan-kyverno-policies is
+      # ever installed against this VM's `skillscan` namespace, it MUST be
+      # rendered with `--set gvisorSandboxRuntimeClass.enabled=false` (chart
+      # default is `true`) - installing it at its default here enforces
+      # nothing real (there is no gVisor to require) and only blocks every
+      # future `kubectl apply`/`rollout restart` of this Deployment.
+      securityContext:
+        runAsNonRoot: true
+        # A name-based `USER engine-runner` cannot be resolved to a uid at
+        # admission, so `runAsNonRoot: true` alone fails closed - see the long
+        # comment in the chart's engine-runner-deployment.yaml. 10002 matches
+        # the Dockerfile's `useradd --uid 10002`.
+        runAsUser: 10002
+        # Must stay identical to the monolith's, so the shared hostPath
+        # blobstore below is writable by both uids.
+        fsGroup: 10000
       containers:
         - name: engine-runner
           image: docker.io/skillscan/engine-runner:dev
           imagePullPolicy: IfNotPresent
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
           env:
             - { name: SKILLSCAN_REDIS_URL, value: "redis://redis:6379/0" }
             - { name: SKILLSCAN_BLOBSTORE_ROOT, value: /var/lib/skillscan/blobstore }

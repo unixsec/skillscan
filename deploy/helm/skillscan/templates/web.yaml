@@ -1,0 +1,237 @@
+# web 控制台 (coding spec §16.1, M-E design §3): nginx serving the built SPA
+# and reverse-proxying /v1 to the monolith on the SAME ORIGIN (INV-16) -
+# session/CSRF cookies are SameSite=Strict and would never be sent if the SPA
+# and the API were two origins. Everything a browser touches goes through this
+# one Service/Ingress; the monolith's own Service is internal-only.
+#
+# ⚠ The nginx.conf BAKED INTO THE IMAGE (web/nginx.conf) is written for
+# docker-compose: it proxies to `monolith:8000` (a compose service name) and
+# listens on :80. Neither is true here - this chart's monolith Service is
+# `skillscan-monolith:80`, and the image runs as a non-root uid that has no
+# business binding a privileged port. So the config below REPLACES the baked
+# one at /etc/nginx/nginx.conf. Without this override the console renders and
+# every single API call 502s, with nothing in the pod logs explaining why the
+# name `monolith` did not resolve. (The hand-built VM deployment reached the
+# same conclusion independently - its `web-nginx` ConfigMap has this same
+# shape, which is where the /tmp paths below are known-good from.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: skillscan-web-nginx
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+data:
+  nginx.conf: |
+    worker_processes 1;
+    error_log /dev/stderr warn;
+    # Every writable path nginx needs is moved under /tmp (an emptyDir in the
+    # Deployment below), which is what lets this container run with
+    # readOnlyRootFilesystem: true. Miss one of these and nginx dies at
+    # startup with a bare "Permission denied" naming a path, not a cause.
+    pid /tmp/nginx.pid;
+    events { worker_connections 1024; }
+    http {
+      include       /etc/nginx/mime.types;
+      default_type  application/octet-stream;
+      access_log /dev/stdout;
+      sendfile on;
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path /tmp/proxy_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+
+      server {
+        listen {{ .Values.web.containerPort }};
+
+        # SECURITY: same-origin BFF (INV-16). The regex covers exactly the
+        # backend-owned prefixes; everything else falls through to the SPA
+        # below. `skillscan-monolith` is this chart's own Service name -
+        # deliberately the SHORT name, not an FQDN: it resolves in whatever
+        # namespace the release was installed into, which an FQDN with a
+        # baked-in namespace would not.
+        #
+        # KNOWN, SELF-HEALING: nginx resolves a literal proxy_pass host ONCE,
+        # at config load, and refuses to start if it does not resolve
+        # ("[emerg] host not found in upstream" - reproduced deliberately, not
+        # assumed). A Service gets its DNS record as soon as the object
+        # exists, endpoints or not, and helm creates both in the same release,
+        # so this only shows up as a brief CrashLoopBackOff if a web pod wins
+        # the race against DNS propagation. It clears on the next restart.
+        # Deferring resolution instead would need an explicit `resolver <IP>`,
+        # i.e. a cluster-specific IP the operator has to get right - trading a
+        # self-correcting crashloop for a silent misconfiguration.
+        location ~ ^/(v1|healthz|readyz|\.well-known) {
+          proxy_pass http://skillscan-monolith:{{ .Values.web.monolithServicePort }};
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          # Reports `http` behind a TLS-terminating Ingress. Nothing in the
+          # monolith reads this header today (checked, not assumed); it is
+          # here for parity with web/nginx.conf, not as a security control.
+          proxy_set_header X-Forwarded-Proto $scheme;
+          # Skill packages are uploaded through here. nginx's 1m default
+          # would reject larger ones with a 413 that looks like a client bug.
+          client_max_body_size {{ .Values.web.maxUploadSize }};
+        }
+
+        # SPA fallback - react-router owns any path nginx does not recognize
+        # as a static asset.
+        location / {
+          root /usr/share/nginx/html;
+          try_files $uri $uri/ /index.html;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: skillscan-web
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  # Unlike the monolith (see values.yaml's replicaCount comment) this is
+  # stateless nginx - static assets plus a reverse proxy, no in-process state
+  # to shard, so >1 replica is safe here.
+  replicas: {{ .Values.replicaCount.web }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: skillscan
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        {{- include "skillscan.labels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # SECURITY/BUG: see monolith-deployment.yaml's long comment - a
+        # name-based `USER` in a Dockerfile cannot be resolved to a uid at
+        # admission time, so `runAsNonRoot: true` alone fails closed. web's
+        # image builds its user with busybox `adduser -S`, which assigns the
+        # uid/gid rather than taking one - measured as uid=100 gid=102 by
+        # running `id` inside the real skillscan/web image, NOT guessed from
+        # the Dockerfile (which names no numbers at all).
+        runAsUser: 100
+        runAsGroup: 102
+      containers:
+        - name: web
+          image: {{ include "skillscan.image" (dict "root" $ "repo" .Values.image.webRepository) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            # Possible here (unlike mysql/redis) only because the nginx.conf
+            # above relocates pid + all five temp paths into the /tmp
+            # emptyDir. Verified by running this image with a genuinely
+            # read-only rootfs, not by reading the config.
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              # Deliberately NOT 80: this container runs as uid 100, and a
+              # non-root process binding a privileged port depends on a
+              # cluster-level sysctl default that is not worth betting the
+              # console's availability on.
+              containerPort: {{ .Values.web.containerPort }}
+          resources:
+            {{- toYaml .Values.resources.web | nindent 12 }}
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          # Probes hit `/`, i.e. the SPA's own index.html, deliberately NOT a
+          # proxied backend path: this reports whether the CONSOLE is
+          # serving. A probe that proxied to the monolith would take every
+          # web replica out of rotation whenever the backend was down, which
+          # replaces a legible "API error" page with an unreachable host.
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: skillscan-web-nginx
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: skillscan-web
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: {{ .Values.web.service.type }}
+  selector:
+    app.kubernetes.io/name: skillscan
+    app.kubernetes.io/component: web
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http
+      {{- if and (eq .Values.web.service.type "NodePort") .Values.web.service.nodePort }}
+      nodePort: {{ .Values.web.service.nodePort }}
+      {{- end }}
+{{- if .Values.ingress.enabled }}
+---
+# Ingress (M-E design §9): this chart provides the CONFIGURATION SLOT only.
+# Certificate issuance belongs to the enterprise PKI - nothing here generates,
+# self-signs, or defaults a certificate. `ingress.tls.enabled` therefore
+# demands a Secret name that already exists in this namespace and fails the
+# render if it is missing, rather than emitting a `tls:` block with no
+# secretName (which several controllers quietly serve with their own fake
+# self-signed default certificate - TLS that looks on and protects nothing).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: skillscan-web
+  labels:
+    {{- include "skillscan.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+  {{- if .Values.ingress.annotations }}
+  annotations:
+    # Each value is quoted rather than dumped with `toYaml`: annotation values
+    # are strings in the API, and a YAML-native bool or number (which is what
+    # `--set ...=true` produces) makes `kubectl apply` reject the object with
+    # "cannot unmarshal bool into Go value of type string".
+    {{- range $key, $value := .Values.ingress.annotations }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- $host := required "ingress.host must be set when ingress.enabled is true" .Values.ingress.host }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ required "ingress.tls.secretName must name an existing TLS Secret (enterprise PKI issues it; this chart never generates one) when ingress.tls.enabled is true" .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: skillscan-web
+                port:
+                  number: {{ .Values.web.service.port }}
+{{- end }}
