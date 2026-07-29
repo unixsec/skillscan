@@ -983,6 +983,10 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
 
     counts["swept"] = await sweep_queued_jobs_to_airlock(runtime)
 
+    # Read once per tick, before anything that must respect it. The sandbox
+    # waited-set below reads the same value; this used to be fetched only there.
+    disabled_engines = await list_disabled_engines(runtime.redis)
+
     tick_engines = await _floor_engines_with_intel(runtime)
     # Everything in `tick_engines` beyond the floor set (currently just the
     # intel matcher, when its DB read succeeded) is advisory: passed to BOTH
@@ -992,6 +996,21 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
     # finding counts toward severity/trifecta when present, without ever
     # gating the "all required engines present" wait).
     floor_names = frozenset(floor_engines().keys())
+    # SECURITY/HONESTY (2026-07-29, milestone C Task 2): the admin toggle now
+    # LISTS the intel matcher and accepts a PATCH for it, so this tick has to
+    # honour it - the same "write-only toggle" the sandbox engines suffered
+    # until 2026-07-13 (recorded in Redis, read by nobody, engine kept running)
+    # would otherwise be reintroduced on the one tier that had just been made
+    # visible. Only NON-floor entries are droppable: a floor engine can never
+    # be in `disabled_engines` (the admin endpoint 409s on INV-1 before it can
+    # be written), and filtering the floor here would silently defeat the
+    # backstop if that guard ever regressed, so the floor is excluded from this
+    # filter by construction rather than by trusting the writer.
+    tick_engines = {
+        name: engine
+        for name, engine in tick_engines.items()
+        if name in floor_names or name not in disabled_engines
+    }
     dispatchable_advisory_engines = tuple(name for name in tick_engines if name not in floor_names)
     # SANDBOX_ADVISORY_ENGINE_NAMES are NEVER added to `dispatchable_advisory_engines`/
     # `additional_engine_names` above - they run only in the separate engine-runner
@@ -1040,11 +1059,9 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
     # disable into a 330s decision delay on EVERY scan from then on (still
     # recorded in `reasons`, so not silent in the audit sense - but a steep,
     # surprising operability cliff for one legitimate admin action). Read live
-    # each tick (same Redis key `list_disabled_engines` reads for the
-    # dashboard at reporting/service.py:359 and engine-runner's own dispatch
-    # gate) so a re-enable takes effect on the very next tick, same as the
-    # disable did.
-    disabled_engines = await list_disabled_engines(runtime.redis)
+    # each tick (`disabled_engines` above - the same Redis key the dashboard's
+    # engine-coverage panel and engine-runner's own dispatch gate read) so a
+    # re-enable takes effect on the very next tick, same as the disable did.
     active_sandbox_waited_engines = tuple(
         n for n in SANDBOX_WAITED_ENGINE_NAMES if n not in disabled_engines
     )

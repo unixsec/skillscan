@@ -16,17 +16,6 @@ from __future__ import annotations
 from typing import Any
 
 from common.log import get_logger
-
-# SECURITY/HONESTY (2026-07-13): the sandboxed OSS engines (bandit/osv-scanner/
-# yara/skillspector/aig-mcp-scan) run in the separate engine-runner service,
-# not in-process here, so they were never in `runtime.engine_metadatas` and
-# never showed up on this admin page at all - every engine an admin COULD see
-# was a floor engine, which INV-1 correctly never lets you disable, so the
-# disable control looked permanently broken. `SANDBOX_ENGINE_NAMES` is the
-# one canonical name list (services/engine_runner/sandbox_engines.py's own
-# docstring explains why a second hardcoded copy of this list already caused
-# a real bug once) - imported, never duplicated.
-from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -53,7 +42,20 @@ from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.orchestration.floor import floor_engine_names
 
 from . import accounts_service, breakglass, local_auth
-from .engine_registry import EngineDisableError, list_disabled_engines, set_engine_enabled
+
+# SECURITY/HONESTY (2026-07-13, extended 2026-07-29): the engine listing is
+# assembled in `engine_registry.known_engine_rows`, not here, because the
+# toggle endpoint below must validate against exactly the same set - see that
+# function's docstring for the two bugs (sandbox engines invisible; the intel
+# tier both invisible and un-toggleable) that came from assembling it per call
+# site.
+from .engine_registry import (
+    EngineDisableError,
+    known_engine_names,
+    known_engine_rows,
+    list_disabled_engines,
+    set_engine_enabled,
+)
 from .models import GroupRoleMappingRow, LocalAccountRow
 
 router = APIRouter(prefix="/v1/admin")
@@ -99,31 +101,9 @@ async def list_engines(
 ) -> dict[str, Any]:
     required = floor_engine_names()
     disabled = await list_disabled_engines(runtime.redis)
-    engines = [
-        {
-            "name": metadata.name,
-            "version": metadata.version,
-            "required": metadata.name in required,
-            "enabled": metadata.name not in disabled,
-            "capabilities": sorted(c.value for c in metadata.capabilities),
-        }
-        for metadata in runtime.engine_metadatas
-    ]
-    # SANDBOX_ENGINE_NAMES has no version/capabilities metadata reachable from
-    # the monolith (that lives in the separate engine-runner service/image) -
-    # "sandboxed" itself is the meaningful capability tag here, distinguishing
-    # these rows from the floor engines above.
-    engines += [
-        {
-            "name": name,
-            "version": None,
-            "required": False,
-            "enabled": name not in disabled,
-            "capabilities": ["sandboxed"],
-        }
-        for name in SANDBOX_ENGINE_NAMES
-    ]
-    return {"engines": engines}
+    return {
+        "engines": known_engine_rows(runtime.engine_metadatas, required=required, disabled=disabled)
+    }
 
 
 @router.patch("/engines/{name}", dependencies=[Depends(require_csrf)])
@@ -134,14 +114,17 @@ async def set_engine_enabled_endpoint(
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> dict[str, Any]:
     required = floor_engine_names()
-    known_names = {metadata.name for metadata in runtime.engine_metadatas} | set(
-        SANDBOX_ENGINE_NAMES
-    )
-    if name not in known_names:
+    if name not in known_engine_names(runtime.engine_metadatas):
         # Without this, is_disableable() only checks "not a required floor
         # engine" - any unknown/misspelled name is silently accepted and
         # written into the shared disabled-engines Redis set (200 response,
         # no row in list_engines to ever notice or undo it from the UI).
+        #
+        # This set is now read off `known_engine_rows` (the very rows GET
+        # /engines returns) rather than re-assembled here: the two used to be
+        # built independently and both missed the intel tier, so the console
+        # rendered no row for `inhouse-intel-matcher` and PATCHing it 404'd
+        # (milestone C Task 2, 2026-07-29).
         raise HTTPException(status_code=404, detail=f"no such engine {name!r}")
     try:
         await set_engine_enabled(runtime.redis, name, enabled=body.enabled, required_names=required)

@@ -15,6 +15,8 @@ import pytest
 import pytest_asyncio
 import redis.asyncio as aioredis
 from common.blobstore import LocalFilesystemBlobStore
+from common.engine_toggle import DISABLED_ENGINES_KEY
+from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from fastapi import FastAPI
 from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
 from sqlalchemy import select
@@ -32,6 +34,7 @@ from monolith.modules.gateway.auth.middleware import (
 )
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
+from monolith.modules.intel.matcher import INTEL_ENGINE_NAME
 from monolith.tests.conftest import SessionmakerFixture
 
 _ENGINE = StaticKeywordEngine()
@@ -177,6 +180,46 @@ class TestListEngines:
         response = await client.get("/v1/admin/engines")
         assert response.status_code == 403
 
+    @pytest.mark.asyncio
+    async def test_lists_all_three_engine_tiers_including_the_intel_matcher(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        """THE LIVE DEFECT (milestone C Task 2, 2026-07-29): this listing
+        enumerated only two tiers - `runtime.engine_metadatas` (which main.py
+        fills from `floor_engines()` alone) and `SANDBOX_ENGINE_NAMES`. The
+        intel matcher is a third tier, declared only inside
+        `worker._floor_engines_with_intel`, so it ran on every scan while being
+        invisible here and un-toggleable (see the 404 test below)."""
+        _as_admin(app)
+        response = await client.get("/v1/admin/engines")
+        assert response.status_code == 200
+        by_name = {e["name"]: e for e in response.json()["engines"]}
+        assert INTEL_ENGINE_NAME in by_name
+        assert by_name[INTEL_ENGINE_NAME]["enabled"] is True
+        # Advisory tier: never `required_engines` (an intel-DB hiccup degrades
+        # to floor-only findings rather than fail-closed BLOCKing every scan).
+        assert by_name[INTEL_ENGINE_NAME]["required"] is False
+        assert set(SANDBOX_ENGINE_NAMES) <= set(by_name)
+
+    @pytest.mark.asyncio
+    async def test_every_listed_engine_is_addressable_by_the_toggle(
+        self, app: FastAPI, client: httpx.AsyncClient, redis_client: aioredis.Redis
+    ) -> None:
+        """The listing and the toggle's `known_names` guard used to be built by
+        two independent expressions; both missed the intel tier. They are now
+        one derivation, and this asserts the property end-to-end rather than
+        trusting that."""
+        _as_admin(app)
+        listed = [e["name"] for e in (await client.get("/v1/admin/engines")).json()["engines"]]
+        headers = _csrf_headers_and_cookies(client)
+        for name in listed:
+            response = await client.patch(
+                f"/v1/admin/engines/{name}", json={"enabled": True}, headers=headers
+            )
+            # 200 (toggled) or 409 (required floor engine, INV-1) - never 404,
+            # which would mean the console renders a row nothing can act on.
+            assert response.status_code in (200, 409), f"{name} listed but not addressable"
+
 
 class TestSetEngineEnabled:
     @pytest.mark.asyncio
@@ -211,6 +254,29 @@ class TestSetEngineEnabled:
             assert response.json()["enabled"] is False
         finally:
             await redis_client.srem("skillscan:admin:disabled_engines", name)  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_toggling_the_intel_matcher_is_not_404(
+        self, app: FastAPI, client: httpx.AsyncClient, redis_client: aioredis.Redis
+    ) -> None:
+        """THE LIVE DEFECT (milestone C Task 2, 2026-07-29): `known_names` was
+        floor names | SANDBOX_ENGINE_NAMES, so PATCHing `inhouse-intel-matcher`
+        404'd - an engine that runs on every scan could not be switched off at
+        all. `worker.worker_tick` now honours the toggle for it too, so this is
+        a real control rather than a write-only Redis entry."""
+        _as_admin(app)
+        headers = _csrf_headers_and_cookies(client)
+        try:
+            response = await client.patch(
+                f"/v1/admin/engines/{INTEL_ENGINE_NAME}", json={"enabled": False}, headers=headers
+            )
+            assert response.status_code == 200
+            assert response.json()["enabled"] is False
+            body = (await client.get("/v1/admin/engines")).json()
+            listed = {e["name"]: e for e in body["engines"]}
+            assert listed[INTEL_ENGINE_NAME]["enabled"] is False
+        finally:
+            await redis_client.srem(DISABLED_ENGINES_KEY, INTEL_ENGINE_NAME)  # type: ignore[misc]
 
     @pytest.mark.asyncio
     async def test_disabling_unknown_engine_name_is_404(

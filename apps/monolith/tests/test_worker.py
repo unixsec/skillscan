@@ -21,6 +21,7 @@ import pytest
 import redis.asyncio as aioredis
 from common import airlock
 from common.blobstore import LocalFilesystemBlobStore, artifact_key, findings_key
+from common.engine_toggle import DISABLED_ENGINES_KEY
 from schemas.findings import serialize_engine_result
 from skillscan_core import (
     DetectionCategory,
@@ -40,6 +41,7 @@ from sqlalchemy import select
 from monolith.modules.gate.models import PolicyProposalRow, VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.runtime import ScanRuntime
+from monolith.modules.intel.matcher import INTEL_ENGINE_NAME
 from monolith.modules.intel.models import ThreatIndicator
 from monolith.modules.inventory.models import (
     BaselineRow,
@@ -47,6 +49,7 @@ from monolith.modules.inventory.models import (
     SkillVersionRow,
 )
 from monolith.modules.inventory.service import current_state, register_skill_version
+from monolith.modules.orchestration.floor import floor_engine_names
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow
 from monolith.modules.orchestration.service import SubmissionChannel, submit_scan
 from monolith.modules.reporting.service import (
@@ -345,6 +348,84 @@ class TestWorkerEndToEnd:
         # CRITICAL is skillscan_core.models.Severity.CRITICAL's int value -
         # IntelMatcher always reports CRITICAL for a confirmed IOC match.
         assert result_row.severity == 4
+
+    @pytest.mark.asyncio
+    async def test_disabling_the_intel_matcher_actually_stops_it_running(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        intel_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+        unique_consumer: str,
+    ) -> None:
+        """Milestone C Task 2 (2026-07-29) made `inhouse-intel-matcher` listable
+        and toggleable in the admin API (it used to 404). That is only honest if
+        the tick honours it: the sandbox engines spent months with a toggle that
+        was recorded in Redis and read by nobody, so the "disabled" engine kept
+        running. Same setup as the test above, differing only in the toggle -
+        the IOC hit that test asserts is present must be absent here."""
+        malicious_domain = f"evil-{uuid.uuid4().hex[:8]}.example.com"
+        async with intel_sessionmaker() as session, session.begin():
+            session.add(
+                ThreatIndicator(
+                    ioc_type="domain",
+                    ioc_value=malicious_domain,
+                    source="test-seed",
+                    imported_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+
+        await airlock.ensure_groups(redis_client)
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            intel_sessionmaker=intel_sessionmaker,
+        )
+        await redis_client.sadd(DISABLED_ENGINES_KEY, INTEL_ENGINE_NAME)  # type: ignore[misc]
+        try:
+            async with orchestration_sessionmaker() as session, session.begin():
+                scan_id = await submit_scan(
+                    session,
+                    redis_client,
+                    blobstore,
+                    files=[
+                        (
+                            f"skill_{uuid.uuid4().hex[:8]}.py",
+                            0o644,
+                            f"# beacon to {malicious_domain}\n".encode(),
+                        )
+                    ],
+                    submitter="intel-toggle-test",
+                    engine_metadatas=(_ENGINE.metadata,),
+                    policy=runtime.policy,
+                    trust_tier=runtime.default_trust_tier,
+                    source=SubmissionChannel.CONSOLE,
+                    requested_trust_tier=runtime.default_trust_tier,
+                )
+            _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
+            for _ in range(200):
+                await worker_tick(runtime, consumer=unique_consumer)
+                async with orchestration_sessionmaker() as session:
+                    job = (
+                        await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+                    ).scalar_one()
+                if job.state == "decided":
+                    break
+            assert job.state == "decided"
+            async with orchestration_sessionmaker() as session:
+                result_row = (
+                    await session.execute(
+                        select(ScanResultRow).where(ScanResultRow.scan_id == scan_id)
+                    )
+                ).scalar_one()
+            assert "intel.ioc_match_domain" not in {f["rule_id"] for f in result_row.findings}
+            # And the disable must not take a floor engine down with it (INV-1).
+            assert {p[0] for p in result_row.provenance} >= floor_engine_names()
+        finally:
+            await redis_client.srem(DISABLED_ENGINES_KEY, INTEL_ENGINE_NAME)  # type: ignore[misc]
 
     @pytest.mark.asyncio
     async def test_sandbox_engine_finding_is_aggregated_but_never_dispatched_here(

@@ -23,15 +23,25 @@ private constant.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 import redis.asyncio as aioredis
 from common.engine_toggle import DISABLED_ENGINES_KEY, list_disabled_engines
+from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from skillscan_core import EngineMetadata
+
+from monolith.modules.intel.matcher import (
+    INTEL_ENGINE_CAPABILITIES,
+    INTEL_ENGINE_NAME,
+    INTEL_ENGINE_VERSION,
+)
 
 __all__ = [
     "EngineDisableError",
     "filter_enabled_engines",
     "is_disableable",
+    "known_engine_names",
+    "known_engine_rows",
     "list_disabled_engines",
     "set_engine_enabled",
 ]
@@ -39,6 +49,80 @@ __all__ = [
 
 class EngineDisableError(ValueError):
     pass
+
+
+def known_engine_rows(
+    engine_metadatas: Sequence[EngineMetadata],
+    *,
+    required: frozenset[str],
+    disabled: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Every engine this deployment knows about, across all THREE tiers, as the
+    admin console renders them.
+
+    THE BUG THIS EXISTS TO PREVENT (2026-07-29, milestone C Task 2): the admin
+    router used to assemble the listing and the toggle's `known_names` guard
+    independently, and both enumerated only two tiers - `runtime.engine_
+    metadatas` (which `main.py` fills from `floor_engines()` alone) plus
+    `SANDBOX_ENGINE_NAMES`. The intel matcher is a third tier, declared nowhere
+    either of them looked, so `inhouse-intel-matcher` could not be listed AND
+    PATCHing it returned 404 - an engine that runs on every scan and that an
+    operator had no way to see or switch off. Deriving both from this one
+    function makes "listable" and "toggleable" the same set by construction.
+
+    Tiers, and why each is enumerated the way it is:
+
+    - floor / in-process: real `EngineMetadata` is available, so version and
+      capabilities are real.
+    - sandbox: runs in the separate engine-runner service/image, so no metadata
+      is reachable from the monolith at all (INV-15) - "sandboxed" is the
+      meaningful capability tag, distinguishing these rows from the floor ones.
+    - intel: in-process but not constructible without a DB-fetched IOC snapshot,
+      so its identity is taken from the constants `intel.matcher` exports.
+    """
+    rows: list[dict[str, Any]] = [
+        {
+            "name": metadata.name,
+            "version": metadata.version,
+            "required": metadata.name in required,
+            "enabled": metadata.name not in disabled,
+            "capabilities": sorted(c.value for c in metadata.capabilities),
+        }
+        for metadata in engine_metadatas
+    ]
+    rows += [
+        {
+            "name": name,
+            "version": None,
+            "required": False,
+            "enabled": name not in disabled,
+            "capabilities": ["sandboxed"],
+        }
+        for name in SANDBOX_ENGINE_NAMES
+    ]
+    rows.append(
+        {
+            "name": INTEL_ENGINE_NAME,
+            "version": INTEL_ENGINE_VERSION,
+            # Advisory by design, never `required_engines`: an intel-DB hiccup
+            # must degrade to floor-only findings, not fail-closed BLOCK every
+            # scan (see worker._floor_engines_with_intel's docstring).
+            "required": INTEL_ENGINE_NAME in required,
+            "enabled": INTEL_ENGINE_NAME not in disabled,
+            "capabilities": sorted(c.value for c in INTEL_ENGINE_CAPABILITIES),
+        }
+    )
+    return rows
+
+
+def known_engine_names(engine_metadatas: Sequence[EngineMetadata]) -> frozenset[str]:
+    """The name universe the toggle validates against - read off `known_engine_
+    rows` rather than re-assembled, so an engine can never be listable but not
+    addressable (or the reverse)."""
+    return frozenset(
+        str(row["name"])
+        for row in known_engine_rows(engine_metadatas, required=frozenset(), disabled=frozenset())
+    )
 
 
 def is_disableable(name: str, *, required_names: frozenset[str]) -> bool:

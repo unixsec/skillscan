@@ -96,17 +96,29 @@ async def load_known_iocs(session: AsyncSession) -> frozenset[tuple[str, str]]:
     return frozenset((row.ioc_type, row.ioc_value.lower()) for row in rows)
 
 
+# The intel matcher's engine name, exported rather than left as a literal
+# inside `_metadata` below: it is a THIRD engine tier (neither floor nor
+# sandbox), and every consumer that needs "every engine name this deployment
+# knows" - the admin listing and toggle above all - previously had no way to
+# name it without constructing an `IntelMatcher`, which needs a DB-fetched IOC
+# snapshot. That is exactly why `/v1/admin/engines` omitted it and PATCHing it
+# 404'd (milestone C Task 2, 2026-07-29).
+INTEL_ENGINE_NAME = "inhouse-intel-matcher"
+INTEL_ENGINE_VERSION = "1.0.0"
+INTEL_ENGINE_CAPABILITIES = frozenset({EngineCapability.STATIC, EngineCapability.THREAT_INTEL})
+
+
 def _metadata(known_ioc_count: int) -> EngineMetadata:
     return EngineMetadata(
-        name="inhouse-intel-matcher",
-        version="1.0.0",
+        name=INTEL_ENGINE_NAME,
+        version=INTEL_ENGINE_VERSION,
         # SECURITY (INV-6/7 staleness): the digest binds the SIZE of the
         # loaded indicator snapshot, so a toolchain_digest computed with a
         # stale/empty snapshot is distinguishable from one with real coverage
         # - a scan re-run after new IOCs are imported gets a different digest
         # and is never served a stale cached verdict.
         ruleset_digest=hashlib.sha256(f"threat_indicator:{known_ioc_count}".encode()).hexdigest(),
-        capabilities=frozenset({EngineCapability.STATIC, EngineCapability.THREAT_INTEL}),
+        capabilities=INTEL_ENGINE_CAPABILITIES,
     )
 
 

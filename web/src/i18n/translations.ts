@@ -497,6 +497,7 @@ const zh: Dict = {
   'row.adapter_status': '适配状态',
   'row.required': '是否必需',
   'row.disabled': '是否停用',
+  'row.lock_key': 'pin 清单键',
   'row.rule_id': '规则 ID',
   'row.scope_value': '范围值',
 
@@ -513,6 +514,7 @@ const zh: Dict = {
   'summary.total_engines': '引擎总数',
   'summary.required_floor': '必需基线引擎',
   'summary.currently_disabled': '当前已停用',
+  'summary.unmapped_lock_keys': '未映射的 pin 清单键',
   'summary.total_granted': '已授予数',
   'summary.total_revoked': '已撤销数',
 
@@ -1147,6 +1149,7 @@ const en: Dict = {
   'row.adapter_status': 'adapter_status',
   'row.required': 'required',
   'row.disabled': 'disabled',
+  'row.lock_key': 'lock-file key',
   'row.rule_id': 'rule_id',
   'row.scope_value': 'scope_value',
 
@@ -1163,6 +1166,7 @@ const en: Dict = {
   'summary.total_engines': 'total engines',
   'summary.required_floor': 'required floor',
   'summary.currently_disabled': 'currently disabled',
+  'summary.unmapped_lock_keys': 'unmapped lock-file keys',
   'summary.total_granted': 'total granted',
   'summary.total_revoked': 'total revoked',
 

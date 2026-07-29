@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import redis.asyncio as aioredis
 import yaml
+from common.engine_toggle import DISABLED_ENGINES_KEY
 from schemas.findings import serialize_finding
 from skillscan_core import DetectionCategory, EngineCapability, Finding, Severity
 from sqlalchemy.exc import DBAPIError
@@ -282,23 +283,77 @@ class TestBuildEngineCoverage:
     async def test_reports_role_status_required_and_disabled(
         self, redis_client: aioredis.Redis, tmp_path: Path
     ) -> None:
+        # Real LOCK KEYS (`osv_scanner`, not `osv-scanner`) - the previous
+        # version of this test used runtime names as lock keys, which is
+        # precisely the assumption the namespace defect was hiding behind: with
+        # key == runtime name the broken join looks correct.
         lock_path = tmp_path / "engines.lock.yaml"
         lock_path.write_text(
             yaml.safe_dump(
                 {
                     "engines": {
-                        "static-keyword": {"role": "mandatory", "adapter_status": "built"},
-                        "some-optional-engine": {"role": "fill_in"},
+                        "osv_scanner": {"role": "mandatory", "adapter_status": "built"},
+                        "aig": {"role": "mandatory"},
                     }
                 }
             )
         )
         report = await build_engine_coverage(redis_client, engines_lock_path=lock_path)
-        by_name = {r["name"]: r for r in report.rows}
-        assert by_name["static-keyword"]["adapter_status"] == "built"
-        assert by_name["some-optional-engine"]["adapter_status"] == "not_built"
+        by_key = {r["lock_key"]: r for r in report.rows}
+        assert by_key["osv_scanner"]["adapter_status"] == "built"
+        assert by_key["aig"]["adapter_status"] == "not_built"
         assert report.summary["total_engines"] == 2
-        assert by_name["static-keyword"]["required"] == ("static-keyword" in floor_engine_names())
+        # Rows are identified by the RUNTIME name, the same identifier the admin
+        # console, every finding's source_engine and the frontend's
+        # `engine.<name>` labels use.
+        assert by_key["osv_scanner"]["name"] == "osv-scanner"
+        assert by_key["aig"]["name"] == "aig-mcp-scan"
+        assert by_key["osv_scanner"]["required"] == ("osv-scanner" in floor_engine_names())
+        assert report.summary["unmapped_lock_keys"] == []
+
+    @pytest.mark.asyncio
+    async def test_disabling_an_engine_shows_on_the_row_whose_lock_key_differs(
+        self, redis_client: aioredis.Redis, tmp_path: Path
+    ) -> None:
+        """THE LIVE DEFECT (milestone C Task 2, 2026-07-29): the `disabled` flag
+        was `<lock key> in <set of disabled RUNTIME names>`. `osv_scanner` and
+        `aig` are not runtime names, so an admin disabling `osv-scanner` never
+        showed up on this panel for 2 of the 5 vendored engines - the flag was
+        permanently False for them no matter what was toggled.
+
+        Exercises the REAL Redis set the admin endpoint writes, not a stand-in:
+        the whole bug lives in the join between that set and the lock file."""
+        lock_path = tmp_path / "engines.lock.yaml"
+        lock_path.write_text(
+            yaml.safe_dump(
+                {"engines": {"osv_scanner": {"role": "mandatory"}, "bandit": {"role": "mandatory"}}}
+            )
+        )
+        await redis_client.sadd(DISABLED_ENGINES_KEY, "osv-scanner")  # type: ignore[misc]
+        try:
+            report = await build_engine_coverage(redis_client, engines_lock_path=lock_path)
+            by_key = {r["lock_key"]: r for r in report.rows}
+            assert by_key["osv_scanner"]["disabled"] is True
+            assert by_key["bandit"]["disabled"] is False
+        finally:
+            await redis_client.srem(DISABLED_ENGINES_KEY, "osv-scanner")  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_an_unmapped_lock_key_is_unknown_not_silently_fine(
+        self, redis_client: aioredis.Redis, tmp_path: Path
+    ) -> None:
+        """A newly vendored engine nobody added to `common.engine_names` must
+        NOT render as "not required, not disabled" (indistinguishable from a
+        healthy row - the exact failure mode being fixed). It renders as
+        unknown, and the report summary names it."""
+        lock_path = tmp_path / "engines.lock.yaml"
+        lock_path.write_text(
+            yaml.safe_dump({"engines": {"a_brand_new_engine": {"role": "fill_in"}}})
+        )
+        report = await build_engine_coverage(redis_client, engines_lock_path=lock_path)
+        assert report.rows[0]["required"] is None
+        assert report.rows[0]["disabled"] is None
+        assert report.summary["unmapped_lock_keys"] == ["a_brand_new_engine"]
 
     @pytest.mark.asyncio
     async def test_missing_lock_file_fails_soft_not_500(

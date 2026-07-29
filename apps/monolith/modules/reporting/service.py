@@ -34,6 +34,7 @@ from typing import Any
 
 import redis.asyncio as aioredis
 import yaml
+from common.engine_names import UnknownEngineNameError, engine_name_for_lock_key
 from common.sarif import findings_to_sarif
 from fpdf import FPDF
 from sqlalchemy import select
@@ -339,6 +340,56 @@ async def build_risk_trend(
     )
 
 
+def build_engine_coverage_rows(
+    engines: Mapping[str, Mapping[str, Any]],
+    *,
+    required: frozenset[str],
+    disabled: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Row builder for `build_engine_coverage`, split out so the join it does is
+    provable without the Redis the report function needs.
+
+    THE BUG THIS EXISTS TO PREVENT (2026-07-29, milestone C Task 2): `required`
+    and `disabled` used to be computed as `<lock key> in <set of RUNTIME
+    names>`. `aig` and `osv_scanner` are not runtime names, so the `disabled`
+    flag was permanently False for 2 of the 5 vendored engines no matter what
+    an admin toggled; and since no lock key is or ever can be a floor-engine
+    name, `required` was False by construction for all five. Both flags now
+    join in ONE namespace - the runtime one, which is what `list_disabled_
+    engines`, `floor_engine_names`, every finding's `source_engine`, the admin
+    toggle and the frontend's `engine.<name>` labels all already speak - via
+    the single explicit conversion in `common.engine_names`.
+
+    `name` is therefore the RUNTIME name (`osv-scanner`), the same identifier
+    the rest of the console shows; `lock_key` keeps the manifest key alongside
+    it so the row is still traceable back to `vendor/engines.lock.yaml`.
+
+    An unmapped lock key yields `required`/`disabled` of `None` (unknown), never
+    `False` (fine): the conversion point fails loudly, and this fail-soft caller
+    - the panel must not 500, see `build_engine_coverage` - degrades to an
+    honest "unknown" plus a `unmapped_lock_keys` entry in the report summary.
+    """
+    rows: list[dict[str, Any]] = []
+    for lock_key, spec in sorted(engines.items()):
+        try:
+            name = engine_name_for_lock_key(lock_key)
+        except UnknownEngineNameError:
+            name, resolved = lock_key, False
+        else:
+            resolved = True
+        rows.append(
+            {
+                "name": name,
+                "lock_key": lock_key,
+                "role": spec.get("role"),
+                "adapter_status": spec.get("adapter_status", "not_built"),
+                "required": (name in required) if resolved else None,
+                "disabled": (name in disabled) if resolved else None,
+            }
+        )
+    return rows
+
+
 async def build_engine_coverage(
     redis: aioredis.Redis, *, engines_lock_path: Path = _DEFAULT_ENGINES_LOCK_PATH
 ) -> Report:
@@ -358,17 +409,7 @@ async def build_engine_coverage(
 
     required = floor_engine_names()
     disabled = await list_disabled_engines(redis)
-
-    rows = [
-        {
-            "name": name,
-            "role": spec.get("role"),
-            "adapter_status": spec.get("adapter_status", "not_built"),
-            "required": name in required,
-            "disabled": name in disabled,
-        }
-        for name, spec in sorted(engines.items())
-    ]
+    rows = build_engine_coverage_rows(engines, required=required, disabled=disabled)
     return Report(
         template="engine_coverage",
         since=None,
@@ -377,6 +418,11 @@ async def build_engine_coverage(
             "total_engines": len(engines),
             "required_floor": sorted(required),
             "currently_disabled": sorted(disabled),
+            # Loud, in the report itself, rather than a row that merely looks
+            # boring: an unmapped lock key means the conversion table in
+            # `common.engine_names` was not updated when an engine was vendored,
+            # and every flag on that row is unknowable until it is.
+            "unmapped_lock_keys": sorted(str(r["lock_key"]) for r in rows if r["required"] is None),
         },
         rows=rows,
     )
