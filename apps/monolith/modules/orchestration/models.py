@@ -206,6 +206,84 @@ class ScanResultRow(Base):
     hard_gate_hits: Mapped[list[str]] = mapped_column(JSON, nullable=False)
 
 
+class ScanEngineHealthRow(Base):
+    """Per-(scan, engine) runtime health - milestone C Task 8, design §3.
+
+    WHY A TABLE AND NOT A COLUMN. `ScanResultRow.provenance` already carries one
+    `(name, version, ruleset_digest)` triple per engine, so "add the status
+    there" looks like the small change. It is not: provenance is written only
+    for engines that produced a usable result, and the fact this table exists to
+    record - "this engine never reported" - has no provenance triple to hang
+    off. The row for a never-reported engine is the row that matters.
+
+    WHY THE MONOLITH WRITES IT. INV-10 forbids the engine-runner a DB session
+    (`services/engine_runner/worker.py`), so the service that MEASURES this
+    physically cannot store it. The telemetry travels engine-runner -> findings
+    blob / Redis results stream -> this process, and is persisted here, in the
+    same transaction that writes `ScanResultRow` - so health rows exist exactly
+    when a scan was scored, and a decide can never half-succeed with telemetry
+    but no verdict or vice versa.
+
+    NOT written by `_dead_letter_and_decide` (poison pill / unpack rejected):
+    that path never aggregates, because no engine ran and there is no engine
+    set to report on. Those scans have no rows here at all, deliberately -
+    inventing 15 `not_reported` rows for a package that was rejected before
+    dispatch would attribute an engine-level failure to a content-level one.
+    """
+
+    __tablename__ = "scan_engine_health"
+
+    scan_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # RUNTIME engine name (`EngineMetadata.name`) - the same namespace
+    # `findings_key`, `GatePolicy.required_engines`, `ScanResultRow.provenance`
+    # and the admin toggle all use. NEVER a `vendor/engines.lock.yaml` key:
+    # `osv_scanner`/`aig` differ between the two namespaces while the other
+    # three collide by accident, so a wrong-namespace write here would join
+    # correctly for three engines and silently mis-join for two - precisely how
+    # `reporting.service.build_engine_coverage`'s `disabled` flag stayed wrong
+    # for years. `common.engine_names` is the one sanctioned conversion, and
+    # `test_engine_health.py` pins that every real dispatch set is already in
+    # the runtime namespace so no conversion is needed on this path at all.
+    # 64 chars against a longest-today of 31 (`inhouse-jailbreak-inducement-zh`).
+    engine_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # `aggregate.EngineReportState`. Whether we HEARD from the engine - our own
+    # observation, deliberately a different column from what the engine SAID.
+    report_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    # `skillscan_core.EngineStatus` - what the engine said about its own run.
+    # NULL exactly when `report_state != 'reported'`, enforced by a DB CHECK
+    # (chk_engine_health_status_iff_reported) and by
+    # `EngineHealthRecord.__post_init__`, because THIS is acceptance criterion
+    # 8: "returned ERROR" is (reported, error); "never reported at all" is
+    # (not_reported, NULL). Before this table they were the same value, since
+    # `aggregate.unavailable_engine_result` fabricates EngineStatus.ERROR for a
+    # missing blob so the gate fails closed. That fabrication must not leak
+    # into telemetry, and the schema is what stops it.
+    engine_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Milestone C Task 7's wall-clock span of one `engine.analyze()` call.
+    # THREE states: an integer (measured), `0` (ALSO measured - in-process
+    # floor engines really do finish in under a millisecond, so a reader must
+    # not render 0 as "unknown"), and NULL (NOT measured - a blob from a
+    # pre-Task-7 engine-runner image, or an engine we never heard from).
+    analyze_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Pre-dedup, pre-cap, pre-min_confidence count as the engine reported it -
+    # NOT derivable from `ScanResultRow.findings`, which is the aggregated,
+    # deduplicated, capped set. "Engine ran fine and found nothing" and "engine
+    # found 40 things that all deduplicated away" are different operational
+    # facts. NULL when there was nothing to count.
+    finding_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The engine's own `error` when reported; our fail-closed reason otherwise
+    # (which key was missing, which schema check failed). Truncated to fit by
+    # `aggregate._truncate_error` - MySQL strict mode ERRORS on over-length
+    # data, and this INSERT shares the scoring transaction, so an untruncated
+    # multi-KB pydantic message would abort the decide rather than lose a tail.
+    error: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # When the observation was made (naive UTC, like every other timestamp in
+    # this schema). The scan's own `created_at` is not a substitute: it is the
+    # submission time, and the two differ by the whole queue backlog. This is
+    # also the column a retention sweep has to key on.
+    recorded_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+
+
 class BaselineReadOnly(Base):
     """SECURITY: orchestration's view onto inventory's `baseline` table is
     SELECT-only at the DB GRANT level (svc_orchestration has no INSERT/UPDATE

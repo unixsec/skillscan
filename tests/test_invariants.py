@@ -12,6 +12,8 @@ import unittest
 
 from skillscan_core import (
     AllowlistEntry,
+    CategoryWeights,
+    DetectionCategory,
     EngineCapability,
     EngineMetadata,
     EngineStatus,
@@ -475,6 +477,202 @@ class TestInvariants(unittest.TestCase):
         td2 = toolchain_digest([e_v2], "policy-v1")
         self.assertNotEqual(td1, td2)
         self.assertNotEqual(cache_key(ch, td1), cache_key(ch, td2))
+
+    # INV-7 (milestone C Task 5): the same invariant for the one policy field
+    # that changes a PERSISTED verdict field without changing any threshold -
+    # `category_weights`. `VerdictResult.score` is stored, so a weights edit
+    # that leaves `policy.version` untouched would otherwise let `cache_key`
+    # keep serving a score computed under the OLD weights, silently, for as
+    # long as the cache holds. The digest therefore reads
+    # `GatePolicy.cache_policy_version`, not `.version`.
+    def test_inv7_category_weight_change_invalidates_cache_key(self) -> None:
+        ch = content_hash([("a.py", 0o644, b"x")])
+        engines = [
+            EngineMetadata(
+                name="static-keyword",
+                version="1.0.0",
+                ruleset_digest="d",
+                capabilities=frozenset(),
+            )
+        ]
+        findings = [
+            make_finding(
+                rule_id="pii.token",
+                severity=Severity.HIGH,
+                category=DetectionCategory.DATA_CREDENTIAL,
+            )
+        ]
+
+        base = default_policy()
+        reweighted = default_policy(
+            category_weights=CategoryWeights(data_credential=4.0),
+        )
+        # The whole hazard in one line: the operator edited the weights and did
+        # NOT bump the version.
+        self.assertEqual(base.version, reweighted.version)
+
+        # ...and the persisted `score` field really does move as a result.
+        score_base = decide(
+            scan_result_from_findings(findings, base), base, TrustTier.INTERNAL, now=0.0
+        ).score
+        score_reweighted = decide(
+            scan_result_from_findings(findings, reweighted),
+            reweighted,
+            TrustTier.INTERNAL,
+            now=0.0,
+        ).score
+        self.assertNotEqual(score_base, score_reweighted)
+
+        # So the cache must not answer the second question with the first answer.
+        ck_base = cache_key(ch, toolchain_digest(engines, base.cache_policy_version))
+        ck_reweighted = cache_key(ch, toolchain_digest(engines, reweighted.cache_policy_version))
+        self.assertNotEqual(ck_base, ck_reweighted)
+
+    # INV-7 corollary, REWRITTEN BY TASK 11. Task 5's version of this asserted
+    # that default weights are an IDENTITY ELEMENT - `cache_policy_version` was
+    # the bare version string for an unweighted policy, so shipping that
+    # feature invalidated nothing. Binding the whole policy deliberately gives
+    # that up: all-1.0 is "the behaviour that predates weights", but no
+    # threshold is neutral in the same sense, so every policy's digest moves
+    # once. See `GatePolicy.cache_policy_version` for the measured cost of that
+    # one-time move; it is the price of the verdict never being stale, and it
+    # was paid on purpose rather than by omission.
+    #
+    # What must SURVIVE is the weaker and more useful property: an edit that
+    # changes nothing about the adjudication changes nothing about the digest.
+    # Otherwise a comment, a reindent or a reordered list would cost a rescan
+    # of the entire published inventory.
+    def test_inv7_a_semantically_neutral_policy_edit_does_not_change_the_digest(self) -> None:
+        engines = [
+            EngineMetadata(
+                name="static-keyword",
+                version="1.0.0",
+                ruleset_digest="d",
+                capabilities=frozenset(),
+            )
+        ]
+        # The whole policy is now bound, so the derived term is no longer the
+        # bare version - stated here so this cost cannot be reintroduced or
+        # reverted silently.
+        policy = default_policy()
+        self.assertNotEqual(policy.cache_policy_version, policy.version)
+        self.assertTrue(policy.cache_policy_version.startswith("policy-v1+p1:"))
+
+        # Neutral edit 1: declaring the all-1.0 weights explicitly, as
+        # policies/gate/v1.yaml does, versus omitting the section entirely.
+        explicit = default_policy(category_weights=CategoryWeights())
+        # Neutral edit 2: reordering / duplicating a tier override. The gate
+        # takes min() over the matches, so these are the same policy.
+        base_overrides = default_policy(
+            tier_block_overrides=(
+                (TrustTier.PUBLIC, Severity.HIGH),
+                (TrustTier.PARTNER, Severity.HIGH),
+            )
+        )
+        shuffled_overrides = default_policy(
+            tier_block_overrides=(
+                (TrustTier.PARTNER, Severity.HIGH),
+                (TrustTier.PUBLIC, Severity.HIGH),
+                (TrustTier.PUBLIC, Severity.HIGH),
+            )
+        )
+        # Neutral edit 3: reordering the engine/rule lists (both frozensets).
+        reordered_lists = default_policy(
+            required_engines=frozenset({"b", "a"}),
+            hard_gate_rules=frozenset({"r2", "r1"}),
+        )
+        ordered_lists = default_policy(
+            required_engines=frozenset({"a", "b"}),
+            hard_gate_rules=frozenset({"r1", "r2"}),
+        )
+
+        for name, left, right in (
+            ("explicit-default-weights", policy, explicit),
+            ("reordered-tier-overrides", base_overrides, shuffled_overrides),
+            ("reordered-frozensets", reordered_lists, ordered_lists),
+        ):
+            with self.subTest(neutral_edit=name):
+                self.assertEqual(left.cache_policy_version, right.cache_policy_version)
+                self.assertEqual(
+                    toolchain_digest(engines, left.cache_policy_version),
+                    toolchain_digest(engines, right.cache_policy_version),
+                )
+
+    # INV-7 (milestone C Task 11): the same invariant for the policy fields that
+    # move the VERDICT rather than the score. Task 5 bound `category_weights`
+    # and recorded, in `cache_policy_version`'s own docstring, that
+    # `block_on_severity`/`tier_block_overrides`/`hard_gate_rules` carry the
+    # identical in-place-edit hazard and were still unbound. An operator who
+    # TIGHTENS a threshold and leaves `version:` alone would keep being served
+    # the adjudication computed under the OLD threshold - a package that should
+    # now BLOCK answers PASS for as long as the cache holds. A score is
+    # advisory; a verdict is the gate.
+    def test_inv7_block_on_severity_change_invalidates_cache_key(self) -> None:
+        ch = content_hash([("a.py", 0o644, b"x")])
+        engines = [
+            EngineMetadata(
+                name="static-keyword",
+                version="1.0.0",
+                ruleset_digest="d",
+                capabilities=frozenset(),
+            )
+        ]
+        findings = [make_finding(rule_id="code.exec", severity=Severity.HIGH)]
+
+        lenient = default_policy()  # block_on_severity=CRITICAL
+        tightened = default_policy(block_on_severity=Severity.HIGH)
+        # The whole hazard in one line: the operator edited the threshold and
+        # did NOT bump the version.
+        self.assertEqual(lenient.version, tightened.version)
+
+        # ...and the persisted VERDICT really does move as a result.
+        v_lenient = decide(
+            scan_result_from_findings(findings, lenient), lenient, TrustTier.INTERNAL, now=0.0
+        ).verdict
+        v_tightened = decide(
+            scan_result_from_findings(findings, tightened), tightened, TrustTier.INTERNAL, now=0.0
+        ).verdict
+        self.assertEqual(v_lenient, Verdict.REVIEW)
+        self.assertEqual(v_tightened, Verdict.BLOCK)
+
+        # So the cache must not answer the second question with the first answer.
+        ck_lenient = cache_key(ch, toolchain_digest(engines, lenient.cache_policy_version))
+        ck_tightened = cache_key(ch, toolchain_digest(engines, tightened.cache_policy_version))
+        self.assertNotEqual(ck_lenient, ck_tightened)
+
+    # INV-7 (milestone C Task 11): the per-tier form of the same edit. A tier
+    # override is the field an operator reaches for FIRST when tightening
+    # (public-tier packages are the exposed ones), and it changes the verdict
+    # for that tier only - so the stale answer is served precisely where the
+    # blast radius is largest.
+    def test_inv7_tier_block_override_change_invalidates_cache_key(self) -> None:
+        ch = content_hash([("a.py", 0o644, b"x")])
+        engines = [
+            EngineMetadata(
+                name="static-keyword",
+                version="1.0.0",
+                ruleset_digest="d",
+                capabilities=frozenset(),
+            )
+        ]
+        findings = [make_finding(rule_id="code.exec", severity=Severity.HIGH)]
+
+        base = default_policy()
+        tightened = default_policy(tier_block_overrides=((TrustTier.PUBLIC, Severity.HIGH),))
+        self.assertEqual(base.version, tightened.version)
+
+        v_base = decide(
+            scan_result_from_findings(findings, base), base, TrustTier.PUBLIC, now=0.0
+        ).verdict
+        v_tightened = decide(
+            scan_result_from_findings(findings, tightened), tightened, TrustTier.PUBLIC, now=0.0
+        ).verdict
+        self.assertEqual(v_base, Verdict.REVIEW)
+        self.assertEqual(v_tightened, Verdict.BLOCK)
+
+        ck_base = cache_key(ch, toolchain_digest(engines, base.cache_policy_version))
+        ck_tightened = cache_key(ch, toolchain_digest(engines, tightened.cache_policy_version))
+        self.assertNotEqual(ck_base, ck_tightened)
 
     # INV-8: four-eyes allowlist, mandatory expiry, severity ceiling, scope matching.
     def test_inv8_allowlist_four_eyes_enforced_at_construction(self) -> None:

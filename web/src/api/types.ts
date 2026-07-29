@@ -307,9 +307,76 @@ export interface ReportSchedule {
 export interface EngineInfo {
   name: string
   version: string | null
+  // Why `version` is null, set by the backend beside the null itself
+  // (`admin.engine_registry.VERSION_UNAVAILABLE_SANDBOXED`). A sandbox engine
+  // runs in the separate engine-runner image and the monolith cannot read its
+  // metadata at all (INV-15), which is a fact about topology - not a value
+  // that failed to load. Null here means the version really is simply absent.
+  version_unavailable_reason: string | null
   required: boolean
   enabled: boolean
   capabilities: string[]
+}
+
+// GET /v1/admin/engines/health - milestone C Task 10.
+export interface EngineHealthCounts {
+  ok: number
+  partial: number
+  error: number
+  not_reported: number
+  unreadable: number
+}
+
+export interface EngineHealth {
+  name: string
+  observed_scans: number
+  counts: EngineHealthCounts
+  last_scan_id: string
+  last_recorded_at: string
+  // TWO fields, never merged - this pair IS the milestone's user-visible goal.
+  // `last_report_state` is whether the monolith heard from the engine at all
+  // ('reported' / 'not_reported' / 'unreadable'); `last_engine_status` is what
+  // the engine said about its own run ('ok' / 'partial' / 'error' / 'timeout'),
+  // and is null exactly when the state is not 'reported'. So "returned ERROR"
+  // is ('reported', 'error') and "never reported at all" is
+  // ('not_reported', null). See engineHealth.ts - never render either raw.
+  last_report_state: string
+  last_engine_status: string | null
+  // THREE states, not two: a positive integer is a measurement, `0` is ALSO a
+  // measurement (in-process floor engines finish in under half a millisecond),
+  // and `null` means NOT MEASURED - a findings blob written by an
+  // engine-runner image older than the field. Rendering null as 0, or as a
+  // dash indistinguishable from a real 0, destroys that distinction.
+  last_analyze_duration_ms: number | null
+  max_analyze_duration_ms: number | null
+  measured_duration_count: number
+  last_finding_count: number | null
+  last_error: string | null
+  // Only ever set when the last row was 'not_reported', and only for the two
+  // of five causes with a source the backend can read. Null means the cause is
+  // not knowable, which the console says out loud rather than guessing.
+  not_reported_attribution: string | null
+  // The qualifier that travels WITH the token: 'current_config' whenever an
+  // attribution is present, null otherwise. Both tokens are read from
+  // configuration AT REQUEST TIME - nothing recorded the configuration those
+  // scans actually ran under. It is on the wire, not only in this console's
+  // hint strings, because this console is not the only possible consumer and a
+  // bare `currently_disabled` reads as a fact about the scan. See
+  // engine_registry.not_reported_attribution_basis.
+  not_reported_attribution_basis: string | null
+}
+
+export interface EngineHealthWindow {
+  requested_scans: number
+  observed_scans: number
+  started_at: string | null
+  ended_at: string | null
+}
+
+export interface EngineHealthReport {
+  window: EngineHealthWindow
+  engines: EngineHealth[]
+  unregistered_engines: string[]
 }
 
 export interface PolicyProposal {

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 from engine_runner.adapters import osv
+from engine_runner.adapters.base import EngineHadNothingInScope
 from skillscan_core import DetectionCategory, Severity
 
 
@@ -126,17 +127,55 @@ class TestParseOutput:
         with pytest.raises(ValueError, match="127"):
             osv.parse_output(completed, Path("."), {})
 
-    def test_no_packages_found_returncode_128_also_raises(self) -> None:
-        # 128 = "No packages found" per osv-scanner's Return Codes table -
-        # distinct from "0 vulnerabilities in packages that WERE scanned"
-        # (returncode 0) and must not be conflated with a clean result.
+    def test_no_packages_found_returncode_128_is_nothing_in_scope_not_an_error(self) -> None:
+        # 128 = "No packages found" per osv-scanner's Return Codes table. This
+        # is the state a Skill package produces on essentially every scan (no
+        # requirements.txt/lockfile to resolve), MEASURED on the dev VM
+        # 2026-07-29: the engine was reporting ERROR on 100% of a real
+        # 800-scan corpus while working exactly as documented.
+        #
+        # Must be neither of the two answers `parse_output` used to have. Not
+        # `ValueError` (that is "the scan did not complete", and it was pinning
+        # the failure counter at 100% so a REAL osv regression could never have
+        # moved it), and not a bare `()` (that would claim a dependency audit
+        # that never ran).
         completed = subprocess.CompletedProcess(
             args=["osv-scanner"],
             returncode=128,
             stdout=json.dumps({"results": []}).encode(),
-            stderr=b"",
+            stderr=b"No package sources found, --help for usage information.",
         )
-        with pytest.raises(ValueError, match="128"):
+        with pytest.raises(EngineHadNothingInScope) as excinfo:
+            osv.parse_output(completed, Path("."), {})
+        # The message has to survive to the console's `error` column, which is
+        # the only place an operator can see WHY zero findings is not an audit.
+        assert "128" in str(excinfo.value)
+        assert "not a clean SCA result" in str(excinfo.value)
+
+    def test_nothing_in_scope_is_not_a_subclass_of_the_fail_closed_error(self) -> None:
+        # Load-bearing for `base.analyze`'s handler ORDER: if this were a
+        # ValueError subclass the two branches would still both match and the
+        # first one wins, but any future reordering (or a second `except
+        # ValueError` added upstream) would silently fold this back into ERROR.
+        # Asserting the type relationship makes that impossible to do quietly.
+        assert not issubclass(EngineHadNothingInScope, ValueError)
+
+    def test_missing_offline_database_stays_an_error_not_nothing_in_scope(self) -> None:
+        # THE distinction this change must not blur. Exit 127 with "could not
+        # load db" is a REAL packaging gap (services/engine_runner/Dockerfile
+        # documents that the OSV database is deliberately not fetched at build
+        # time) and it is reachable on any package that DOES declare
+        # dependencies - reproduced in the engine-runner pod on 2026-07-29 with
+        # a requirements.txt. If 127 ever became "nothing in scope" too, this
+        # deployment's only known-CVE detection could fail permanently and
+        # silently while the console showed a healthy amber.
+        completed = subprocess.CompletedProcess(
+            args=["osv-scanner"],
+            returncode=127,
+            stdout=json.dumps({"results": []}).encode(),
+            stderr=b"could not load db for PyPI ecosystem: unable to fetch OSV database",
+        )
+        with pytest.raises(ValueError, match="127"):
             osv.parse_output(completed, Path("."), {})
 
     def test_snippet_hash_derived_from_package_identity(self) -> None:

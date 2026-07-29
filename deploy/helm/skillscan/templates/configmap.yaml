@@ -62,3 +62,21 @@ data:
   # mechanism that needs no external IdP; the seed itself is a Secret key
   # (see secret.yaml), never a value in this ConfigMap.
   SKILLSCAN_LOCAL_AUTH_ENABLED: {{ .Values.config.localAuthEnabled | quote }}
+
+  # ONE per-job budget, read by BOTH deployables (milestone C Task 4). The
+  # monolith stamps it onto every scan message as `deadline_epoch`; the
+  # engine-runner reads it only to warn at startup when the per-engine timeouts
+  # below cannot all fit inside it. Both defaulted to 300s in code already -
+  # this key exists so raising one cannot leave the other behind, which is
+  # exactly what `adapters/aig.py` has been warning about in a comment.
+  SKILLSCAN_SCAN_DEADLINE_S: {{ .Values.config.scanDeadlineS | quote }}
+  # Per-engine subprocess timeouts for the engine-runner. The global default
+  # applies to every engine without its own value; the JSON object overrides it
+  # per engine, keyed by the engine's real runtime name ("bandit",
+  # "osv-scanner", "yara", "skillspector", "aig-mcp-scan" - the same names the
+  # findings and the admin toggle use, NOT vendor/engines.lock.yaml's keys).
+  # An unparseable value, a non-positive one or an unknown engine name stops
+  # the engine-runner at startup rather than reverting to the default: a
+  # timeout that silently did not apply looks exactly like a broken engine.
+  SKILLSCAN_ENGINE_TIMEOUT_S: {{ .Values.config.engineTimeoutS | quote }}
+  SKILLSCAN_ENGINE_TIMEOUTS_JSON: {{ .Values.config.engineTimeoutsJson | quote }}

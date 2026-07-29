@@ -43,6 +43,7 @@ from common.config import (
 )
 from common.db import make_engine, make_session_factory
 from common.log import get_logger
+from common.pinned_dns import set_rebinding_observer
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from fastapi import FastAPI
@@ -588,6 +589,9 @@ def _build_scan_runtime() -> tuple[ScanRuntime, tuple[AsyncEngine, ...]]:
         default_trust_tier=TrustTier.INTERNAL,
         scan_deadline_s=settings.scan_deadline_s,
         sandbox_wait_timeout_s=settings.sandbox_wait_timeout_s,
+        # Presence, not the endpoint itself - see ScanRuntime's own comment.
+        # `Settings` has already validated it as internal (INV-14) by here.
+        sandbox_llm_configured=bool(settings.vllm_base_url),
         reeval_session_factory=make_session_factory(reeval_engine),
         marketplace=_build_marketplace(),
         siem_notifier=_build_siem_notifier(settings),
@@ -742,6 +746,36 @@ def create_app(
     # in use (a test-supplied runtime doesn't change this deployment's actual
     # env-var configuration).
     reconciliation_settings = _build_reconciliation_settings()
+    # Task 13 (2026-07-29): the gauge the log line beside it has been *naming*
+    # since this block was written, while the gauge itself sat at 0.0 forever
+    # because nothing instantiated `SecurityMetrics` at all - the app told you
+    # "reconciliation_inactive metric should be raised" and the scrape said it
+    # was not. Set UNCONDITIONALLY, before the warning loop, so the healthy
+    # case explicitly records 0 rather than leaving the gauge at its never-
+    # written default: a gauge only ever written on the bad path is
+    # indistinguishable from an unwired one, which is the exact defect this
+    # line is fixing.
+    scan_runtime.security_metrics.observe_reconciliation_mode(
+        poll_enabled=reconciliation_settings.poll_enabled
+    )
+    # Task 13: point `common.pinned_dns` at THIS app's registry, so a live
+    # DNS-rebinding attempt against an internal-only endpoint (INV-14) lands
+    # in `external_egress_attempts_total` - the coding spec's "must be
+    # permanently 0" metric - instead of only raising a ValueError inside
+    # whichever HTTP client happened to be connecting. Registered here rather
+    # than in `_build_scan_runtime` because a caller-supplied `scan_runtime`
+    # (tests) must get the same wiring; last-writer-wins, so building several
+    # apps in one process never double-counts.
+    _metrics = scan_runtime.security_metrics
+
+    def _on_external_egress_attempt(hostname: str) -> None:
+        _metrics.external_egress_attempts_total.inc()
+        _logger.error(
+            "pinned internal host failed re-validation - external egress attempt or DNS outage",
+            extra={"context": {"hostname": hostname, "metric": "external_egress_attempts_total"}},
+        )
+
+    set_rebinding_observer(_on_external_egress_attempt)
     for warning in reconciliation_mode_warnings(
         poll_enabled=reconciliation_settings.poll_enabled,
         push_enabled=reconciliation_settings.push_enabled,

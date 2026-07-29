@@ -33,7 +33,8 @@ from skillscan_core import (
     Severity,
 )
 
-from .base import SubprocessEngineAdapter
+from ..timeouts import DEFAULT_ENGINE_TIMEOUT_S
+from .base import EngineHadNothingInScope, SubprocessEngineAdapter
 
 
 def _metadata(*, ruleset_digest: str, version: str) -> EngineMetadata:
@@ -67,6 +68,35 @@ def _severity_from_max_severity(raw: str) -> Severity:
 
 _EXPECTED_RETURNCODES = frozenset({0, 1})  # per vendor/osv-scanner/docs/output.md's own table
 
+# 128 = "No packages found (likely caused by the scanning format not picking up
+# any files to scan)" - vendor/osv-scanner/docs/output.md's Return Codes table,
+# quoted verbatim.
+#
+# MEASURED 2026-07-29 on the dev VM, milestone C's first real finding: this
+# engine returned ERROR on EVERY scan of the live 800-scan corpus, and had been
+# doing so unnoticed for as long as it has been deployed - nothing recorded
+# per-engine status until `scan_engine_health` existed. `osv-scanner --offline
+# --recursive` over a directory holding `SKILL.md` and a couple of `.py` files
+# exits 128, because a Skill package declares no dependencies: no
+# requirements.txt, no package-lock.json, no go.sum, nothing an SCA scanner
+# parses. Reproduced directly in the engine-runner pod, and the control
+# reproduced too (the same binary on a directory with a requirements.txt walks
+# it and reports the packages).
+#
+# So this is not a broken engine and not a packaging fault: it is an engine
+# being handed input outside its domain, on the overwhelming majority of this
+# system's corpus. Reporting that as ERROR made a healthy engine look broken
+# AND buried the state where a genuinely broken osv-scanner would have shown
+# up - the failure counter was already pinned at 100%, so a real regression
+# could not have moved it.
+#
+# NOT changed to a clean `()` return, which would be the other lie: zero
+# findings from an SCA engine that never read a manifest is NOT the same claim
+# as "these dependencies carry no known CVEs", and a Skill can still vendor
+# vulnerable code inline where no manifest declares it. PARTIAL is exactly the
+# distinction - see `base.EngineHadNothingInScope`.
+_NO_PACKAGE_SOURCES_RETURNCODE = 128
+
 
 def parse_output(
     completed: subprocess.CompletedProcess[bytes], _target_dir: Path, _files: dict[str, bytes]
@@ -85,6 +115,19 @@ def parse_output(
     # `treat_nonzero_exit_as_error=False`), 127=general error, 128=no
     # packages found, 129-255=other errors. Anything outside {0,1} means the
     # scan didn't actually complete - fail closed rather than trust stdout.
+    if completed.returncode == _NO_PACKAGE_SOURCES_RETURNCODE:
+        # Checked BEFORE the fail-closed branch below, and ONLY for this one
+        # code. 127 ("general error", which is what a missing offline database
+        # produces - see this module's own docstring and the vendored
+        # Dockerfile's note that the OSV database is deliberately not fetched
+        # at image-build time) stays an ERROR: that one really is "the scan did
+        # not complete", and collapsing the two would hide the packaging gap
+        # behind the benign case.
+        raise EngineHadNothingInScope(
+            "osv-scanner found no package sources to scan (exit 128): this package declares "
+            "no dependency manifest or lockfile, so there was nothing for an SCA engine to "
+            "resolve - not a clean SCA result"
+        )
     if completed.returncode not in _EXPECTED_RETURNCODES:
         raise ValueError(
             f"osv-scanner exited {completed.returncode} (expected 0 or 1 per its documented "
@@ -171,10 +214,13 @@ def parse_output(
     return tuple(findings)
 
 
-def make_adapter(*, ruleset_digest: str, version: str) -> SubprocessEngineAdapter:
+def make_adapter(
+    *, ruleset_digest: str, version: str, timeout_s: float = DEFAULT_ENGINE_TIMEOUT_S
+) -> SubprocessEngineAdapter:
     return SubprocessEngineAdapter(
         metadata=_metadata(ruleset_digest=ruleset_digest, version=version),
         build_argv=_build_argv,
         parse_output=parse_output,
         treat_nonzero_exit_as_error=False,
+        timeout_s=timeout_s,
     )

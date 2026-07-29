@@ -33,6 +33,14 @@ users:
     tables:
       scan_job: ALL
       scan_result: ALL
+      # 里程碑 C Task 8: per-(scan, engine) runtime health, written by the
+      # result collector in the SAME transaction as scan_result. Orchestration's
+      # own private table, not a cross-module seam - deliberately NOT granted to
+      # svc_reporting yet, unlike `scan_result: [SELECT]` below. Nothing reads
+      # it across a module boundary today (the read path is a later task), and
+      # this script is additive with no REVOKE, so a grant issued "because it
+      # will probably be needed" cannot be taken back once a dev DB has it.
+      scan_engine_health: ALL
       # 里程碑 B' review (C2): who may read one scan - a scan has N rightful
       # submitters because submit_scan is single-flight on content+toolchain.
       # SECURITY: INSERT+SELECT only, never ALL. Append-only by design -

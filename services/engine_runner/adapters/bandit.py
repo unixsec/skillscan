@@ -47,6 +47,7 @@ from skillscan_core import (
     Severity,
 )
 
+from ..timeouts import DEFAULT_ENGINE_TIMEOUT_S
 from .base import SubprocessEngineAdapter
 
 # SECURITY: bandit test IDs the coding spec explicitly names as mapping to a
@@ -579,7 +580,9 @@ def parse_output(
     return tuple(findings)
 
 
-def make_adapter(*, ruleset_digest: str, version: str) -> SubprocessEngineAdapter:
+def make_adapter(
+    *, ruleset_digest: str, version: str, timeout_s: float = DEFAULT_ENGINE_TIMEOUT_S
+) -> SubprocessEngineAdapter:
     """`ruleset_digest`/`version` come from the pinned vendored commit
     (coding spec: 'name@version#ruleset_digest 来自 pin 的镜像 digest') - the
     caller (wherever engines are wired up) is responsible for deriving these
@@ -589,4 +592,5 @@ def make_adapter(*, ruleset_digest: str, version: str) -> SubprocessEngineAdapte
         build_argv=_build_argv,
         parse_output=parse_output,
         treat_nonzero_exit_as_error=False,
+        timeout_s=timeout_s,
     )

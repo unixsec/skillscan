@@ -108,7 +108,19 @@ async def drain_one(
                 )
     else:
         # M3's original log-only relay target - still exercised for any
-        # event_type this module doesn't have a real downstream target for.
+        # event_type this module doesn't have a real downstream target for,
+        # AND (easy to miss) for every `verdict_issued` row whenever no
+        # marketplace adapter is configured, which is the default.
+        #
+        # SECURITY (2026-07-29): `verdict_issued`'s payload carries the signed
+        # verdict itself under `payload["jws"]` (modules/gate/service.py) -
+        # a credential anyone holding it can present as a valid skillscan
+        # verdict. `common.log`'s `_SENSITIVE_KEYS` listed `jwt` but not the
+        # `jws` spelling this codebase actually uses, so the full JWS would
+        # have gone to stdout here; `jws` is now covered and the surviving
+        # fields (scan_id, content_hash, verdict, jti) keep the line useful.
+        # This whole branch had never emitted anything - `get_logger` never set
+        # a level - so the leak was latent rather than historical.
         _logger.info(
             "gate_outbox event dispatched (log-only)",
             extra={

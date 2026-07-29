@@ -21,7 +21,7 @@ import datetime
 
 import jwt as pyjwt
 from schemas.findings import deserialize_finding
-from skillscan_core import CategoryWeights, Verdict
+from skillscan_core import GatePolicy, Verdict
 from skillscan_core.scoring import security_score
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -95,6 +95,7 @@ async def submit_review_decision(
     reviewer: str,
     reason: str,
     signer: SignerPort,
+    policy: GatePolicy,
 ) -> VerdictRow:
     """SECURITY: caller must run `gate_session` inside `async with
     gate_session.begin():` - the verdict update/outbox/audit rows commit
@@ -107,6 +108,12 @@ async def submit_review_decision(
     this deployment has no inventory module wired at all - the same condition
     `reviews_router` already tests before enriching the queue - in which case
     no lifecycle exists to supersede anything and every REVIEW is decidable.
+
+    `policy` is required for the same reason and with no default: this function
+    RECOMPUTES and overwrites the verdict's score, and the weights that
+    recomputation uses now live in the policy (milestone C Task 5 - see the
+    comment at the `security_score` call below). A default would let a call site
+    silently re-score a weighted deployment's verdict under all-1.0.
     """
     if decision not in _DECISION_TO_VERDICT:
         raise InvalidDecisionError(f"decision must be one of {sorted(_DECISION_TO_VERDICT)}")
@@ -213,8 +220,31 @@ async def submit_review_decision(
             "- cannot recompute score for the review decision"
         )
     findings = [deserialize_finding(f) for f in result_row.findings]
+    # SECURITY (milestone C Task 5): the weights come from the POLICY, not from
+    # a bare `CategoryWeights()`.
+    #
+    # The hardcoded default here expressed nothing deliberate - it was written
+    # when `CategoryWeights()` was the only value that existed, so "scored
+    # unweighted" and "scored under the configured weights" were the same
+    # sentence. They stopped being the same sentence the moment weights became
+    # configurable, and keeping the reset would have made this function score
+    # every manually-reviewed verdict under all-1.0 while `gate.decide` scored
+    # every automated one under the policy's weights - two scoring regimes
+    # distinguished only by whether a human touched the row, the reviewed one
+    # always the more lenient. Since this function REWRITES `verdict_row.score`
+    # in place, the visible effect would be that passing through the review
+    # queue silently raises a package's score in any weighted deployment.
+    #
+    # KNOWN LIMIT, same one `policy.tier_divergence` documents: this is the
+    # policy loaded NOW, while the verdict was signed under
+    # `verdict_row.policy_version`, and historical policy CONTENT is not
+    # reconstructible (the bootstrap policy is a file on disk with no row
+    # anywhere). Where the policy has not changed since the scan - the normal
+    # case for a queue measured in hours - it is exactly right; where it has,
+    # it is the same policy the next scan of these bytes would be scored under.
+    # Both beat all-1.0, which is wrong in every weighted deployment.
     new_score = security_score(
-        Verdict[new_verdict], findings, pin_to_floor=False, weights=CategoryWeights()
+        Verdict[new_verdict], findings, pin_to_floor=False, weights=policy.category_weights
     )
 
     jws = await signer.sign_verdict(

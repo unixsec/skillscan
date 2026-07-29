@@ -66,6 +66,7 @@ from monolith.modules.orchestration.service import (
 from monolith.modules.reeval.reconciliation import (
     MarketplacePublishedEntry,
     PushEventVerificationError,
+    ReconciliationResult,
     verify_push_event_signature,
 )
 from monolith.modules.reeval.service import apply_push_event
@@ -193,6 +194,14 @@ async def create_scan(
                 # accident. "You may not modify this object" is not a
                 # conflict, and a client told 409 would retry with different
                 # content forever against a wall that is about identity.
+                #
+                # Task 13: the WRITE-side cross-scope attempt. Same counter as
+                # the read-side 404s above - "someone tried to act on an
+                # object owned by another principal" is one condition, and
+                # splitting it by HTTP status would only reflect the fact
+                # that the read path hides existence and the write path does
+                # not.
+                runtime.security_metrics.record_cross_scope_attempt()
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
             # SECURITY: the tier a RESUBMISSION is judged at is the skill's
             # RECORDED tier, never the caller's form field. `trust_tier`
@@ -322,7 +331,15 @@ async def create_scan(
         # registered to another skill" check needs it BEFORE `submit_scan`
         # runs, and hashing the same bytes twice per submission to keep the
         # computation next to its second use would be pure waste.
-        t_digest = compute_toolchain_digest(enabled_engine_metadatas, runtime.policy.version)
+        # `cache_policy_version`, NOT `version` (milestone C Tasks 5 and 11,
+        # INV-7): this digest is recorded on the skill_version and later
+        # compared against `ScanRuntime.current_toolchain_digest` to decide
+        # staleness, so the two must be spelled identically or every skill
+        # reads as stale. It is also the reason a policy-threshold edit is
+        # VISIBLE to reeval: the stale set is defined by this value moving.
+        t_digest = compute_toolchain_digest(
+            enabled_engine_metadatas, runtime.policy.cache_policy_version
+        )
         # FR-PAR-013: record the Skill's declared permissions so the gate and
         # human reviewers can see them. skill_version.declared_perms has existed
         # since the initial schema but every caller passed None until 2026-07-27.
@@ -413,6 +430,12 @@ async def create_scan(
                 # safely. Same 403, so the race resolves to "the registrant
                 # who got there first owns it" rather than to a 500 or, far
                 # worse, a silent write.
+                #
+                # Task 13: counted, same as the pre-flight refusal above. A
+                # request that only reaches the refusal by losing the TOCTOU
+                # race is still a request that tried to write someone else's
+                # object.
+                runtime.security_metrics.record_cross_scope_attempt()
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
             except ContentRegisteredToAnotherSkillError as exc:
                 # SECURITY: the same content is already registered under a
@@ -498,6 +521,16 @@ async def get_scan(
         if not await is_scan_submitter(
             db_session, scan_id=scan_id, subject=session.subject
         ) and not session.has_role(*_REVIEWER_ROLES):
+            # Task 13 (2026-07-29): `cross_scope_access_attempts_total`
+            # (coding spec §11.7). Counted HERE and not one line up: `job is
+            # None` is a request for a scan that does not exist (a stale
+            # bookmark, a typo), whereas reaching this branch means the scan
+            # EXISTS and belongs to someone else - the only one of the two
+            # 404s that is evidence of anything. Merging them would bury the
+            # signal under ordinary not-founds, and the two are deliberately
+            # indistinguishable in the RESPONSE precisely so that the
+            # distinction has to be recorded here or nowhere.
+            runtime.security_metrics.record_cross_scope_attempt()
             raise HTTPException(status_code=404, detail="scan not found")
 
         result_row = (
@@ -651,6 +684,10 @@ async def get_scan_sarif(
         if not await is_scan_submitter(
             db_session, scan_id=scan_id, subject=session.subject
         ) and not session.has_role(*_REVIEWER_ROLES):
+            # Same cross-scope denial as `get_scan`, and counted for the same
+            # reason - an IDOR probe that walks one path segment over must
+            # not become invisible to the metric.
+            runtime.security_metrics.record_cross_scope_attempt()
             raise HTTPException(status_code=404, detail="scan not found")
 
     if runtime.reporting_session_factory is None:
@@ -873,6 +910,25 @@ async def marketplace_push_webhook(
             marketplace=runtime.marketplace,
             push_auto_quarantine_enabled=runtime.push_auto_quarantine_enabled,
         )
+    if outcome.result is ReconciliationResult.ORPHAN:
+        # Task 13 (2026-07-29): `reconciliation_orphan_total` (coding spec
+        # §11.7). ORPHAN means the marketplace has published content for which
+        # we hold no verdict at all - the gate was bypassed. Counted at the
+        # ONE production path that can reach it: `reeval.service.
+        # run_poll_reconciliation`, which SAD §4.3 names as the control that
+        # can actually detect ORPHAN (it enumerates the full published set
+        # independently), has no production caller anywhere in this repo - no
+        # scheduler, no worker step, no route. So this counter can only ever
+        # move on a push event the marketplace chooses to send us, which is
+        # strictly weaker than the design intends. See task-13-report.md.
+        #
+        # This is a Counter, not a Gauge, and poll reconciliation - if it is
+        # ever scheduled - re-derives every outcome from scratch on each pass
+        # by design, so a persistent ORPHAN would increment once per pass.
+        # That is the right shape for a detection counter (rate() then reads
+        # "how hard is this still firing"), but it is NOT a count of distinct
+        # orphaned skills; `GET /v1/reconciliation` is where that lives.
+        runtime.security_metrics.reconciliation_orphan_total.inc()
     return {"status": "processed", "result": outcome.result.value}
 
 

@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
@@ -48,7 +48,19 @@ def _get_scan_runtime(request: Request) -> ScanRuntime:
 class _GrantAllowlistBody(BaseModel):
     scope_type: str
     scope_value: str
-    rule_id: str
+    # `allowlist.rule_id` is VARCHAR(128) and MySQL runs in strict mode, so an
+    # over-length value is a DataError, not a truncation - and `create_allowlist_entry`
+    # only catches `AllowlistError`, so it escapes as a 500 with the
+    # same-transaction `audit_intent` rolled back beside it: the grant silently
+    # does not exist and nothing recorded the attempt.
+    #
+    # SECOND of two bounds, not the only one (2026-07-29, review N-2). The
+    # candidates this field is filled from come from `_known_rule_ids` below,
+    # i.e. out of untrusted findings blobs, and that is bounded at the blob
+    # trust boundary (`schemas.findings._MAX_RULE_ID_CHARS`). This one bounds
+    # the OTHER way in: an operator, or a script, POSTing a rule_id by hand -
+    # a 422 naming the field instead of a 500 naming nothing.
+    rule_id: str = Field(max_length=128)
     expires_at: float
     requested_by: str
     reason: str = ""
@@ -167,6 +179,18 @@ async def create_allowlist_entry(
             )
     except AllowlistError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Task 13 (2026-07-29): `allowlist_entries_total` (coding spec §11.7's
+    # "加白增长"). Counted AFTER the transaction that wrote the row committed,
+    # never before - an entry that failed four-eyes/expiry validation, or
+    # whose transaction rolled back, did not grow the allowlist, and a
+    # growth indicator that counts attempts is not a growth indicator.
+    #
+    # It counts GRANTS, not the live entry count: revocation
+    # (`delete_allowlist_entry`) does not decrement, because a Counter cannot
+    # go down and must not pretend to. The question this answers is "how fast
+    # are we accumulating exemptions", which is the risk that matters; "how
+    # many are active right now" is `GET /v1/allowlist`.
+    runtime.security_metrics.allowlist_entries_total.inc()
     _, skill_id_by_content_hash = await _known_skills(runtime)
     return _row_to_dict(row, skill_id_by_content_hash=skill_id_by_content_hash)
 

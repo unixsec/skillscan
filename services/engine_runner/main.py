@@ -7,6 +7,12 @@ process. Reads config from `SKILLSCAN_`-prefixed env vars, matching
 `apps/monolith/config.py`'s existing convention so the same ConfigMap keys
 work for both deployables.
 
+Per-engine subprocess timeouts (milestone C Task 4) are parsed by
+`engine_runner.timeouts` from `SKILLSCAN_ENGINE_TIMEOUT_S` /
+`SKILLSCAN_ENGINE_TIMEOUTS_JSON` - see that module for the shape, the
+precedence and what happens to the superseded `SKILLSCAN_LLM_ENGINE_TIMEOUT_S`.
+A bad value stops this process here rather than reaching an engine.
+
 SECURITY (INV-10): no DB DSN, no Vault address, no IdP config is read here -
 only `SKILLSCAN_REDIS_URL`, `SKILLSCAN_BLOBSTORE_ROOT` (or MinIO endpoint,
 once that's wired), and `SKILLSCAN_VLLM_BASE_URL`/`SKILLSCAN_OSV_SOURCE` for
@@ -27,6 +33,7 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,9 +50,10 @@ from common.blobstore import (
     log_share_status,
     probe_identity,
 )
-from common.log import get_logger
+from common.log import get_logger, redact_url_credentials
 
-from engine_runner.sandbox_engines import sandbox_engines
+from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES, sandbox_engines
+from engine_runner.timeouts import EngineTimeouts
 from engine_runner.worker import ensure_sandbox_group, sandbox_engine_tick
 
 _logger = get_logger("skillscan.engine_runner.main")
@@ -67,13 +75,15 @@ def _settings_from_env() -> dict[str, str]:
         # by default.
         "llm_api_key": os.environ.get("SKILLSCAN_LLM_API_KEY", ""),
         "llm_model": os.environ.get("SKILLSCAN_LLM_MODEL", ""),
-        # aig-mcp-scan's own subprocess timeout (services/engine_runner/
-        # adapters/aig.py) - default 240s assumes a reasonably fast backend;
-        # override for a slower one (e.g. a local debug model with no
-        # dedicated inference hardware). Raising this alone does nothing
-        # unless SKILLSCAN_SCAN_DEADLINE_S (apps/monolith) is ALSO raised -
-        # see aig.py's own make_adapter() docstring for why.
-        "llm_engine_timeout_s": os.environ.get("SKILLSCAN_LLM_ENGINE_TIMEOUT_S", "240.0"),
+        # The shared per-job budget the MONOLITH stamps onto every scan message
+        # (`ScanRuntime.scan_deadline_s`, same env var, same 300s default -
+        # config.py's Settings picks it up through pydantic-settings). This
+        # process cannot enforce it (the deadline arrives inside each job) and
+        # does not try to; it reads it only to tell an operator at startup when
+        # the timeouts they configured cannot all fit inside it. A disagreement
+        # between the two deployables' values therefore costs a wrong warning,
+        # never a wrong timeout.
+        "scan_deadline_s": os.environ.get("SKILLSCAN_SCAN_DEADLINE_S", "300.0"),
         # 里程碑 E spec §4.3 - shared-blobstore self-check.
         "share_check": os.environ.get("SKILLSCAN_BLOBSTORE_SHARE_CHECK", "1"),
         "share_grace_s": os.environ.get(
@@ -105,6 +115,49 @@ def _float_setting(settings: dict[str, str], key: str, default: float) -> float:
             extra={"context": {"setting": key, "value": settings[key], "default": default}},
         )
         return default
+
+
+def _warn_if_timeouts_exceed_scan_budget(
+    timeouts: EngineTimeouts, *, engine_names: Sequence[str], scan_deadline_s: float
+) -> float:
+    """Warn when the configured per-engine timeouts cannot all fit in one job's
+    shared deadline. Returns the shortfall in seconds (0.0 when they fit).
+
+    WHY A WARNING AND NOT A REFUSAL. The overrun is real but its consequence is
+    not a crash: `worker._dispatch_engines` runs the engines sequentially
+    against one `deadline_epoch`, and `adapters/base.py` clamps each engine's
+    timeout to the budget REMAINING when its turn comes - so the deadline always
+    holds, and what actually happens is that the LAST engines silently get less
+    than they were configured for (or, at the extreme, "deadline already passed"
+    and no subprocess at all). That is a starvation ordering, not an
+    unstartable process. And the number this is compared against is the
+    MONOLITH's setting, read here out of a copy of the same env var: refusing to
+    start on a value another deployable owns would turn one pod's misconfigured
+    ConfigMap into this pod's outage. So it says so, loudly, and starts.
+
+    This is also the check that makes per-engine timeouts safe to raise at all -
+    the previous single-engine knob's own docstring told operators that raising
+    it "does nothing unless SKILLSCAN_SCAN_DEADLINE_S is ALSO raised", and
+    nothing verified that they had."""
+    total_s = timeouts.total_budget_s(engine_names)
+    shortfall_s = total_s - scan_deadline_s
+    if shortfall_s <= 0:
+        return 0.0
+    _logger.warning(
+        "engine timeouts do not fit one scan's deadline - later engines will be cut short "
+        "or skipped; raise SKILLSCAN_SCAN_DEADLINE_S (on BOTH deployables) or lower "
+        "SKILLSCAN_ENGINE_TIMEOUTS_JSON",
+        extra={
+            "context": {
+                "metric": "engine_timeout_budget_exceeded",
+                "total_timeout_s": total_s,
+                "scan_deadline_s": scan_deadline_s,
+                "shortfall_s": shortfall_s,
+                "timeout_s_by_engine": {n: timeouts.for_engine(n) for n in engine_names},
+            }
+        },
+    )
+    return shortfall_s
 
 
 class _ReadinessState:
@@ -284,11 +337,23 @@ async def run() -> None:
     started_at = time.time()
     redis = aioredis.Redis.from_url(settings["redis_url"])
     blobstore = LocalFilesystemBlobStore(root=Path(settings["blobstore_root"]))
+    # Parsed BEFORE anything is constructed and deliberately not guarded: an
+    # EngineTimeoutConfigError here must stop the process, not be logged and
+    # defaulted (see engine_runner/timeouts.py's docstring). Kubernetes reports
+    # that as CrashLoopBackOff with the reason on stderr - an operator whose
+    # timeout typo silently reverted to 60s would instead see engines timing out
+    # and conclude the engines were broken.
+    engine_timeouts = EngineTimeouts.from_env(os.environ, known_engines=SANDBOX_ENGINE_NAMES)
     engines_by_name = sandbox_engines(
         vllm_base_url=settings["vllm_base_url"],
         llm_api_key=settings["llm_api_key"] or None,
         llm_model=settings["llm_model"] or None,
-        llm_engine_timeout_s=float(settings["llm_engine_timeout_s"]),
+        engine_timeouts=engine_timeouts,
+    )
+    _warn_if_timeouts_exceed_scan_budget(
+        engine_timeouts,
+        engine_names=tuple(engines_by_name),
+        scan_deadline_s=_float_setting(settings, "scan_deadline_s", 300.0),
     )
     consumer = f"engine-runner-{uuid.uuid4().hex[:8]}"
     interval_s = float(settings["tick_interval_s"])
@@ -327,7 +392,26 @@ async def run() -> None:
             "context": {
                 "consumer": consumer,
                 "engines": sorted(engines_by_name.keys()),
-                "redis_url": settings["redis_url"],
+                # The RESOLVED value per engine, not the raw setting: overrides,
+                # built-in per-engine defaults and the global default are three
+                # inputs to one number, and "did my override take effect" must
+                # be answerable from the log without re-deriving them by hand.
+                "timeout_s_by_engine": {
+                    name: engine_timeouts.for_engine(name) for name in sorted(engines_by_name)
+                },
+                # SECURITY (2026-07-29): NOT the raw setting. The chart's own
+                # Redis requires auth and this Deployment builds
+                # SKILLSCAN_REDIS_URL as `redis://:$(REDIS_PASSWORD)@host/db`
+                # (deploy/helm/skillscan/templates/engine-runner-deployment.yaml),
+                # so the raw value carries the Redis password. This line had
+                # never actually emitted - `get_logger` never set a level, so
+                # every INFO record was dropped before reaching a handler - and
+                # turning INFO on would have put that password into
+                # `kubectl logs` in cleartext. `RedactionFilter` now strips URL
+                # userinfo for `*_url` keys too, so this is belt-and-suspenders,
+                # but the caller should not depend on the filter to know that a
+                # config value it hands over is a credential.
+                "redis_url": redact_url_credentials(settings["redis_url"]),
                 "blobstore_root": settings["blobstore_root"],
                 "share_probe_identity": share_monitor.identity if share_monitor else None,
             }

@@ -1,4 +1,10 @@
 import { useI18n } from '../i18n/I18nContext'
+import {
+  ENGINE_HEALTH_BADGE_CLASS,
+  engineHealthLabel,
+  engineHealthState,
+} from '../engineHealth'
+import type { EngineHealth } from '../api/types'
 
 const VERDICT_CLASS: Record<string, string> = {
   PASS: 'badge badge-pass',
@@ -54,6 +60,20 @@ export function BoolBadge({
   return (
     <span className={value ? 'badge badge-block' : 'badge badge-pass'}>
       {value ? trueLabel : falseLabel}
+    </span>
+  )
+}
+
+// The ONE sanctioned way to put an engine's report_state/engine_status on
+// screen (milestone C Task 10). `health === undefined` is a real, meaningful
+// input - it renders "no observation in the retained window", which is neither
+// a failure nor a success - so callers pass a lookup miss straight in rather
+// than branching around this component and inventing their own dash.
+export function EngineHealthBadge({ health }: { health: EngineHealth | undefined }) {
+  const { t } = useI18n()
+  return (
+    <span className={ENGINE_HEALTH_BADGE_CLASS[engineHealthState(health)]}>
+      {engineHealthLabel(t, health)}
     </span>
   )
 }

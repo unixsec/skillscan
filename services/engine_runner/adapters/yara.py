@@ -52,6 +52,7 @@ from skillscan_core import (
     Severity,
 )
 
+from ..timeouts import DEFAULT_ENGINE_TIMEOUT_S
 from .base import SubprocessEngineAdapter
 
 _MATCH_LINE_RE = re.compile(r"^(?P<rule>\S+)\s+\[(?P<meta>.*)\]\s+(?P<path>.+)$")
@@ -194,9 +195,16 @@ def parse_output(
     return tuple(findings)
 
 
-def make_adapter(*, rules_path: Path, ruleset_digest: str, version: str) -> SubprocessEngineAdapter:
+def make_adapter(
+    *,
+    rules_path: Path,
+    ruleset_digest: str,
+    version: str,
+    timeout_s: float = DEFAULT_ENGINE_TIMEOUT_S,
+) -> SubprocessEngineAdapter:
     return SubprocessEngineAdapter(
         metadata=_metadata(ruleset_digest=ruleset_digest, version=version),
         build_argv=_ArgvBuilder(rules_path),
         parse_output=parse_output,
+        timeout_s=timeout_s,
     )

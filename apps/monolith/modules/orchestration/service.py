@@ -60,7 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from monolith.modules.gate.service import SignerPort, decide_and_record
 
 from .aggregate import load_and_aggregate, unavailable_engine_result
-from .models import ScanJob, ScanResultRow, ScanSubmitterRow
+from .models import ScanEngineHealthRow, ScanJob, ScanResultRow, ScanSubmitterRow
 
 SessionFactory = Callable[[], AsyncSession]
 
@@ -130,6 +130,38 @@ UNPACK_REJECTED_STATUS = "unpack_rejected"
 _POISON_PILL_ENGINE_MARKER = "__poison_pill__"
 _UNPACK_REJECTED_ENGINE_MARKER = "__unpack_rejected__"
 _TERMINAL_STATUSES = frozenset({POISON_PILL_STATUS, UNPACK_REJECTED_STATUS})
+
+# SECURITY (INV-5 poison-pill, 2026-07-29 milestone C correctness review N-1):
+# the RESULTS stream's own dead-letter reason, the mirror of the SCANS stream's
+# "poison_pill:max_delivery_exceeded" above.
+#
+# WHAT WAS MISSING. The scans stream has capped redelivery since M3; the
+# results stream never did. `run_result_collector_tick` leaves a scan_id's
+# messages unacked when deciding it raises (deliberately - so a transient
+# failure retries), `reclaim_stale_results` hands them straight back, and a
+# DETERMINISTIC failure inside `_try_score_and_decide` therefore retries
+# forever: the scan never gets a verdict and the stream never drains.
+#
+# Milestone C Task 8 made that reachable rather than theoretical. It added 15
+# `scan_engine_health` INSERTs, four CHECK constraints and a new GRANT into
+# that same transaction, so a missing grant, a violated CHECK or an
+# out-of-range value now fails identically on every attempt.
+#
+# WHY A FORCED BLOCK AND NOT AN ACK-AND-DROP. Both ends of the obvious choice
+# are wrong: leaving it unacked churns the stream forever, and acking it away
+# leaves the scan with no verdict, silently. So this takes the SAME exit the
+# scans stream takes - a real, signed, audited fail-closed BLOCK through
+# `_dead_letter_and_decide` - and only then acks. An operator sees a BLOCK
+# verdict carrying this reason, `scan_job.state = 'failed'`, and an ERROR log
+# naming the scan_id and the delivery count; nothing is silently dropped and
+# nothing keeps churning.
+#
+# A distinct reason string from the scans stream's, deliberately: the two say
+# very different things about where to look. "The worker could never process
+# this artifact" is a content/worker problem; this one is "the monolith could
+# never finish scoring a result it had already received", which points at the
+# database, the grants or the policy - not at the submitted package.
+RESULT_POISON_PILL_REASON = "result_poison_pill:max_delivery_exceeded"
 
 # Grace on top of the configured wait before the sweep forces a decision - see
 # sweep_sandbox_wait_timeouts' docstring for why it is not zero.
@@ -266,7 +298,16 @@ async def submit_scan(
     override as a divergence and give an untrusted input a display surface.
     """
     c_hash = compute_content_hash(files)
-    t_digest = compute_toolchain_digest(engine_metadatas, policy.version)
+    # `cache_policy_version`, NOT `version` (milestone C Tasks 5 and 11, INV-7):
+    # the policy's `category_weights` change the persisted `verdict.score` and
+    # its thresholds (`block_on_severity`, `tier_block_overrides`, ...) change
+    # the persisted VERDICT, neither of which changes the version string - so an
+    # in-place policy edit that forgot the bump would let this cache_key serve
+    # the adjudication computed under the old policy. Must
+    # stay identical to `ScanRuntime.current_toolchain_digest`, which decides
+    # whether an ALREADY-published skill is stale - the two disagreeing would
+    # mean every skill reads as permanently stale.
+    t_digest = compute_toolchain_digest(engine_metadatas, policy.cache_policy_version)
     ck = compute_cache_key(c_hash, t_digest)
 
     existing = (
@@ -654,8 +695,17 @@ async def run_mock_engine_worker_tick(
             )
             for engine_name in dispatch_engines:
                 engine = engines_by_name.get(engine_name)
+                # Milestone C Task 7: same bracket, same units and the same
+                # helper as the sandbox runner's loop
+                # (`engine_runner/worker.py`), so a floor engine's timing and a
+                # sandbox engine's timing mean the same thing when the console
+                # puts them in one table. Stays None on the branch below -
+                # nothing ran, and "0ms" would read as a working engine.
+                analyze_duration_ms: int | None = None
                 if engine is not None:
+                    started = airlock.monotonic_now()
                     result = engine.analyze(files, deadline=job.deadline_epoch)
+                    analyze_duration_ms = airlock.elapsed_ms(started)
                 else:
                     # Defensive only: dispatch list should always match the
                     # worker's registered engine set.
@@ -664,7 +714,11 @@ async def run_mock_engine_worker_tick(
                     )
                 key = findings_key(job.scan_id, engine_name)
                 await asyncio.to_thread(
-                    blobstore.put, key, json.dumps(serialize_engine_result(result)).encode("utf-8")
+                    blobstore.put,
+                    key,
+                    json.dumps(
+                        serialize_engine_result(result, analyze_duration_ms=analyze_duration_ms)
+                    ).encode("utf-8"),
                 )
                 await airlock.produce_result(
                     redis,
@@ -672,6 +726,7 @@ async def run_mock_engine_worker_tick(
                     findings_key=key,
                     engine=engine_name,
                     status=result.status.value,
+                    analyze_duration_ms=analyze_duration_ms,
                 )
         except Exception:
             # SECURITY: one job's failure (missing/corrupt blob, malformed
@@ -774,6 +829,13 @@ async def run_result_collector_tick(
     left partially written) - a reconciliation sweep to resume from 'scored'
     would close this, but is not required for M3's acceptance bar and is not
     implemented here.
+
+    SECURITY (INV-5, 2026-07-29): a scan whose messages have been redelivered
+    past `airlock.MAX_DELIVERY_COUNT` is dead-lettered to a forced BLOCK
+    instead of being retried again - the results stream's counterpart to the
+    scans stream's own cap. See `RESULT_POISON_PILL_REASON` for why the
+    unacked-forever behaviour it replaces was reachable, and why the exit is a
+    signed verdict rather than an ack-and-drop.
     """
     results = await airlock.claim_results(redis, consumer=consumer, count=count, block_ms=200)
     # SECURITY (2026-07-28, VM re-review N-2): also take over messages an
@@ -788,13 +850,28 @@ async def run_result_collector_tick(
     )
     required = tuple(sorted(policy.required_engines))
     by_scan_id: dict[str, list[str]] = {}
+    message_ids_by_scan_id: dict[str, list[str]] = {}
     for r in results:
         by_scan_id.setdefault(r.scan_id, []).append(r.status)
+        message_ids_by_scan_id.setdefault(r.scan_id, []).append(r.message_id)
 
     decided = 0
     failed_scan_ids: set[str] = set()
     for scan_id, statuses in by_scan_id.items():
         try:
+            # SECURITY (INV-5): how many times the results stream has already
+            # handed us this scan's messages. The MAX across them, not a sum:
+            # a scan's engines each produce their own message and they are
+            # redelivered independently, so summing would trip the cap on a
+            # busy healthy scan while the max only rises when the SAME message
+            # keeps coming back - which is exactly the poison-pill signature.
+            # See `RESULT_POISON_PILL_REASON` for why this exists at all.
+            deliveries = [
+                await airlock.result_delivery_count(redis, message_id)
+                for message_id in message_ids_by_scan_id[scan_id]
+            ]
+            exhausted = max(deliveries, default=0) > airlock.MAX_DELIVERY_COUNT
+
             terminal = _TERMINAL_STATUSES.intersection(statuses)
             if terminal:
                 # SECURITY: if a scan_id somehow reported BOTH a poison-pill and
@@ -815,6 +892,34 @@ async def run_result_collector_tick(
                     signer=signer,
                     operator=operator,
                     reason=reason,
+                )
+            elif exhausted:
+                # SECURITY (INV-5): every prior attempt to score this scan has
+                # failed, so the next one will fail the same way. Take the
+                # fail-closed exit rather than retrying forever - see
+                # `RESULT_POISON_PILL_REASON`. Checked AFTER `terminal` on
+                # purpose: both land in `_dead_letter_and_decide`, and a
+                # terminal marker names the more specific cause.
+                _logger.error(
+                    "results-stream message exceeded MAX_DELIVERY_COUNT - "
+                    "dead-lettering this scan to a forced BLOCK",
+                    extra={
+                        "context": {
+                            "scan_id": scan_id,
+                            "deliveries": max(deliveries, default=0),
+                            "max_delivery_count": airlock.MAX_DELIVERY_COUNT,
+                        }
+                    },
+                )
+                did_decide = await _dead_letter_and_decide(
+                    orchestration_session_factory,
+                    gate_session_factory,
+                    scan_id=scan_id,
+                    policy=policy,
+                    default_trust_tier=default_trust_tier,
+                    signer=signer,
+                    operator=operator,
+                    reason=RESULT_POISON_PILL_REASON,
                 )
             else:
                 await _mark_running_if_queued(orchestration_session_factory, scan_id)
@@ -1199,12 +1304,41 @@ async def _try_score_and_decide(
                 tuple(required_engines) + tuple(waited_advisory_engines) + tuple(additional_engines)
             )
         )
-        scan_result = load_and_aggregate(
+        aggregated = load_and_aggregate(
             blobstore,
             scan_id=scan_id,
             content_hash=str(job.content_hash),
             engine_names=engine_names,
             policy=policy,
+        )
+        scan_result = aggregated.scan_result
+        # Milestone C Task 8: the per-engine telemetry that reached this
+        # process and was discarded here until now - status, error text and
+        # (Task 7) the analyze() duration. Written in the SAME transaction as
+        # the ScanResultRow above, so "this scan was scored" and "here is what
+        # each engine did on it" can never disagree, and a health row can never
+        # outlive a rolled-back decide.
+        #
+        # One timestamp for the whole set, taken once: these observations were
+        # all made in the same read-back pass, and a per-row `now()` would
+        # imply an ordering between engines that this loop does not have.
+        recorded_at = _naive_utcnow()
+        session.add_all(
+            [
+                ScanEngineHealthRow(
+                    scan_id=scan_id,
+                    engine_name=health.engine_name,
+                    report_state=health.report_state.value,
+                    engine_status=(
+                        None if health.engine_status is None else health.engine_status.value
+                    ),
+                    analyze_duration_ms=health.analyze_duration_ms,
+                    finding_count=health.finding_count,
+                    error=health.error,
+                    recorded_at=recorded_at,
+                )
+                for health in aggregated.engine_health
+            ]
         )
         session.add(
             ScanResultRow(

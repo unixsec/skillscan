@@ -99,6 +99,94 @@ def _grant_body(**overrides: object) -> dict[str, object]:
     return body
 
 
+async def _scrape_allowlist_total(client_instance: httpx.AsyncClient) -> float:
+    """Task 13: read `allowlist_entries_total` off a REAL `/metrics` scrape of
+    this app rather than off the collector, so the assertion covers the value
+    a Prometheus scraper would see and not merely the presence of an
+    `.inc()` call in the source."""
+    response = await client_instance.get("/metrics")
+    assert response.status_code == 200
+    for line in response.text.splitlines():
+        if line.startswith("skillscan_allowlist_entries_total "):
+            return float(line.rsplit(" ", 1)[1])
+    raise AssertionError("allowlist_entries_total missing from /metrics output")
+
+
+class TestAllowlistGrowthIsCounted:
+    """Task 13 (2026-07-29): `allowlist_entries_total` (coding spec §11.7's
+    "加白增长") had no production writer. It is a growth indicator: exemptions
+    accumulating faster than they are justified is the risk, so it counts
+    grants that actually committed - not attempts, and not the live total.
+    Needs real MySQL/Redis - VM only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_successful_grant_moves_the_metric(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        _as(app, "approver-carol", frozenset({"approver"}))
+        headers = _csrf_headers_and_cookies(client)
+        before = await _scrape_allowlist_total(client)
+
+        response = await client.post("/v1/allowlist", json=_grant_body(), headers=headers)
+        assert response.status_code == 201
+
+        assert await _scrape_allowlist_total(client) == before + 1.0
+
+    @pytest.mark.asyncio
+    async def test_a_four_eyes_rejection_does_NOT_move_it(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # THE load-bearing negative: a rejected grant did not grow the
+        # allowlist, and a growth indicator that counts attempts is not a
+        # growth indicator. This request fails INV-8 inside the transaction,
+        # so it also proves the increment sits after the commit rather than
+        # beside the call.
+        _as(app, "dev-dave", frozenset({"approver"}))
+        headers = _csrf_headers_and_cookies(client)
+        before = await _scrape_allowlist_total(client)
+
+        response = await client.post(
+            "/v1/allowlist", json=_grant_body(requested_by="dev-dave"), headers=headers
+        )
+        assert response.status_code == 400
+
+        assert await _scrape_allowlist_total(client) == before
+
+    @pytest.mark.asyncio
+    async def test_a_hard_gate_refusal_does_NOT_move_it(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        _as(app, "approver-carol", frozenset({"approver"}))
+        headers = _csrf_headers_and_cookies(client)
+        before = await _scrape_allowlist_total(client)
+
+        response = await client.post(
+            "/v1/allowlist", json=_grant_body(rule_id=_HARD_GATE_RULE), headers=headers
+        )
+        assert response.status_code == 403
+
+        assert await _scrape_allowlist_total(client) == before
+
+    @pytest.mark.asyncio
+    async def test_revocation_does_NOT_decrement(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # A Counter cannot go down, and must not pretend to. "How fast are we
+        # accumulating exemptions" is the question this answers; "how many are
+        # active right now" is `GET /v1/allowlist`.
+        _as(app, "admin-alice", frozenset({"admin"}))
+        headers = _csrf_headers_and_cookies(client)
+        created = await client.post("/v1/allowlist", json=_grant_body(), headers=headers)
+        assert created.status_code == 201
+        after_create = await _scrape_allowlist_total(client)
+
+        deleted = await client.delete(f"/v1/allowlist/{created.json()['id']}", headers=headers)
+        assert deleted.status_code == 200
+
+        assert await _scrape_allowlist_total(client) == after_create
+
+
 class TestCreateAllowlistEntry:
     @pytest.mark.asyncio
     async def test_approver_can_grant_non_hard_gate_exemption(
@@ -157,6 +245,38 @@ class TestCreateAllowlistEntry:
         client.cookies.set(SESSION_COOKIE_NAME, "fake-session-cookie-for-csrf-test")
         response = await client.post("/v1/allowlist", json=_grant_body())
         assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_an_over_length_rule_id_is_422_not_500(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        """2026-07-29, correctness review N-2: `allowlist.rule_id` is
+        VARCHAR(128) and MySQL is in strict mode, so before the bound this was
+        a DataError - `create_allowlist_entry` only catches `AllowlistError`,
+        so it escaped as a 500 and rolled the same-transaction `audit_intent`
+        back with it: the grant did not exist AND nothing recorded the attempt.
+        The 129th character is the whole test."""
+        _as(app, "approver-carol", frozenset({"approver"}))
+        headers = _csrf_headers_and_cookies(client)
+        response = await client.post(
+            "/v1/allowlist", json=_grant_body(rule_id="r" * 129), headers=headers
+        )
+        assert response.status_code == 422, response.text
+
+    @pytest.mark.asyncio
+    async def test_a_rule_id_exactly_the_column_width_is_still_grantable(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        """The bound is the column, so the boundary value must round-trip
+        through a real MySQL INSERT - an off-by-one would 422 something the
+        database would have stored happily."""
+        _as(app, "approver-carol", frozenset({"approver"}))
+        headers = _csrf_headers_and_cookies(client)
+        response = await client.post(
+            "/v1/allowlist", json=_grant_body(rule_id="r" * 128), headers=headers
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["rule_id"] == "r" * 128
 
 
 class TestListAllowlist:

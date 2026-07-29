@@ -263,6 +263,27 @@ config:
   # requires one. secretRefs.keys below carries the API key, if that
   # deployment enforces its own auth.
   llmModel: ""  # e.g. an enterprise-internal model's own name/identifier
+  # Milestone C Task 4 - the scan budget and how it is divided between engines.
+  # Both defaults match the code's own, so an existing install that never sets
+  # them behaves identically.
+  #
+  # scanDeadlineS is the whole job's wall clock: the monolith stamps it onto
+  # every scan message and every engine's subprocess is clamped to whatever is
+  # left of it when its turn comes. The gate's wait for the sandbox tier
+  # (sandbox_wait_timeout_s) defaults to the same number, so raising this alone
+  # is what an operator wants when engines are being cut short.
+  #
+  # engineTimeoutsJson is per-engine, keyed by the runtime engine name. The
+  # engines run SEQUENTIALLY inside the engine-runner, so what has to fit in
+  # scanDeadlineS is the SUM - the engine-runner logs a warning at startup when
+  # it does not (with the shipped defaults it does not: 60*4 + 240 = 480 > 300,
+  # which is why aig-mcp-scan, running last, is the one that gets truncated).
+  # Example for a slow privatized LLM backend:
+  #   scanDeadlineS: "900"
+  #   engineTimeoutsJson: '{"aig-mcp-scan": 600, "skillspector": 120}'
+  scanDeadlineS: "300"
+  engineTimeoutS: "60"
+  engineTimeoutsJson: ""
 
 # The first admin account, for a deployment with no external IdP (the normal
 # air-gapped case). This is the ONE credential the chart cannot invent for you:

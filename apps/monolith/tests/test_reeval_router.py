@@ -84,20 +84,28 @@ def _as(app_instance: FastAPI, subject: str, roles: frozenset[str]) -> None:
 
 
 async def _seed_published_skill(
-    inventory_sessionmaker: SessionmakerFixture, *, skill_id: str, toolchain_digest: str
-) -> None:
+    inventory_sessionmaker: SessionmakerFixture,
+    *,
+    skill_id: str,
+    toolchain_digest: str,
+    trust_tier: str = "public",
+) -> str:
+    """Returns the generated content_hash so a caller can find the scan_job the
+    rescan produced without guessing at it."""
+    content_hash = uuid.uuid4().hex + uuid.uuid4().hex
     async with inventory_sessionmaker() as session, session.begin():
         await register_skill_version(
             session,
             skill_id=skill_id,
             source="test-suite",
-            trust_tier="public",
-            content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+            trust_tier=trust_tier,
+            content_hash=content_hash,
             toolchain_digest=toolchain_digest,
             declared_perms=None,
             operator="tester",
             actor_is_admin=False,
         )
+    return content_hash
 
 
 class TestListReevalStatus:
@@ -320,6 +328,165 @@ class TestTriggerReeval:
         client.cookies.set(CSRF_COOKIE_NAME, "test-csrf-token")
         response = await client.post(f"/v1/reeval/{skill_id}")  # no x-csrf-token header
         assert response.status_code == 403
+
+
+class TestDrainStaleReeval:
+    """`POST /v1/reeval` (milestone C Task 11): the bulk, STALE-ONLY sibling of
+    the per-skill trigger.
+
+    Task 11 bound the whole gate policy to the toolchain digest, so a threshold
+    edit now correctly marks the entire published inventory stale (760 skills on
+    the dev VM). `batch_rescan_targets` had existed since §11.7 with no caller
+    at all, which made "drain it through reeval" a per-skill loop rather than a
+    mechanism.
+
+    TIER ORDERING IS NOT ASSERTED HERE. The endpoint hands the full status list
+    to `batch_rescan_targets` and slices its result; that function's
+    public -> partner -> internal ordering is covered as a pure function in
+    test_reeval_controller.py. At the HTTP level the shared test database
+    carries stale rows seeded by other tests, so which of this test's own
+    skills falls inside a small `limit` is not deterministic - asserting it
+    would be a flaky test standing in for one that already exists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queues_the_stale_skill_and_skips_the_current_one(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # THE behavioural difference from POST /v1/reeval/{skill_id}, which
+        # deliberately bypasses the staleness filter: on the bulk path,
+        # re-scanning what is already current is pure waste.
+        _as(app, "carol", frozenset({"approver"}))
+        current_digest = (await client.get("/v1/reeval")).json()["current_toolchain_digest"]
+
+        stale_hash = await _seed_published_skill(
+            inventory_sessionmaker,
+            skill_id=f"skill-stale-{uuid.uuid4().hex[:12]}",
+            toolchain_digest="stale-digest-xyz",
+        )
+        current_hash = await _seed_published_skill(
+            inventory_sessionmaker,
+            skill_id=f"skill-current-{uuid.uuid4().hex[:12]}",
+            toolchain_digest=current_digest,
+        )
+
+        _as(app, "admin-alice", frozenset({"admin"}))
+        response = await client.post("/v1/reeval?limit=500")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["current_toolchain_digest"] == current_digest
+        assert body["stale_total"] >= 1
+        assert body["versions_queued"] >= 1
+
+        # Read the rows back through ORCHESTRATION's own credentials, in a
+        # fresh session opened after the request returned - svc_reeval is
+        # INSERT-only on scan_job and the endpoint's own transaction proving
+        # itself would prove nothing about durability.
+        async with orchestration_sessionmaker() as session:
+            queued = (
+                (
+                    await session.execute(
+                        select(ScanJob).where(ScanJob.content_hash.in_([stale_hash, current_hash]))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        hashes = {str(row.content_hash) for row in queued}
+        assert stale_hash in hashes
+        assert current_hash not in hashes
+        assert all(row.submitter == "admin-alice" for row in queued)
+
+    @pytest.mark.asyncio
+    async def test_the_limit_bounds_the_batch_and_reports_what_remains(
+        self, app: FastAPI, client: httpx.AsyncClient, inventory_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # The "controlled" in controlled replay: an operator paces the drain
+        # against a single-replica worker and reads `remaining` between calls.
+        for _ in range(3):
+            await _seed_published_skill(
+                inventory_sessionmaker,
+                skill_id=f"skill-{uuid.uuid4().hex[:12]}",
+                toolchain_digest=f"stale-{uuid.uuid4().hex[:8]}",
+            )
+        _as(app, "admin-alice", frozenset({"admin"}))
+        response = await client.post("/v1/reeval?limit=2")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stale_total"] >= 3
+        assert body["targets_selected"] == 2
+        assert body["remaining"] == body["stale_total"] - 2
+        assert body["versions_queued"] <= 2
+
+    @pytest.mark.asyncio
+    async def test_draining_twice_queues_nothing_new(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # A target stays stale until its rescan is DECIDED and
+        # `advance_scanned_toolchain_digests` retires it, so a second drain
+        # re-selects the same skills. It must not double-queue them: the
+        # cache_key UNIQUE constraint makes the repeat a benign no-op, which is
+        # what lets an operator (or a retry) call this repeatedly.
+        content_hash = await _seed_published_skill(
+            inventory_sessionmaker,
+            skill_id=f"skill-{uuid.uuid4().hex[:12]}",
+            toolchain_digest="stale-digest-repeat",
+        )
+        _as(app, "admin-alice", frozenset({"admin"}))
+        first = await client.post("/v1/reeval?limit=500")
+        assert first.status_code == 200
+        second = await client.post("/v1/reeval?limit=500")
+        assert second.status_code == 200
+        assert second.json()["versions_queued"] == 0
+
+        async with orchestration_sessionmaker() as session:
+            rows = (
+                (await session.execute(select(ScanJob).where(ScanJob.content_hash == content_hash)))
+                .scalars()
+                .all()
+            )
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_approver_cannot_drain(self, app: FastAPI, client: httpx.AsyncClient) -> None:
+        # Same posture as the per-skill trigger: queueing rescans is real
+        # compute cost, so it is admin-only even though reading staleness is not.
+        _as(app, "carol", frozenset({"approver"}))
+        response = await client.post("/v1/reeval")
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_missing_csrf_token_is_403(self, app: FastAPI, client: httpx.AsyncClient) -> None:
+        # A real cookie (not the dependency-override auth the rest of this
+        # class uses) is required to exercise require_csrf's actual check -
+        # the same pattern as its per-skill sibling above, because a NEW
+        # state-changing route is exactly where that dependency gets forgotten.
+        _as(app, "admin-alice", frozenset({"admin"}))
+        client.cookies.set(SESSION_COOKIE_NAME, "fake-session-cookie-for-csrf-test")
+        client.cookies.set(CSRF_COOKIE_NAME, "test-csrf-token")
+        response = await client.post("/v1/reeval")  # no x-csrf-token header
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_a_nonsensical_limit_is_refused(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # Refused rather than clamped: `limit=0` means the operator believes
+        # they asked for something, and silently queueing nothing (or, for a
+        # negative value, silently queueing everything through a python slice)
+        # is the worse answer.
+        _as(app, "admin-alice", frozenset({"admin"}))
+        assert (await client.post("/v1/reeval?limit=0")).status_code == 422
+        assert (await client.post("/v1/reeval?limit=-1")).status_code == 422
+        assert (await client.post("/v1/reeval?limit=100000")).status_code == 422
 
 
 class TestGetReconciliationStatus:

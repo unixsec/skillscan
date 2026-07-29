@@ -7,10 +7,11 @@ mirrors `auth.dependencies.AuthRuntime`'s pattern.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import redis.asyncio as aioredis
 from common.blobstore import BlobStorePort
+from common.observability import SecurityMetrics
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from ports import NotificationPort
 from skillscan_core import AllowlistEntry, EngineMetadata, GatePolicy, TrustTier, toolchain_digest
@@ -95,16 +96,42 @@ class ScanRuntime:
     scan_deadline_s: float = 300.0
     # orchestration.service.sweep_sandbox_wait_timeouts' own `wait_timeout_s`
     # (D2, 2026-07-27) - how long the gate waits for the sandbox engines
-    # (bandit/osv-scanner/yara/skillspector) before deciding without them.
-    # Deliberately defaults to the same value as `scan_deadline_s`: the
-    # sandbox subprocesses are themselves bounded by that budget, so waiting
-    # longer than it cannot produce more results.
+    # before deciding without them. Deliberately defaults to the same value as
+    # `scan_deadline_s`: the sandbox subprocesses are themselves bounded by
+    # that budget, so waiting longer than it cannot produce more results.
     sandbox_wait_timeout_s: float = 300.0
+    # Whether this deployment has an internal LLM endpoint (Settings.
+    # vllm_base_url / SKILLSCAN_VLLM_BASE_URL - one ConfigMap key the monolith
+    # and the engine-runner both consume). NOT the URL: this process never
+    # calls it (INV-11 - the monolith parses no untrusted content), it only
+    # needs to know whether the engine-runner will have constructed its
+    # LLM-gated sandbox engines, because the gate must not wait on an engine
+    # that cannot report. See worker._active_sandbox_waited_engines. False by
+    # default, which waits for less rather than stalling every scan on an
+    # engine that was never going to answer.
+    sandbox_llm_configured: bool = False
+    # Task 12 (2026-07-29, milestone C engine-management): ONE `SecurityMetrics`
+    # instance for this process's whole lifetime, exposed at `GET /metrics`
+    # (`gateway/infra_router.py`). `default_factory` (not `None`-then-build,
+    # unlike the optional session factories above) so every ScanRuntime -
+    # production or a test's hand-built one - always has a real, working
+    # registry; SecurityMetrics()'s own default gives each instance a FRESH
+    # CollectorRegistry, so tests that build several ScanRuntimes never share
+    # counters. Task 13 (2026-07-29) wired real production writers for eight
+    # of the nine collectors - see `infra_router.metrics`'s comment for which
+    # readings are now honest and which are still "unmeasured"
+    # (`sandbox_egress_denied_total` has no writer and cannot get one from
+    # Python). Every writer reaches this object through the runtime it is
+    # already holding; the ONE exception is `common.pinned_dns`, a process-
+    # wide socket patch with no runtime in scope, which `main.create_app`
+    # points at THIS instance via `set_rebinding_observer` rather than
+    # building a second registry nothing would scrape.
+    security_metrics: SecurityMetrics = field(default_factory=SecurityMetrics)
 
-    def current_toolchain_digest(self) -> str:
+    async def current_toolchain_digest(self) -> str:
         """INV-7's `toolchain_digest` for the engines and policy THIS process
-        currently has loaded - the value `orchestration.submit_scan` would
-        stamp on a scan_job submitted right now.
+        would actually run right now - the value `orchestration.submit_scan`
+        would stamp on a scan_job submitted this instant.
 
         ONE definition, on the object that holds both inputs. It used to be
         recomputed inline wherever it was needed (`reeval.router`, and the
@@ -113,5 +140,50 @@ class ScanRuntime:
         `policy.version` changes on every hot-reload, so a call site that
         passed a stale policy would silently disagree with the one that
         stamped the job, and every skill would read as permanently stale.
+
+        `cache_policy_version`, NOT `version` (milestone C Tasks 5 and 11): the
+        policy's weights move the persisted score and its thresholds move the
+        persisted verdict, neither of which moves the version string. This is
+        also the expression that decides what `reeval` calls STALE, so binding
+        the policy here is what makes a threshold edit reach the published
+        inventory at all.
+
+        ENABLED ENGINES, NOT ALL OF THEM, and async for exactly that reason
+        (2026-07-29, milestone C correctness review N-3). This hashed
+        `self.engine_metadatas` while every writer of a persisted digest -
+        `gateway.router.create_scan`, `marketplace_api.router`, and the
+        `skill_version.toolchain_digest` write beside them - hashes
+        `filter_enabled_engines(...)` of the same list. The two agree only
+        while nothing is admin-disabled, and the docstring here used to claim
+        they were "asserted equal in apps/monolith/tests/test_gate_service.py",
+        a file that contained no reference to either. The guard now exists, in
+        `apps/monolith/tests/test_toolchain_digest_agreement.py`, and it
+        disables an engine first - which is the only state in which the claim
+        was ever worth making.
+
+        WHY THE ENABLED SET IS THE CORRECT ONE, rather than making the writers
+        match this. This value has no writers at all: it exists only to be
+        COMPARED against `scan_job.toolchain_digest`, `skill_version.
+        toolchain_digest` and the `cache_key` built from them, every one of
+        which is written from the enabled set. A comparison value that cannot
+        equal what was recorded is simply wrong, and it failed in the
+        fail-OPEN direction on the cache: `cache_key` is content+toolchain, so
+        a digest that ignores the disabled set would let a verdict reached
+        with an engine that no longer runs be served for a submission made
+        after it was switched off. Disabling an engine genuinely changes what
+        a scan does, so it must genuinely change the toolchain's identity.
+
+        Reads Redis (`filter_enabled_engines`) rather than a cached snapshot:
+        the disabled set is shared fleet-wide precisely so an admin action
+        applies to every replica at once, and a per-process cache of it is the
+        same "second registry" defect the paragraph above is about.
         """
-        return toolchain_digest(self.engine_metadatas, self.policy.version)
+        # Imported here, not at module scope: `admin.router` imports THIS
+        # module for `ScanRuntime`, so a module-level import of anything under
+        # `admin` that transitively reaches it would close a cycle.
+        # `engine_registry` does not import gateway today - this keeps that
+        # from becoming a constraint on it.
+        from monolith.modules.admin.engine_registry import filter_enabled_engines
+
+        enabled = await filter_enabled_engines(self.redis, self.engine_metadatas)
+        return toolchain_digest(enabled, self.policy.cache_policy_version)

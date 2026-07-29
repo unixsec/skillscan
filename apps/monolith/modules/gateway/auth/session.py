@@ -33,6 +33,28 @@ class SessionError(Exception):
     """Any session validation failure. SECURITY: callers must treat this as fail-closed (401)."""
 
 
+class IntrospectionUnavailableError(SessionError):
+    """The introspection CALL itself failed - the IdP was unreachable, returned
+    a non-2xx, or answered with something that is not a JSON object.
+
+    SECURITY: a subclass, not a separate exception, so every existing
+    `except SessionError` handler keeps fail-closing exactly as before - the
+    distinction is additive and cannot change any authorization outcome
+    (Task 13, 2026-07-29).
+
+    It exists so `introspection_failures_total` (coding spec §11.7) can count
+    the condition the spec's own acceptance test names - "introspection 故障→
+    fail-closed 拒" - WITHOUT counting the ordinary rejections that share the
+    same 401: an expired token, a revoked token, `active: false`, a missing
+    `sub`. Those are the system working; this is the system unable to ask.
+    Merging them would produce a counter that rises steadily on a healthy
+    deployment (every lapsed browser session) and so could never alert on an
+    IdP outage, which is the only thing it is for. The type is raised here,
+    at the one place that performs the introspection I/O, and counted in
+    `dependencies.get_session_context`, the one place that can reach the
+    metrics registry."""
+
+
 @dataclass(frozen=True, slots=True)
 class SessionContext:
     """SECURITY: `is_machine` is the KIND of identity, not its permission list.
@@ -117,9 +139,12 @@ async def introspect_token(
         logger.info(
             "introspection endpoint failure", extra={"context": {"error": type(exc).__name__}}
         )
-        raise SessionError(f"introspection endpoint unavailable: {exc}") from exc
+        raise IntrospectionUnavailableError(f"introspection endpoint unavailable: {exc}") from exc
     if not isinstance(payload, dict):
-        raise SessionError("introspection response was not a JSON object")
+        # Also an introspection failure, not a token verdict: the IdP answered
+        # with something we cannot interpret, so we never learned anything
+        # about this token at all.
+        raise IntrospectionUnavailableError("introspection response was not a JSON object")
     cache.put(token, payload)
     return payload
 

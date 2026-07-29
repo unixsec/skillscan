@@ -10,7 +10,6 @@ from collections.abc import Iterable
 
 from skillscan_core.models import (
     AllowlistEntry,
-    CategoryWeights,
     Finding,
     GatePolicy,
     ScanResult,
@@ -20,8 +19,6 @@ from skillscan_core.models import (
     VerdictResult,
 )
 from skillscan_core.scoring import evaluate_findings, security_score
-
-_DEFAULT_WEIGHTS = CategoryWeights()
 
 
 def _classify(
@@ -45,8 +42,17 @@ def decide(
     now: float,
     min_confidence: float = 0.0,
     skill_id: str | None = None,
-    weights: CategoryWeights = _DEFAULT_WEIGHTS,
 ) -> VerdictResult:
+    """SECURITY (INV-7, milestone C Task 5): the scoring weights are read off
+    `policy.category_weights` and are NOT a parameter of this function. They
+    used to be one, defaulting to all-1.0, which meant a caller could score a
+    verdict under weights no `policy_version` mentions - and `score` is a
+    persisted field the INV-7 cache serves. With the policy as the only source,
+    `GatePolicy.cache_policy_version` covers every weight that can reach a
+    score. A caller that wants different weights builds a different policy,
+    which is exactly the thing the cache key can see."""
+    weights = policy.category_weights
+
     # SECURITY (INV-1): required engine missing/failed -> fail-closed, no exceptions.
     if not scan_result.required_ok:
         verdict = policy.fail_closed_verdict

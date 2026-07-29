@@ -43,6 +43,15 @@
   `marketplace_fetch_log` 表永远空着——看起来像"系统健康、只是还没人轮询过"。部署本里程碑
   后，第一次真实轮询发生后应主动 grep 应用日志中的 `marketplace_fetch_audit_write_failed`；
   出现即说明 `svc_marketplace` 授权缺失或过期，重跑 `db/setup_grants.py` 补上。
+- **改过 `企业Skill安全评估测试维度清单.xlsx` 后必须重跑目录生成器（2026-07-29，里程碑 C
+  Task 6）：** `uv run python scripts/gen_detection_catalog.py`，并把
+  `policies/detection_catalog.json` 一起提交。那份 .xlsx 是 62 个 `test_item_id` 的唯一权威源，
+  但它被 `.gitignore` 排除（`/*.xlsx`）、只存在于作者本机——**任何 clone、CI checkout 与容器镜像里
+  都没有它**。因此 `tests/test_test_item_catalog.py`（`SUP-01` 事故后建立的三重守卫）改为读那份
+  生成的 JSON 清单：清单随仓库走，守卫因此在所有环境里都真跑；清单缺失是**硬失败**，不再是 skip。
+  同步性由两处保证：`deploy_and_test_vm.sh` 第 1 步在 Mac 上跑 `--check`（.xlsx 缺失也算失败），
+  以及 `TestManifestMatchesTheAuthoritativeXlsx`。**只导出条目编号，不导出条目名称/检测要点**——
+  编号本来就散布在引擎源码、测试与 SAD 里，不属于需要留在表格内的内容。
 - **策略生效语义（2026-07-06 晚新增）：** 管理员批准提案 → `promote_approved_policy` 当场
   应用并把该行标为 `applied`（ENUM 新值，迁移 `e4b8c31a90d2`）；worker 每 tick 重读最新
   `applied` 行使之跨重启/跨副本收敛。**历史上只停留在 `approved` 的行永远不会自动生效**
@@ -170,14 +179,62 @@ break-glass 就这样漏过一次（只有真实浏览器测试才发现）。�
 会话/cookie 类型，必须同步检查：(1) 是否已进入 `SESSION_COOKIE_NAMES`；(2) 它的 TTL 是否仍
 短于 `CSRF_COOKIE_MAX_AGE_S`（若通过环境变量把会话 TTL 调到 7 天以上，(二) 会复现）。
 
-### 4.3 MySQL 并发已知注意事项（M3 已修复，供未来修改审计链代码时参考）
+### 4.3 结果收集器的真实驱动方式（读源码会得出错误结论的一处）
+
+`apps/monolith/main.py` 曾经在 `_build_scan_runtime` 里留过一条 KNOWN GAP 注释，称
+`run_result_collector_tick`"从未被本代码库中任何存活进程调用"。这个结论本身就是**只读源码**
+得出的，而且是错的——它在里程碑 F 的残留清理（`7136e0e`）里已经改正：`worker.worker_tick`
+每个 tick 自行做实时白名单读取，并把结果传给 `run_result_collector_tick`，收集器**是**有
+存活驱动方的。那条旧注释曾经为真的部分，其实是 **chart 层面**的缺口——里程碑 E 发现整个
+Helm chart 里根本不存在 `SKILLSCAN_WORKER_ENABLED`，默认 false，于是扫描永远卡在 `queued`：
+代码有调用方，是部署没启用它。chart 已在 `deploy/helm/skillscan/values.yaml`
+（`config.workerEnabled: true`）补上。
+
+**2026-07-29 在 VM 上现场核实（不是读源码推断）的结论：**
+
+- **驱动方是单个 monolith 进程内的后台协程，不是独立的 worker 进程/Deployment。**
+  `kubectl get pods -n skillscan` 只有一个 `monolith-*` pod 和一个 `engine-runner-*` pod，
+  没有第三个"worker"工作负载；`monolith` 容器的 entrypoint（`/entrypoint/run.py`）就是
+  `create_app()` + `uvicorn.run()` 单进程，lifespan 里按 `SKILLSCAN_WORKER_ENABLED` 起一个
+  `asyncio.create_task(run_worker_loop(...))`。`kubectl exec deploy/monolith -- env` 现场
+  确认部署里 `SKILLSCAN_WORKER_ENABLED=true`。
+- **tick 间隔是可配置的，当前用的是代码默认值。** `SKILLSCAN_WORKER_INTERVAL_S`
+  在部署的 configmap/env 里**没有被设置**（`kubectl exec deploy/monolith -- env | grep
+  SKILLSCAN` 未出现该变量），所以取 `config.py` 的默认值 1.0 秒；chart 目前没有任何地方
+  覆盖它，想调需要新增一个 chart 值。
+- **engine-runner 结构上不可能自己落库**（INV-10：`services/engine_runner/worker.py` 只碰
+  Redis + blob store，代码里没有任何 SQLAlchemy/DB session），它只把结果写进 Redis Stream
+  `skillscan:results`。`XINFO GROUPS skillscan:results` 显示唯一的消费组 `orchestrators`
+  下唯一的消费者名叫 `monolith-worker`——正是 `worker.py` 里 `run_worker_loop`/`worker_tick`
+  的默认 `consumer` 参数值——`pending=0`、`lag=0`、`entries-read` 与流总长度相等，说明这个
+  消费者在持续、无积压地把 engine-runner 写的每一条结果读走。
+- **端到端落库已用真实数据核实**：MySQL `verdict` 表里 `scan_id=5df592e4-8d3b-49dc-95b2-
+  6336cb9bf107` 的一行正是 `REVIEW / 47`，与设计文档 §8 引用的那次"提交真实包后走到
+  Decided / REVIEW / 47"完全对应；`scan_job.created_at`（22:52:03.634）到
+  `verdict.issued_at`（22:52:09.423）相隔约 5.8 秒，另几条最近记录（4fbd9c73...、
+  347a959c...）也都是 5-6 秒量级的 queued→decided 延迟——与"约 1 秒一个 tick、裁决要跨
+  好几个 tick 才能走完排队/引擎执行/打分/裁决多个阶段"完全吻合，不是一次性瞬间写入。
+- **陷阱：`kubectl logs` 看不出 worker 在跑，但这不代表它没在跑。**
+  `libs/common/log.py` 的 `get_logger()` 从未调用 `logger.setLevel(...)`，这些 logger 因此
+  沿用 Python 的默认根 level（`WARNING`），`worker.py` 里 `_logger.info("background worker
+  started", ...)` 之类的 INFO 日志会被静默丢弃——`kubectl logs deploy/monolith | grep
+  worker` 在这套部署上什么都搜不到。日志里能看到的 INFO 行只是 uvicorn 自己的访问日志（它
+  自己配置了 log level）。**下一个人如果靠 `grep worker kubectl logs` 来判断 worker 是否
+  存活，会被这个空结果误导成"没在跑"**——要看 Redis 消费组状态（`XINFO GROUPS`/
+  `XINFO CONSUMERS`）或 DB 里的实际时间戳，不要只看日志。
+
+**结论：与改正后的注释不矛盾**，`run_result_collector_tick` 确实由 `apps/monolith/
+worker.py` 的 `worker_tick` 驱动，跑在唯一的 monolith 进程里；§3 的遥测存储设计可以继续
+假设"落库发生在 monolith 侧"这个前提成立。
+
+### 4.4 MySQL 并发已知注意事项（M3 已修复，供未来修改审计链代码时参考）
 
 审计哈希链在真实并发下暴露过三个真实 MySQL/InnoDB 行为（挑选待处理记录无锁导致双写、
 链尾追加在 REPEATABLE READ 下死锁、READ COMMITTED 下仍可能拿到陈旧链尾导致静默分叉）——
 均已修复（`SELECT...FOR UPDATE SKIP LOCKED` + READ COMMITTED + 显式陈旧性检测），修改
 `append_one_intent`/`drain_pending_outbox` 或任何"读链尾→算哈希→追加"逻辑前务必了解。
 
-### 4.4 环境受限项（非缺陷，本机验证深度的诚实边界）
+### 4.5 环境受限项（非缺陷，本机验证深度的诚实边界）
 
 gVisor 沙箱隔离本身（Linux-only）、真实 K8s 集群 apply/隔离测试/DR 演练、持续运行的真实
 Vault、真实企业 IdP、真实 Skill 市场——均无法在本开发环境验证，相关代码/配置本身已通过

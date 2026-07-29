@@ -1,17 +1,16 @@
-"""`GET /v1/reeval`, `POST /v1/reeval/{skill_id}`, `GET /v1/reconciliation`
-(coding spec §9/§11.7).
+"""`GET /v1/reeval`, `POST /v1/reeval`, `POST /v1/reeval/{skill_id}`,
+`GET /v1/reconciliation` (coding spec §9/§11.7).
 
 SECURITY: read routes require approver/admin (reeval) or admin/auditor
-(reconciliation, matching the spec table exactly); the manual-trigger route
-requires admin - triggering a rescan is a real compute-cost action, not a
-read.
+(reconciliation, matching the spec table exactly); BOTH trigger routes require
+admin - queueing a rescan is a real compute-cost action, not a read.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
@@ -21,7 +20,12 @@ from monolith.modules.inventory.models import SkillLifecycleEventRow, SkillVersi
 from monolith.modules.orchestration.drift import is_drift
 from monolith.modules.orchestration.models import BaselineReadOnly
 
-from .controller import is_stale, list_published_toolchain_statuses, trigger_rescans
+from .controller import (
+    batch_rescan_targets,
+    is_stale,
+    list_published_toolchain_statuses,
+    trigger_rescans,
+)
 from .service import list_reconciliation_outcomes
 
 router = APIRouter(prefix="/v1")
@@ -45,6 +49,16 @@ _reeval_reader = require_role("approver", "admin")
 _reeval_admin = require_role("admin")
 _reconciliation_reader = require_role("admin", "auditor")
 
+# `POST /v1/reeval` drain sizing. A rescan is real engine work on a worker that
+# is single-replica by default, so the batch is bounded and the default is
+# deliberately well below a whole inventory: an operator who wants everything
+# says so, in pages, and watches `remaining` between calls. Measured on the dev
+# VM (2026-07-29) to pick these: 93 scans decided in 59s in one real burst, 251
+# in 853s in another, so a 50-job page is roughly a minute of worker time at the
+# fast end and a few minutes at the slow end.
+_DEFAULT_DRAIN_LIMIT = 50
+_MAX_DRAIN_LIMIT = 500
+
 
 def _get_scan_runtime(request: Request) -> ScanRuntime:
     runtime: ScanRuntime = request.app.state.scan
@@ -63,7 +77,7 @@ async def list_reeval_status(
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> dict[str, Any]:
     session_factory = _require_reeval_session_factory(runtime)
-    current_digest = runtime.current_toolchain_digest()
+    current_digest = await runtime.current_toolchain_digest()
     async with session_factory() as db_session:
         statuses = await list_published_toolchain_statuses(db_session)
     return {
@@ -156,6 +170,59 @@ async def _drift_summary(runtime: ScanRuntime) -> dict[str, Any]:
     return {"skills": drift_skills, "events": events}
 
 
+@router.post("/reeval", dependencies=[Depends(require_csrf)])
+async def drain_stale_reeval(
+    limit: int = Query(default=_DEFAULT_DRAIN_LIMIT, ge=1, le=_MAX_DRAIN_LIMIT),
+    session: SessionContext = Depends(_reeval_admin),
+    runtime: ScanRuntime = Depends(_get_scan_runtime),
+) -> dict[str, Any]:
+    """Re-queue the STALE published skills, highest-exposure tier first
+    (milestone C Task 11).
+
+    WHY THIS EXISTS. `batch_rescan_targets` has been in `controller.py` since
+    §11.7 with no caller at all: the only way to act on the staleness `GET
+    /v1/reeval` reports was `POST /v1/reeval/{skill_id}`, one skill at a time.
+    That was survivable while staleness was an occasional single skill; Task 11
+    binds the whole gate policy to the toolchain digest, so a threshold edit now
+    correctly marks the ENTIRE published inventory stale, and on the dev VM that
+    is 760 skills. A mechanism that requires 760 requests is not a mechanism, and
+    the alternative - letting the cache go cold and waiting for organic
+    resubmission - never re-adjudicates the already-published verdicts at all,
+    which is the whole point of tightening a threshold.
+
+    STALE ONLY, unlike its per-skill sibling. That route deliberately bypasses
+    the filter because "manually trigger reeval" means forcing one rescan on an
+    out-of-band signal. This one is the bulk path, where re-scanning what is
+    already current is pure waste - and `advance_scanned_toolchain_digests`
+    (worker.py) is what retires a target from the stale set once its rescan has
+    actually been decided, so repeated calls converge instead of looping.
+
+    BOUNDED BY `limit`, and that is the "controlled" in controlled replay. The
+    ordering (public -> partner -> internal, `batch_rescan_targets`) means a
+    partial drain is not an arbitrary subset: it is the highest-exposure end of
+    the inventory. `remaining` tells the operator how much is left so the drain
+    can be paced against a single-replica worker rather than dropped on it in
+    one call. Idempotent either way - `trigger_rescans` treats an already-queued
+    cache_key as a benign no-op.
+    """
+    session_factory = _require_reeval_session_factory(runtime)
+    current_digest = await runtime.current_toolchain_digest()
+    async with session_factory() as db_session, db_session.begin():
+        statuses = await list_published_toolchain_statuses(db_session)
+        stale = batch_rescan_targets(statuses, current_digest)
+        selected = stale[:limit]
+        queued = await trigger_rescans(
+            db_session, selected, toolchain_digest=current_digest, submitter=session.subject
+        )
+    return {
+        "current_toolchain_digest": current_digest,
+        "stale_total": len(stale),
+        "targets_selected": len(selected),
+        "versions_queued": queued,
+        "remaining": len(stale) - len(selected),
+    }
+
+
 @router.post("/reeval/{skill_id}", dependencies=[Depends(require_csrf)])
 async def trigger_reeval(
     skill_id: str,
@@ -163,7 +230,7 @@ async def trigger_reeval(
     runtime: ScanRuntime = Depends(_get_scan_runtime),
 ) -> dict[str, Any]:
     session_factory = _require_reeval_session_factory(runtime)
-    current_digest = runtime.current_toolchain_digest()
+    current_digest = await runtime.current_toolchain_digest()
     async with session_factory() as db_session, db_session.begin():
         statuses = await list_published_toolchain_statuses(db_session)
         targets = [s for s in statuses if s.skill_id == skill_id]

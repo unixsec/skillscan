@@ -686,10 +686,17 @@ class TestSetSkillOwner:
             headers=headers,
         )
         assert response.status_code == 200
+        # `owner_recognized` was added to this response by f57ea1b and this
+        # exact-equality assertion was never updated, so the test has been red
+        # on any real database since that commit; it went unnoticed because it
+        # needs MySQL and the VM run that would have collected it came later.
+        # True here is not incidental: `_seed_skill` registers the version as
+        # operator `tester`, which is the identity being assigned.
         assert response.json() == {
             "skill_id": skill_id,
             "owner": "tester",
             "previous_owner": None,
+            "owner_recognized": True,
         }
 
     @pytest.mark.asyncio

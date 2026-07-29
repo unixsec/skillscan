@@ -9,11 +9,26 @@ validation happens in `orchestration/aggregate.py`, not here; this module
 only moves bytes.
 
 Lives in `libs/common` (not `apps/monolith`) deliberately: this module has
-zero monolith-specific dependencies (only `redis.asyncio` + stdlib), and both
-`apps/monolith` (the workers/orchestrators side) and `services/engine_runner`
-(a genuinely separate, credential-free deployable per INV-10 that must not
-import monolith-namespaced code) need the exact same wire-compatible stream
-names/field layout to talk to each other through Redis.
+zero monolith-specific dependencies (only `redis.asyncio`, its sibling
+`common.log` + stdlib), and both `apps/monolith` (the workers/orchestrators
+side) and `services/engine_runner` (a genuinely separate, credential-free
+deployable per INV-10 that must not import monolith-namespaced code) need the
+exact same wire-compatible stream names/field layout to talk to each other
+through Redis.
+
+WIRE COMPATIBILITY (read before changing any field): because the two ends are
+two independently deployed images, every rollout has a window in which one side
+speaks a newer field set than the other. The rule this module holds to is that
+BOTH directions must survive that window unaided:
+
+  * a consumer reads each field by name and never requires one that older
+    producers did not write (a new optional field parses to `None`, never to a
+    plausible-looking default like `0`);
+  * a producer only ever ADDS fields, and older consumers ignore what they do
+    not read, because a Redis Stream entry is a flat field map, not a
+    positional record.
+
+So no field addition here is allowed to imply a deployment ordering constraint.
 """
 
 from __future__ import annotations
@@ -23,6 +38,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import redis.asyncio as aioredis
+
+from common.log import get_logger
+
+_logger = get_logger("skillscan.common.airlock")
 
 SCANS_STREAM = "skillscan:scans"
 RESULTS_STREAM = "skillscan:results"
@@ -46,6 +65,13 @@ class ScanJobMessage:
     engines: tuple[str, ...]
 
 
+# Wire field name for the per-engine timing added in milestone C Task 7. Named
+# after the interval it measures rather than after the thing it is attached to:
+# it is the wall-clock span of ONE `DetectionEngine.analyze()` call and nothing
+# else. See `ResultMessage.analyze_duration_ms`.
+ANALYZE_DURATION_MS_FIELD = "analyze_duration_ms"
+
+
 @dataclass(frozen=True, slots=True)
 class ResultMessage:
     message_id: str
@@ -53,6 +79,30 @@ class ResultMessage:
     findings_key: str
     engine: str
     status: str
+    # Milestone C Task 7. WHICH INTERVAL: wall-clock milliseconds spanning the
+    # single `engine.analyze(files, deadline=...)` call that produced this
+    # result - i.e. the adapter staging the file set into its tempdir, the
+    # engine's own `subprocess.run`, and the parse of that subprocess's output
+    # (`engine_runner/adapters/base.py`). It deliberately EXCLUDES time the
+    # scan job spent queued on `SCANS_STREAM`, the artifact fetch, the hardened
+    # unpack (paid once per job, shared by every engine) and the findings-blob
+    # write.
+    #
+    # WHY THAT ONE: it is the only interval directly comparable to the knob a
+    # deployer actually turns - `SKILLSCAN_ENGINE_TIMEOUTS_JSON`, milestone C
+    # Task 4 - and its SUM across a scan's engines is precisely the quantity
+    # Task 4 flagged as already unsafe (the shipped defaults sum to 480s
+    # against a 300s scan deadline, with sequential dispatch, so the last
+    # engine in line starves). Nothing had ever measured it, so "the defaults
+    # are wrong" was theory. Queue-wait would answer a capacity question
+    # instead, and dispatch-to-result wall time would fold both plus blob I/O
+    # into one number that could not be compared to any configured limit.
+    #
+    # `None` means "no timing on this message", which is NOT 0ms. Three
+    # producers legitimately have none: the poison-pill, unpack-rejected and
+    # unrunnable-artifact markers (no engine ran at all), plus - during a
+    # rolling upgrade - any producer still on a pre-Task-7 image.
+    analyze_duration_ms: int | None = None
 
 
 async def ensure_group(redis: aioredis.Redis, stream: str, group: str) -> None:
@@ -155,24 +205,65 @@ async def ack_scan_job(
     await redis.xack(SCANS_STREAM, group, message_id)
 
 
-async def delivery_count(
-    redis: aioredis.Redis, message_id: str, *, group: str = WORKERS_GROUP
-) -> int:
-    pending = await redis.xpending_range(
-        SCANS_STREAM, group, min=message_id, max=message_id, count=1
-    )
+async def _delivery_count(redis: aioredis.Redis, stream: str, group: str, message_id: str) -> int:
+    pending = await redis.xpending_range(stream, group, min=message_id, max=message_id, count=1)
     if not pending:
         return 0
     return int(pending[0]["times_delivered"])
 
 
+async def delivery_count(
+    redis: aioredis.Redis, message_id: str, *, group: str = WORKERS_GROUP
+) -> int:
+    """How many times the SCANS stream has delivered `message_id` to `group`."""
+    return await _delivery_count(redis, SCANS_STREAM, group, message_id)
+
+
+async def result_delivery_count(redis: aioredis.Redis, message_id: str) -> int:
+    """The RESULTS stream's counterpart to `delivery_count` (2026-07-29, C
+    correctness review N-1).
+
+    A SEPARATE named function rather than a `stream=`/`group=` pair of keyword
+    arguments on `delivery_count`: the two are not independent, and a call site
+    that overrode one and forgot the other would be asking about a (stream,
+    group) pairing that does not exist. The pairing is fixed here rather than
+    left as a call-site obligation, the same reason `_parse_results` is shared
+    rather than copied.
+    """
+    return await _delivery_count(redis, RESULTS_STREAM, ORCHESTRATORS_GROUP, message_id)
+
+
 async def produce_result(
-    redis: aioredis.Redis, *, scan_id: str, findings_key: str, engine: str, status: str
+    redis: aioredis.Redis,
+    *,
+    scan_id: str,
+    findings_key: str,
+    engine: str,
+    status: str,
+    analyze_duration_ms: int | None = None,
 ) -> str:
-    result: Any = await redis.xadd(
-        RESULTS_STREAM,
-        {"scan_id": scan_id, "findings_key": findings_key, "engine": engine, "status": status},
-    )
+    """`analyze_duration_ms` is OMITTED from the entry when None rather than
+    written as an empty string or a 0, so a marker message (poison pill /
+    unpack rejected / unrunnable) stays byte-identical to what pre-Task-7
+    producers wrote, and so "absent" and "measured as zero" can never collide
+    on the wire.
+
+    NOTE (mypy): the fields mapping is annotated `dict[Any, Any]`, not
+    `dict[str, str]` - redis-py's `xadd` stub takes `Mapping[FieldT,
+    EncodableT]` and `Mapping`'s key parameter is invariant, so a concretely
+    keyed dict variable fails the match even though `str` is one of the union
+    members. (`produce_scan_job` sidesteps the same problem by inlining its
+    literal; this one cannot, because it has a conditional field.)
+    """
+    fields: dict[Any, Any] = {
+        "scan_id": scan_id,
+        "findings_key": findings_key,
+        "engine": engine,
+        "status": status,
+    }
+    if analyze_duration_ms is not None:
+        fields[ANALYZE_DURATION_MS_FIELD] = str(int(analyze_duration_ms))
+    result: Any = await redis.xadd(RESULTS_STREAM, fields)
     return result.decode() if isinstance(result, bytes) else result
 
 
@@ -184,17 +275,7 @@ async def claim_results(
     )
     results: list[ResultMessage] = []
     for _stream_name, messages in response:
-        for message_id, fields in messages:
-            decoded = _decode_fields(fields)
-            results.append(
-                ResultMessage(
-                    message_id=_decode(message_id),
-                    scan_id=decoded["scan_id"],
-                    findings_key=decoded["findings_key"],
-                    engine=decoded["engine"],
-                    status=decoded["status"],
-                )
-            )
+        results += _parse_results(messages)
     return results
 
 
@@ -229,6 +310,17 @@ async def reclaim_stale_results(
     _cursor, messages, _deleted = await redis.xautoclaim(
         RESULTS_STREAM, ORCHESTRATORS_GROUP, consumer, min_idle_time=min_idle_ms, start_id="0"
     )
+    return _parse_results(messages)
+
+
+def _parse_results(messages: Any) -> list[ResultMessage]:
+    """The ONE place a results-stream entry becomes a `ResultMessage`.
+
+    Deliberately shared by `claim_results` and `reclaim_stale_results`: they had
+    byte-identical inline copies of this, and the reclaim path is the one nobody
+    exercises until a collector has already crashed - exactly the copy that
+    would have been left behind when a field was added to the other.
+    """
     results: list[ResultMessage] = []
     for message_id, fields in messages:
         decoded = _decode_fields(fields)
@@ -239,9 +331,49 @@ async def reclaim_stale_results(
                 findings_key=decoded["findings_key"],
                 engine=decoded["engine"],
                 status=decoded["status"],
+                analyze_duration_ms=_parse_analyze_duration_ms(decoded),
             )
         )
     return results
+
+
+def _parse_analyze_duration_ms(decoded: dict[str, str]) -> int | None:
+    """Absent or unusable timing reads as `None` - never as a number.
+
+    Two deliberate asymmetries with the fields above it:
+
+    1. It uses `.get`, not `[...]`. A pre-Task-7 producer writes no such field
+       and its messages must keep flowing; the alternative (a default of 0)
+       would record "this engine finished instantly" for every engine on the
+       not-yet-upgraded side, i.e. it would silently poison the exact dataset
+       this field exists to collect. Mutation-tested.
+
+    2. A malformed value degrades to `None` instead of raising, unlike
+       `scan_id`/`findings_key`/`status`, whose absence SHOULD blow up. Those
+       are load-bearing: without them the message cannot be acted on at all.
+       This one is telemetry. Raising here would abort the parse of the whole
+       XREADGROUP batch, so one corrupt field would stall the results stream
+       for every scan in it - fail-stuck across the board to protect a number
+       nobody scores on. Logged at WARNING so it is not silent.
+    """
+    raw = decoded.get(ANALYZE_DURATION_MS_FIELD)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning(
+            "results-stream message carried an unparseable analyze_duration_ms - ignoring it",
+            extra={"context": {"engine": decoded.get("engine"), "raw_length": len(raw)}},
+        )
+        return None
+    if value < 0:
+        _logger.warning(
+            "results-stream message carried a negative analyze_duration_ms - ignoring it",
+            extra={"context": {"engine": decoded.get("engine"), "value": value}},
+        )
+        return None
+    return value
 
 
 async def ack_result(redis: aioredis.Redis, message_id: str) -> None:
@@ -260,3 +392,32 @@ def now_epoch() -> float:
     """Thin wrapper so callers don't reach for time.time() directly - kept as a
     single seam in case a deterministic clock is needed for testing later."""
     return time.time()
+
+
+def monotonic_now() -> float:
+    """Start reading for a DURATION measurement - never for a deadline.
+
+    SECURITY/CORRECTNESS: `now_epoch` (wall clock) and this (an arbitrary-origin
+    uptime counter) are not interchangeable and this codebase has already paid
+    for mixing them - `engine_runner/adapters/base.py` carries the post-mortem:
+    comparing an epoch `deadline` against `time.monotonic()` produced a
+    `remaining` of tens of years, so the shared scan budget constrained nothing
+    and every engine silently fell back to its own fixed timeout. Deadlines are
+    absolute and cross process boundaries, so they must stay on `now_epoch`.
+    Durations are local and must not be distorted by an NTP step or a leap
+    second, so they belong here.
+    """
+    return time.monotonic()
+
+
+def elapsed_ms(started: float) -> int:
+    """Whole milliseconds since a `monotonic_now()` reading.
+
+    Floored at 0: a monotonic clock cannot legitimately run backwards, but a
+    negative duration would be indistinguishable from a bug downstream, and
+    `_parse_analyze_duration_ms` rejects negatives on the wire anyway. Both
+    dispatch loops go through this rather than doing their own arithmetic, so
+    the monolith's floor engines and the sandbox runner's engines cannot end up
+    reporting the same interval in different units.
+    """
+    return max(0, round((time.monotonic() - started) * 1000))

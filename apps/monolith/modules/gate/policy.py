@@ -12,12 +12,13 @@ into "policy loaded fine, just with fewer rules than intended".
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
-from skillscan_core import GatePolicy, Severity, TrustTier, Verdict
+from skillscan_core import CategoryWeights, GatePolicy, Severity, TrustTier, Verdict
 
 
 class GatePolicyLoadError(ValueError):
@@ -87,6 +88,49 @@ def _parse_tier_overrides(raw: object) -> tuple[tuple[TrustTier, Severity], ...]
     return tuple(overrides)
 
 
+def _parse_category_weights(raw: object) -> CategoryWeights:
+    """`category_weights:` -> `CategoryWeights` (milestone C Task 5).
+
+    ABSENT IS VALID and means the all-1.0 default: every policy file written
+    before this section existed keeps loading, and behaves exactly as it did.
+    Absent and all-1.0 are also indistinguishable downstream by construction -
+    `GatePolicy.cache_policy_version` derives the same term for both (Task 11
+    hashes the parsed policy, and `CategoryWeights.non_default_items()` is
+    empty either way) - so an operator adding an explicit all-1.0 section does
+    not invalidate a cache.
+
+    An UNKNOWN KEY IS REFUSED, same fail-closed posture as the rest of this
+    module: `data_credentials: 2.0` (plural, a plausible typo) would otherwise
+    load as "weights configured" while weighting nothing, and the only symptom
+    would be scores that never moved.
+    """
+    if raw is None:
+        return CategoryWeights()
+    if not isinstance(raw, dict):
+        raise GatePolicyLoadError(f"category_weights: expected a mapping, got {raw!r}")
+
+    valid = {spec.name for spec in dataclasses.fields(CategoryWeights)}
+    kwargs: dict[str, float] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or key not in valid:
+            raise GatePolicyLoadError(
+                f"category_weights: unknown category {key!r}, expected one of {sorted(valid)}"
+            )
+        # bool is an int subclass - `code: true` must not read as 1.0.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise GatePolicyLoadError(f"category_weights.{key}: expected a number, got {value!r}")
+        kwargs[key] = float(value)
+
+    # SECURITY: range/finiteness (negative weights invert the penalty) is
+    # enforced by CategoryWeights.__post_init__, never duplicated here - same
+    # posture as GatePolicy's own invariants below, so there is exactly one
+    # place those rules can drift. Its message already names the field.
+    try:
+        return CategoryWeights(**kwargs)
+    except ValueError as exc:
+        raise GatePolicyLoadError(f"category_weights: {exc}") from exc
+
+
 def parse_gate_policy(raw: dict[str, Any]) -> GatePolicy:
     """Pure parsing function (no file I/O) - `load_gate_policy` below is the
     thin file-reading wrapper. Split out so tests can exercise malformed
@@ -105,6 +149,7 @@ def parse_gate_policy(raw: dict[str, Any]) -> GatePolicy:
             _parse_str_sequence(raw.get("hard_gate_rules"), field_name="hard_gate_rules")
         ),
         "tier_block_overrides": _parse_tier_overrides(raw.get("tier_block_overrides")),
+        "category_weights": _parse_category_weights(raw.get("category_weights")),
     }
     if "review_confidence" in raw:
         if not isinstance(raw["review_confidence"], (int, float)):

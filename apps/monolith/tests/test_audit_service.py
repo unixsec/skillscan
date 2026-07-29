@@ -38,6 +38,7 @@ from monolith.modules.audit.service import (
     append_one_intent,
     canonical_json,
     compute_entry_hash,
+    count_unchained_intents,
     drain_pending_intents,
     verify_chain,
 )
@@ -339,6 +340,66 @@ class TestAppendAndDrain:
             await restore_genesis_row()
         async with audit_sessionmaker() as session:
             assert await verify_chain(session) is True
+
+
+class TestCountUnchainedIntents:
+    """Task 13 (2026-07-29): the read behind the `audit_intent_unchained`
+    gauge (coding spec §11.7). No query answering this existed anywhere in the
+    codebase before - the only unchained-row predicate was the drainer's own
+    `LIMIT 1` claim, which by construction cannot tell one pending intent from
+    fifty thousand. Real MySQL (this whole module) - VM only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_counts_only_unchained_rows(
+        self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # Measured relatively, never against an absolute: this dev database is
+        # long-lived and shared (see this module's own docstring), so an
+        # absolute expectation would be a test that passes only on a fresh DB.
+        async with audit_sessionmaker() as session:
+            baseline = await count_unchained_intents(session)
+
+        action = _unique_action("test_count_unchained")
+        await _seed_intents(gate_sessionmaker, action=action, count=7)
+
+        async with audit_sessionmaker() as session:
+            assert await count_unchained_intents(session) == baseline + 7
+
+    @pytest.mark.asyncio
+    async def test_draining_brings_the_count_back_down(
+        self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        async with audit_sessionmaker() as session:
+            baseline = await count_unchained_intents(session)
+
+        action = _unique_action("test_count_after_drain")
+        await _seed_intents(gate_sessionmaker, action=action, count=5)
+        await drain_pending_intents(audit_sessionmaker)
+
+        async with audit_sessionmaker() as session:
+            # Everything seeded here is chained now; anything left is whatever
+            # the baseline already carried, and a drain never increases it.
+            assert await count_unchained_intents(session) <= baseline
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_larger_than_one_batch_is_reported_in_full(
+        self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        # THE property that matters. `drain_pending_intents` stops at
+        # `batch_size`, so after one drain a real backlog persists - and the
+        # whole point of the gauge is to make THAT visible. A count derived
+        # from the drainer's own claim query could never show it.
+        async with audit_sessionmaker() as session:
+            baseline = await count_unchained_intents(session)
+
+        action = _unique_action("test_count_backlog")
+        await _seed_intents(gate_sessionmaker, action=action, count=12)
+        await drain_pending_intents(audit_sessionmaker, batch_size=5)
+
+        async with audit_sessionmaker() as session:
+            remaining = await count_unchained_intents(session)
+        assert remaining >= baseline + 7, "a backlog beyond one batch must still be counted"
 
 
 class TestConcurrentDrainProducesAConsistentChain:

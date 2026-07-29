@@ -7,8 +7,29 @@ gate-decision time.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import math
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
+
+# Domain separator + SCHEME VERSION for `GatePolicy.adjudication_semantics`
+# (milestone C Task 11). Bump the `.vN` when the canonical form itself changes
+# shape: the point of the version is that two processes running different
+# skillscan builds must not silently derive different digests from the same
+# policy, they must derive VISIBLY different ones - a policy edit and a
+# canonicaliser change are both "the digest moved", and both correctly mean
+# "re-adjudicate", but only a version in the string makes the second one
+# distinguishable from a corrupt read.
+_POLICY_SEMANTICS_DOMAIN = "skillscan.gate_policy.adjudication_semantics.v1"
+
+# Upper bound for a single `CategoryWeights` field. The scoring penalty
+# saturates (scoring.security_score), so an absurd weight does not overflow -
+# it just pins that band to its floor for any finding in the category, which is
+# indistinguishable from a working configuration until someone compares scores.
+# The cap exists to catch the shape of typo that produces it: a percentage
+# (`100`) or a basis-point value written where a multiplier was meant.
+MAX_CATEGORY_WEIGHT = 10.0
 
 
 class Severity(IntEnum):
@@ -195,6 +216,112 @@ class ScanResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CategoryWeights:
+    """Per-DetectionCategory multiplier for security_score()'s penalty term
+    (2026-07-24 scoring design doc). All-1.0 default = every category counts
+    equally; raising a category's weight makes its findings cost more score.
+
+    CONFIGURED THROUGH `GatePolicy.category_weights` AND NOWHERE ELSE
+    (milestone C Task 5). These values change `VerdictResult.score`, which is a
+    PERSISTED field, so they have to be covered by the same version term that
+    invalidates the INV-7 cache - see `GatePolicy.cache_policy_version`. A
+    weight reachable by any other route would be a scoring input the cache key
+    cannot see.
+    """
+
+    instruction: float = 1.0
+    code: float = 1.0
+    data_credential: float = 1.0
+    network_intel: float = 1.0
+    permission: float = 1.0
+    file_package: float = 1.0
+    supply_chain: float = 1.0
+    bundled_component: float = 1.0
+
+    def __post_init__(self) -> None:
+        for spec in dataclasses.fields(self):
+            raw = getattr(self, spec.name)
+            # bool is an int subclass; `True` as a weight is a config error.
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError(f"CategoryWeights.{spec.name} must be a number, got {raw!r}")
+            value = float(raw)
+            # SECURITY: a NEGATIVE weight inverts the penalty - a finding in
+            # that category would RAISE the score, so the more credentials a
+            # package leaked the cleaner it would look. Refused outright.
+            if not math.isfinite(value) or not 0.0 <= value <= MAX_CATEGORY_WEIGHT:
+                raise ValueError(
+                    f"CategoryWeights.{spec.name} must be a finite number in "
+                    f"[0.0, {MAX_CATEGORY_WEIGHT}], got {raw!r}"
+                )
+            # Normalize int -> float so `CategoryWeights(code=1)` compares equal
+            # to the default (YAML writes `1`, not `1.0`) and so two policies
+            # that mean the same thing produce the same cache_policy_version.
+            object.__setattr__(self, spec.name, value)
+
+    def for_category(self, category: DetectionCategory) -> float:
+        return float(getattr(self, category.value))
+
+    def non_default_items(self) -> tuple[tuple[str, float], ...]:
+        """The fields that diverge from the all-1.0 default, in declaration
+        order. Discovers the fields rather than listing them, so a new category
+        added above cannot be silently omitted from `cache_policy_version`."""
+        return tuple(
+            (spec.name, float(getattr(self, spec.name)))
+            for spec in dataclasses.fields(self)
+            if getattr(self, spec.name) != spec.default
+        )
+
+
+def _canonical_policy_term(value: object) -> str:
+    """One deterministic string for one `GatePolicy` field value (milestone C
+    Task 11).
+
+    DETERMINISM IS THE WHOLE JOB, and it is why this is a hand-written
+    type-dispatch rather than `repr(value)`. `repr` of a `frozenset` is in
+    ITERATION order, which python does not promise to be stable across
+    processes - `required_engines` and `hard_gate_rules` are frozensets, so a
+    repr-based digest would differ between the API pod and the worker pod for
+    an identical policy, and every cached verdict would read as stale forever
+    while every process disagreed about why. Sets are sorted here; sequences
+    keep their order (an unnecessary invalidation is safe, a missed one is
+    not).
+
+    AN UNHANDLED TYPE RAISES rather than falling back to `repr`. The fallback
+    is the dangerous direction: a future `GatePolicy` field whose type this
+    does not understand would be canonicalised to something that either does
+    not move when the field moves (a stale verdict served under a changed
+    policy - the exact bug this function exists to prevent) or is unstable
+    across processes. `tests/test_models.py` constructs a real policy and
+    calls this on every field, so the raise lands in CI, not in production.
+    """
+    # Enum branches come first: Severity/Verdict are IntEnum and TrustTier is
+    # StrEnum, so an int/str branch above them would swallow the name.
+    if isinstance(value, (Severity, Verdict, TrustTier, DetectionCategory, EngineCapability)):
+        return f"{type(value).__name__}.{value.name}"
+    if isinstance(value, CategoryWeights):
+        # Reuses Task 5's own canonical form: field-discovering, declaration
+        # order, and normalised int->float, so an explicitly-declared all-1.0
+        # section and an ABSENT one produce the same term.
+        return "cw(" + ",".join(f"{n}={v!r}" for n, v in value.non_default_items()) + ")"
+    # bool before int: bool is an int subclass and `True`/`1` must not collide.
+    if isinstance(value, bool):
+        return f"bool({value!r})"
+    if isinstance(value, (int, float, str)):
+        return repr(value)
+    if isinstance(value, (frozenset, set)):
+        return "{" + ",".join(sorted(_canonical_policy_term(item) for item in value)) + "}"
+    if isinstance(value, (tuple, list)):
+        return "[" + ",".join(_canonical_policy_term(item) for item in value) + "]"
+    raise TypeError(
+        f"GatePolicy carries a value of type {type(value).__name__!r} that "
+        "cache_policy_version cannot canonicalise deterministically. Add an "
+        "explicit branch to _canonical_policy_term - do NOT let it fall through "
+        "to repr(), which is unstable across processes for set-like values and "
+        "would make every cached verdict read as permanently stale."
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class GatePolicy:
     version: str
     required_engines: frozenset[str]
@@ -205,6 +332,10 @@ class GatePolicy:
     tier_block_overrides: tuple[tuple[TrustTier, Severity], ...] = ()
     allowlistable_max_severity: Severity = Severity.HIGH
     fail_closed_verdict: Verdict = Verdict.BLOCK
+    # Loaded from the versioned policy file (gate.policy._parse_category_weights).
+    # Optional: a policy file written before milestone C omits the section and
+    # gets the all-1.0 default, i.e. exactly today's behaviour.
+    category_weights: CategoryWeights = field(default_factory=CategoryWeights)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "required_engines", frozenset(self.required_engines))
@@ -232,6 +363,117 @@ class GatePolicy:
         if not matches:
             return self.block_on_severity
         return min(matches)  # strictest override wins = lowest severity threshold
+
+    def adjudication_semantics(self) -> str:
+        """Every input this policy contributes to an adjudication, in one
+        canonical string (milestone C Task 11). Feeds `cache_policy_version`;
+        exposed on its own because "why did my digest move" is an operational
+        question and a diff of two of these answers it.
+
+        WHICH FIELDS, AND WHY IT IS ALL OF THEM. Each was checked against
+        `gate.decide` rather than assumed: `required_engines` decides
+        `required_ok` and therefore the INV-1 fail-closed branch;
+        `fail_closed_verdict` is that branch's answer; `hard_gate_rules` forces
+        the unwaivable INV-3 BLOCK and floors INV-8's waiver check;
+        `block_on_severity`/`tier_block_overrides`/`review_on_severity`/
+        `review_confidence` are `_classify` in its entirety;
+        `allowlistable_max_severity` decides which findings survive waiving;
+        `category_weights` moves the persisted score (Task 5). There is no
+        `GatePolicy` field that does NOT reach a verdict or a score - so the
+        honest scope is "the whole policy object", and the field loop below
+        DISCOVERS them rather than naming them, which is what makes a field
+        added later fail loudly (`_canonical_policy_term`) instead of quietly
+        dropping out of the digest.
+
+        DERIVED, NOT THE FILE'S BYTES - the same choice Task 5 made, for the
+        same reason: a semantically-neutral edit must stay neutral. Hashing
+        `policies/gate/v1.yaml` verbatim would make a mass rescan out of a
+        comment (that file is majority comment), a reindent, or a key
+        reordering. Reading the PARSED policy instead means all of those are
+        free, and so are: `1` vs `1.0` in a weight (CategoryWeights normalises),
+        reordering `required_engines`/`hard_gate_rules` (frozensets, sorted
+        here), reordering or duplicating `tier_block_overrides` (resolved
+        through `block_threshold` below), declaring `category_weights` at the
+        all-1.0 default versus omitting the section, and any key
+        `gate.policy.parse_gate_policy` ignores entirely.
+
+        `tier_block_overrides` IS READ THROUGH `block_threshold`, not off the
+        raw tuple, because `block_threshold` is the authority - it takes
+        `min()` over the matching entries, so `[public:HIGH, public:HIGH]` and
+        `[public:HIGH]` are the same policy and must produce the same digest.
+        Enumerating every `TrustTier` also means a tier added to the enum is
+        covered without touching this.
+
+        That resolution also swallows `block_on_severity` (it is
+        `block_threshold`'s fallback for an un-overridden tier), so the
+        separate `block_on_severity=` term below is REDUNDANT TODAY - a
+        mutation test confirms dropping it changes nothing. Kept anyway: the
+        redundancy is the field loop doing its job, and it is what keeps the
+        binding correct if `block_threshold` ever stops reading the field.
+        """
+        parts: list[str] = []
+        for spec in dataclasses.fields(self):
+            if spec.name == "version":
+                # The version is the PREFIX of cache_policy_version, not part
+                # of the semantics body - including it twice would say nothing.
+                continue
+            if spec.name == "tier_block_overrides":
+                value: object = tuple(
+                    sorted((tier.value, self.block_threshold(tier).name) for tier in TrustTier)
+                )
+            else:
+                value = getattr(self, spec.name)
+            parts.append(f"{spec.name}={_canonical_policy_term(value)}")
+        return _POLICY_SEMANTICS_DOMAIN + "\n" + "\n".join(parts)
+
+    @property
+    def cache_policy_version(self) -> str:
+        """The policy identity that INV-7's `toolchain_digest` must bind, as
+        opposed to `version`, the identity a verdict RECORDS.
+
+        WHY THE TWO DIFFER. `toolchain_digest` hashes `policy_version` and
+        nothing else about the policy, and `cache_key` is derived from it - so
+        whatever is NOT in that string is invisible to the cache. A policy file
+        is edited by a human who can forget to bump `version:`, and the
+        policy-proposal path (worker._parse_policy_candidate) changes policy at
+        runtime with no file edit at all, where no bump-the-version convention
+        exists to forget. Deriving the digest's version term from the policy's
+        CONTENT removes the convention from the trust path.
+
+        Task 5 bound `category_weights` this way, which move the persisted
+        `score`. Task 11 extends it to the whole policy, which moves the
+        persisted VERDICT: an operator who tightens `block_on_severity` in
+        place and leaves `version:` alone was, until then, still served the
+        adjudication computed under the OLD threshold - a package that should
+        now BLOCK kept answering PASS for as long as the cache held. A score is
+        advisory; a verdict is the gate.
+
+        STILL ONE HASH TERM in `toolchain_digest`, and still one `version:`
+        line in the file. The term just can no longer lag the content it names.
+
+        THE COST, PAID DELIBERATELY (Task 11 measured it on the dev VM before
+        choosing). There is no identity element any more: Task 5 could return
+        the bare version for all-1.0 weights because "all-1.0" IS the behaviour
+        that predates the feature, but no threshold is neutral in that sense,
+        so EVERY policy's digest moves once when this ships and every cached
+        verdict is invalidated. Measured rather than feared: on a 860-scan /
+        760-skill corpus the cache had served 3 of 863 submissions (0.35%), the
+        toolchain digest had already rotated 4 times in 7 days on ordinary
+        engine changes, and 752 of 764 skill_versions already read as stale
+        against the current digest. This adds one more rotation to a series the
+        deployment already absorbs routinely; it does not create a novel event.
+
+        DELIVERY IS `reeval`, BY CONSTRUCTION rather than by a new mechanism.
+        `ScanRuntime.current_toolchain_digest` is this same expression, and
+        `reeval` calls a published skill stale exactly when its recorded digest
+        differs from it - so before this change a threshold tightening was
+        invisible to re-evaluation too, and the already-published verdicts
+        would never have been revisited at all. Binding the policy is what
+        makes `GET /v1/reeval` surface them, where an admin drains them under
+        control instead of the recompute landing on whoever submits next.
+        """
+        digest = hashlib.sha256(self.adjudication_semantics().encode("utf-8")).hexdigest()
+        return f"{self.version}+p1:{digest}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,26 +520,6 @@ class AllowlistEntry:
 
     def waives(self, finding: Finding) -> bool:
         return self.rule_id == finding.rule_id
-
-
-@dataclass(frozen=True, slots=True)
-class CategoryWeights:
-    """Per-DetectionCategory multiplier for security_score()'s penalty term
-    (2026-07-24 scoring design doc). All-1.0 default = every category counts
-    equally; a caller (admin config, milestone C) can raise a category's
-    weight to make its findings cost more score."""
-
-    instruction: float = 1.0
-    code: float = 1.0
-    data_credential: float = 1.0
-    network_intel: float = 1.0
-    permission: float = 1.0
-    file_package: float = 1.0
-    supply_chain: float = 1.0
-    bundled_component: float = 1.0
-
-    def for_category(self, category: DetectionCategory) -> float:
-        return float(getattr(self, category.value))
 
 
 @dataclass(frozen=True, slots=True)

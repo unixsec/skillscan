@@ -133,6 +133,17 @@ async def sandbox_engine_tick(
                 disabled=disabled,
             )
         except Exception:
+            # UNMEASURED, deliberately and explicitly (2026-07-29 honesty
+            # review). This is the engine-runner's per-scan failure handler and
+            # it increments NO counter: this process has no
+            # `prometheus_client`, no registry and nothing scraping it, and
+            # `skillscan_worker_failures_total` in the monolith's registry
+            # covers the monolith's tick only - its HELP text now says so,
+            # because for a milestone it claimed to be this. Anyone reading
+            # that metric at 0 is reading nothing about this loop. The log line
+            # below is the ONLY signal a failure here produces; see
+            # `libs/common/observability.py`'s docstring for what wiring a real
+            # counter here would take.
             _logger.exception(
                 "sandbox engine tick failed processing a scan job - leaving unacked for redelivery",
                 extra={"context": {"scan_id": job.scan_id}},
@@ -167,13 +178,37 @@ async def _dispatch_engines(
                 extra={"context": {"scan_id": scan_id, "engine": engine_name}},
             )
             continue
+        # Milestone C Task 7: the ONLY timing anyone takes of an engine. The
+        # bracket is placed around `analyze()` alone - not around the blob write
+        # or the XADD below - because that call is exactly what the per-engine
+        # timeout (Task 4) bounds, so the two numbers are directly comparable.
+        # See `airlock.ResultMessage.analyze_duration_ms` for the full
+        # definition and for why this interval and not another.
+        started = airlock.monotonic_now()
         result = engine.analyze(files, deadline=deadline)
+        analyze_duration_ms = airlock.elapsed_ms(started)
         key = findings_key(scan_id, engine_name)
-        blobstore.put(key, json.dumps(serialize_engine_result(result)).encode("utf-8"))
+        blobstore.put(
+            key,
+            json.dumps(
+                serialize_engine_result(result, analyze_duration_ms=analyze_duration_ms)
+            ).encode("utf-8"),
+        )
         await airlock.produce_result(
-            redis, scan_id=scan_id, findings_key=key, engine=engine_name, status=result.status.value
+            redis,
+            scan_id=scan_id,
+            findings_key=key,
+            engine=engine_name,
+            status=result.status.value,
+            analyze_duration_ms=analyze_duration_ms,
         )
         _logger.info(
+            # INV-9: every value in this context is either an identifier this
+            # service already logged before Task 7 or, for the new one, an
+            # integer read off a monotonic clock - it carries no bytes, paths
+            # or text derived from the scanned artifact, so the redaction
+            # review that cleared this call site (2026-07-29, commit 82393b8)
+            # covers it on the same terms.
             "sandbox engine reported",
             extra={
                 "context": {
@@ -181,6 +216,7 @@ async def _dispatch_engines(
                     "engine": engine_name,
                     "status": result.status.value,
                     "finding_count": len(result.findings),
+                    "analyze_duration_ms": analyze_duration_ms,
                 }
             },
         )

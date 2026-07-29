@@ -15,6 +15,7 @@ import redis.asyncio as aioredis
 from common.blobstore import LocalFilesystemBlobStore
 from schemas.findings import serialize_finding
 from skillscan_core import (
+    CategoryWeights,
     DetectionCategory,
     EngineCapability,
     Finding,
@@ -42,6 +43,18 @@ from monolith.tests.conftest import SessionmakerFixture
 
 def _naive_utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+
+
+def _review_policy(**overrides: object) -> GatePolicy:
+    """The policy a review decision is recomputed under (milestone C Task 5).
+
+    Default weights, so every score assertion in this file is the same number
+    it was before weights were configurable; `TestReviewScoreUsesPolicyWeights`
+    below is the one case that overrides them.
+    """
+    params: dict[str, object] = {"version": "review-v1", "required_engines": frozenset()}
+    params.update(overrides)
+    return GatePolicy(**params)  # type: ignore[arg-type]
 
 
 async def _seed_result_and_verdict(
@@ -171,6 +184,7 @@ class TestSubmitReviewDecision:
                 reviewer="approver-carol",
                 reason="reviewed, looks fine",
                 signer=LocalDevSigner(),
+                policy=_review_policy(),
             )
         assert result.verdict == "PASS"
         assert result.score == 94
@@ -205,6 +219,7 @@ class TestSubmitReviewDecision:
                 reviewer="approver-carol",
                 reason="confirmed malicious",
                 signer=LocalDevSigner(),
+                policy=_review_policy(),
             )
         assert result.verdict == "BLOCK"
         assert result.score == 33
@@ -238,6 +253,7 @@ class TestSubmitReviewDecision:
                 reviewer="approver-carol",
                 reason="reviewed, looks fine",
                 signer=LocalDevSigner(),
+                policy=_review_policy(),
             )
 
         claims = pyjwt.decode(result.jws_signature, options={"verify_signature": False})
@@ -269,6 +285,7 @@ class TestSubmitReviewDecision:
                     reviewer="dev-dave",
                     reason="x",
                     signer=LocalDevSigner(),
+                    policy=_review_policy(),
                 )
 
     @pytest.mark.asyncio
@@ -297,6 +314,7 @@ class TestSubmitReviewDecision:
                     reviewer="approver-carol",
                     reason="x",
                     signer=LocalDevSigner(),
+                    policy=_review_policy(),
                 )
 
     @pytest.mark.asyncio
@@ -320,6 +338,7 @@ class TestSubmitReviewDecision:
                     reviewer="approver-carol",
                     reason="x",
                     signer=LocalDevSigner(),
+                    policy=_review_policy(),
                 )
 
     @pytest.mark.asyncio
@@ -352,7 +371,119 @@ class TestSubmitReviewDecision:
                     reviewer="approver-carol",
                     reason="x",
                     signer=LocalDevSigner(),
+                    policy=_review_policy(),
                 )
+
+
+class TestReviewScoreUsesPolicyWeights:
+    """Milestone C Task 5: the review re-score reads `policy.category_weights`.
+
+    It used to pass a hardcoded `CategoryWeights()`. That was invisible while
+    weights were unconfigurable and became a real defect the moment they were:
+    `gate.decide` would score an automated verdict under the policy's weights
+    while this function scored the manually-reviewed one under all-1.0, so a
+    package's score would RISE just by passing through the review queue - this
+    function overwrites `verdict.score` in place.
+
+    The seeded finding is CODE/MEDIUM/0.8 (see `_seed_result_and_verdict`), so
+    the penalty is 8.0 * 0.8 * weight: 94/33 at weight 1.0, 87/24 at 3.0.
+    """
+
+    @pytest.mark.asyncio
+    async def test_approve_score_reflects_a_weighted_category(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        scan_id = str(uuid.uuid4())
+        await _seed_review_scan(
+            orchestration_sessionmaker, gate_sessionmaker, scan_id=scan_id, submitter="dev-dave"
+        )
+
+        async with (
+            orchestration_sessionmaker() as orch_session,
+            gate_sessionmaker() as gate_session,
+            gate_session.begin(),
+        ):
+            result = await submit_review_decision(
+                orchestration_session=orch_session,
+                gate_session=gate_session,
+                inventory_session=None,
+                scan_id=scan_id,
+                decision="approve",
+                reviewer="approver-carol",
+                reason="reviewed under a weighted policy",
+                signer=LocalDevSigner(),
+                policy=_review_policy(category_weights=CategoryWeights(code=3.0)),
+            )
+        assert result.verdict == "PASS"
+        # 87, not the 94 the same decision produces under default weights.
+        assert result.score == 87
+
+    @pytest.mark.asyncio
+    async def test_reject_score_reflects_a_weighted_category(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        scan_id = str(uuid.uuid4())
+        await _seed_review_scan(
+            orchestration_sessionmaker, gate_sessionmaker, scan_id=scan_id, submitter="dev-dave"
+        )
+
+        async with (
+            orchestration_sessionmaker() as orch_session,
+            gate_sessionmaker() as gate_session,
+            gate_session.begin(),
+        ):
+            result = await submit_review_decision(
+                orchestration_session=orch_session,
+                gate_session=gate_session,
+                inventory_session=None,
+                scan_id=scan_id,
+                decision="reject",
+                reviewer="approver-carol",
+                reason="confirmed, under a weighted policy",
+                signer=LocalDevSigner(),
+                policy=_review_policy(category_weights=CategoryWeights(code=3.0)),
+            )
+        assert result.verdict == "BLOCK"
+        # 24, not the 33 the same decision produces under default weights.
+        assert result.score == 24
+
+    @pytest.mark.asyncio
+    async def test_signed_score_matches_the_persisted_one(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # The JWS is what a downstream consumer trusts; a re-score that lands
+        # in the row but not in the signature (or vice versa) is the 2026-07-26
+        # score/JWS consistency gap all over again, and a weighted policy is a
+        # new way to reach it.
+        scan_id = str(uuid.uuid4())
+        await _seed_review_scan(
+            orchestration_sessionmaker, gate_sessionmaker, scan_id=scan_id, submitter="dev-dave"
+        )
+
+        async with (
+            orchestration_sessionmaker() as orch_session,
+            gate_sessionmaker() as gate_session,
+            gate_session.begin(),
+        ):
+            result = await submit_review_decision(
+                orchestration_session=orch_session,
+                gate_session=gate_session,
+                inventory_session=None,
+                scan_id=scan_id,
+                decision="approve",
+                reviewer="approver-carol",
+                reason="reviewed under a weighted policy",
+                signer=LocalDevSigner(),
+                policy=_review_policy(category_weights=CategoryWeights(code=3.0)),
+            )
+        claims = pyjwt.decode(result.jws_signature, options={"verify_signature": False})
+        assert claims["score"] == result.score == 87
 
 
 class TestListPendingReviews:
@@ -503,6 +634,7 @@ class TestSodReadsTheAssociationTableNotTheFirstSubmitter:
                     reviewer="dev-bob",
                     reason="approving my own submission",
                     signer=LocalDevSigner(),
+                    policy=_review_policy(),
                 )
 
         # Nothing was written. A SoD refusal that still rewrote and re-signed
@@ -552,6 +684,7 @@ class TestSodReadsTheAssociationTableNotTheFirstSubmitter:
                     reviewer="dev-alice",
                     reason="approving my own submission",
                     signer=LocalDevSigner(),
+                    policy=_review_policy(),
                 )
 
     @pytest.mark.asyncio
@@ -593,5 +726,6 @@ class TestSodReadsTheAssociationTableNotTheFirstSubmitter:
                 reviewer="approver-carol",
                 reason="reviewed, looks fine",
                 signer=LocalDevSigner(),
+                policy=_review_policy(),
             )
         assert result.verdict == "PASS"

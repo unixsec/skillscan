@@ -98,6 +98,7 @@ from skillscan_core import (
     Severity,
 )
 
+from ..timeouts import BUILTIN_ENGINE_TIMEOUT_S
 from .base import SubprocessEngineAdapter
 
 # SECURITY: not a real credential - documented above (module docstring) as a
@@ -185,9 +186,16 @@ def _classify(risk_type: str, title: str) -> tuple[str, DetectionCategory]:
     return "GEN-01", DetectionCategory.INSTRUCTION
 
 
+# The one `name=` literal for this adapter. `engine_runner.timeouts` keys this
+# engine's built-in per-engine default (240s, see below) by the same string, and
+# `sandbox_engines.SANDBOX_ENGINE_NAMES` restates it; two literals inside this
+# file would be one drift more than necessary.
+_ENGINE_NAME = "aig-mcp-scan"
+
+
 def _metadata(*, ruleset_digest: str, version: str) -> EngineMetadata:
     return EngineMetadata(
-        name="aig-mcp-scan",
+        name=_ENGINE_NAME,
         version=version,
         ruleset_digest=ruleset_digest,
         capabilities=frozenset({EngineCapability.SEMANTIC_LLM}),
@@ -269,7 +277,7 @@ def make_adapter(
     api_key: str | None = None,
     interpreter: str = "/app/.venv-aig/bin/python3",
     script: str = "/app/vendor-aig-mcp-scan/main.py",
-    timeout_s: float = 240.0,
+    timeout_s: float = BUILTIN_ENGINE_TIMEOUT_S[_ENGINE_NAME],
 ) -> SubprocessEngineAdapter:
     # SECURITY (Finding #16): validated once here (fail fast on an obviously-
     # bad config at startup), but the REAL, load-bearing check is inside
@@ -385,12 +393,14 @@ def make_adapter(
         # reasoning) take meaningfully longer than a single regex/AST pass -
         # 60s (the base class default, tuned for bandit/yara/osv-scanner)
         # would truncate a real mcp-scan run mid-reasoning on anything but a
-        # trivial target. Defaults to 240s, comfortably under the shared
-        # overall-job deadline (`ScanRuntime.scan_deadline_s`, itself
-        # defaulting to 300s) with headroom left for file materialization and
-        # other engines in the same job - but configurable (engine_runner/
-        # main.py's `SKILLSCAN_LLM_ENGINE_TIMEOUT_S`) for a slower LLM backend
-        # (e.g. a local debug model with no dedicated inference hardware).
+        # trivial target. Defaults to 240s (`timeouts.BUILTIN_ENGINE_TIMEOUT_S`,
+        # which is where every engine's own default now lives), comfortably
+        # under the shared overall-job deadline (`ScanRuntime.scan_deadline_s`,
+        # itself defaulting to 300s) with headroom left for file materialization
+        # and other engines in the same job - but configurable for a slower LLM
+        # backend (e.g. a local debug model with no dedicated inference
+        # hardware) via `SKILLSCAN_ENGINE_TIMEOUTS_JSON`, which since milestone
+        # C Task 4 does the same for ANY engine rather than only this one.
         # Whatever this is set to, `SubprocessEngineAdapter.analyze()`'s own
         # `deadline` handling (base.py) still clamps it down to the actual
         # remaining shared-deadline budget per-call regardless - raising this

@@ -38,7 +38,13 @@ from .middleware import (
     enforce_csrf,
     request_has_session_cookie,
 )
-from .session import IntrospectionCache, SessionContext, SessionError, authenticate
+from .session import (
+    IntrospectionCache,
+    IntrospectionUnavailableError,
+    SessionContext,
+    SessionError,
+    authenticate,
+)
 
 
 class AuthRuntime:
@@ -241,7 +247,31 @@ async def get_session_context(request: Request) -> SessionContext:
             group_role_map=runtime.group_role_map,
         )
     except (SessionError, M2MError) as exc:
+        if isinstance(exc, IntrospectionUnavailableError):
+            # Task 13 (2026-07-29): `introspection_failures_total` (coding
+            # spec §11.7). Both auth paths above funnel here - the M2M one
+            # lets `introspect_token`'s error propagate unwrapped, so a
+            # bearer-token introspection outage is counted the same as a
+            # cookie one, which is what an "is the IdP answering us" signal
+            # needs. See `IntrospectionUnavailableError` for why the ordinary
+            # 401s sharing this handler are deliberately not counted.
+            _record_introspection_failure(request)
         raise _as_http_exception(AuthenticationError(internal_detail=str(exc))) from exc
+
+
+def _record_introspection_failure(request: Request) -> None:
+    """SECURITY: instrumentation must never be able to turn a 401 into a 500.
+
+    `app.state.scan` is set by `create_app`, but this module is also mounted by
+    tests that build an app with only `app.state.auth` - and the whole point of
+    reaching this function is that something is already going wrong. A missing
+    or half-built runtime therefore degrades to "no metric recorded", never to
+    an exception that would replace the correct fail-closed 401 with a 500 and
+    hand an attacker a way to distinguish IdP-down from token-rejected."""
+    scan_runtime = getattr(request.app.state, "scan", None)
+    metrics = getattr(scan_runtime, "security_metrics", None)
+    if metrics is not None:
+        metrics.introspection_failures_total.inc()
 
 
 def require_role(*roles: str) -> Callable[..., Awaitable[SessionContext]]:

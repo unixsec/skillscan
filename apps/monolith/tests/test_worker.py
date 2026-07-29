@@ -38,7 +38,8 @@ from skillscan_core import (
 )
 from sqlalchemy import select
 
-from monolith.modules.gate.models import PolicyProposalRow, VerdictRow
+from monolith.modules.audit.service import count_unchained_intents
+from monolith.modules.gate.models import AuditIntentInsertOnly, PolicyProposalRow, VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.intel.matcher import INTEL_ENGINE_NAME
@@ -50,7 +51,8 @@ from monolith.modules.inventory.models import (
 )
 from monolith.modules.inventory.service import current_state, register_skill_version
 from monolith.modules.orchestration.floor import floor_engine_names
-from monolith.modules.orchestration.models import ScanJob, ScanResultRow
+from monolith.modules.orchestration.models import ScanEngineHealthRow, ScanJob, ScanResultRow
+from monolith.modules.orchestration.retention import DEFAULT_RETENTION_DAYS
 from monolith.modules.orchestration.service import SubmissionChannel, submit_scan
 from monolith.modules.reporting.service import (
     InvalidCronError,
@@ -59,11 +61,14 @@ from monolith.modules.reporting.service import (
 )
 from monolith.tests.conftest import SessionmakerFixture
 from monolith.worker import (
-    SANDBOX_WAITED_ENGINE_NAMES,
+    _HEALTH_RETENTION_INTERVAL_S,
+    _HEALTH_RETENTION_LEASE_KEY,
+    _active_sandbox_waited_engines,
     advance_scanned_toolchain_digests,
     promote_approved_policy,
     reload_policy_if_changed,
     run_due_report_schedules,
+    run_engine_health_retention,
     run_worker_loop,
     sweep_queued_jobs_to_airlock,
     sync_lifecycle_tick,
@@ -89,19 +94,32 @@ def _unique_files(marker: str) -> list[tuple[str, int, bytes]]:
 def _seed_sandbox_waited_engine_blobs(
     blobstore: LocalFilesystemBlobStore, scan_id: str, *, skip: frozenset[str] = frozenset()
 ) -> None:
-    """2026-07-27 (D2): `worker_tick` now waits for `SANDBOX_WAITED_ENGINE_NAMES`
-    before its collector step will decide a scan at all (see
-    apps/monolith/worker.py's own `run_result_collector_tick` call). This
-    process has no adapter for any of them - a real deployment gets these
-    blobs from the separate engine-runner service's own subprocess adapters -
-    so every end-to-end test in this file that polls `worker_tick` until a
-    scan reaches 'decided' must simulate "the engine-runner already finished"
-    the same way `test_sandbox_engine_finding_is_aggregated_but_never_
-    dispatched_here` does below, or the wait would never resolve within the
-    test's own tick budget (resolving it for real means waiting out
-    ScanRuntime.sandbox_wait_timeout_s, which none of these tests exercise -
-    that is TestSandboxWait's job, in test_orchestration_pipeline.py)."""
-    for name in SANDBOX_WAITED_ENGINE_NAMES:
+    """2026-07-27 (D2): `worker_tick` now waits for the sandbox engines before
+    its collector step will decide a scan at all (see apps/monolith/worker.py's
+    own `run_result_collector_tick` call). This process has no adapter for any
+    of them - a real deployment gets these blobs from the separate
+    engine-runner service's own subprocess adapters - so every end-to-end test
+    in this file that polls `worker_tick` until a scan reaches 'decided' must
+    simulate "the engine-runner already finished" the same way
+    `test_sandbox_engine_finding_is_aggregated_but_never_dispatched_here` does
+    below, or the wait would never resolve within the test's own tick budget
+    (resolving it for real means waiting out ScanRuntime.sandbox_wait_timeout_s,
+    which none of these tests exercise - that is TestSandboxWait's job, in
+    test_orchestration_pipeline.py).
+
+    2026-07-29 (milestone C Task 4): seeds what `worker_tick` ACTUALLY waits
+    for, not the `SANDBOX_WAITED_ENGINE_NAMES` constant. The two are no longer
+    the same set: the constant became the whole sandbox tier once per-engine
+    timeouts landed, and the engines a deployment cannot receive a report from
+    are subtracted at runtime instead. Every ScanRuntime in this file leaves
+    `sandbox_llm_configured` at its default False, so the LLM-gated engines are
+    not waited for - and seeding them here anyway would silently OVERWRITE the
+    aig-mcp-scan blob that
+    `test_sandbox_engine_finding_is_aggregated_but_never_dispatched_here`
+    writes as its own regression target, with an empty-findings one."""
+    for name in _active_sandbox_waited_engines(
+        disabled_engines=frozenset(), sandbox_llm_configured=False
+    ):
         if name in skip:
             continue
         result = EngineResult(
@@ -383,6 +401,21 @@ class TestWorkerEndToEnd:
             orchestration_sessionmaker=orchestration_sessionmaker,
             gate_sessionmaker=gate_sessionmaker,
             intel_sessionmaker=intel_sessionmaker,
+            # A policy that requires the WHOLE floor, not this file's usual
+            # single-engine one. `submit_scan` writes `job.engines` from
+            # `policy.required_engines` and `run_mock_engine_worker_tick`'s
+            # dispatch loop is driven by `job.engines` - so under the default
+            # policy only static-keyword ever runs and the INV-1 assertion at
+            # the bottom is unsatisfiable by construction. Measured on the VM
+            # 2026-07-29: provenance came back as static-keyword plus the five
+            # sandbox names, missing all eight `inhouse-*` engines, and the
+            # test had never been run anywhere that could show it.
+            policy=GatePolicy(
+                version=f"vt-{uuid.uuid4().hex[:8]}",
+                required_engines=floor_engine_names(),
+                hard_gate_rules=frozenset(),
+                fail_closed_verdict=Verdict.BLOCK,
+            ),
         )
         await redis_client.sadd(DISABLED_ENGINES_KEY, INTEL_ENGINE_NAME)  # type: ignore[misc]
         try:
@@ -548,12 +581,12 @@ class TestWorkerEndToEnd:
             findings_key(scan_id, "aig-mcp-scan"),
             json.dumps(serialize_engine_result(aig_result)).encode("utf-8"),
         )
-        # D2 (2026-07-27): worker_tick's collector now WAITS for
-        # SANDBOX_WAITED_ENGINE_NAMES (bandit already written above with a
-        # real finding - skip it here so this doesn't clobber it) before it
-        # will decide this scan at all. aig-mcp-scan is deliberately NOT in
-        # the waited set (see SANDBOX_WAITED_ENGINE_NAMES' own comment) but is
-        # already written above anyway, as this test's own regression target.
+        # D2 (2026-07-27): worker_tick's collector WAITS for the sandbox
+        # engines (bandit already written above with a real finding - skip it
+        # here so this doesn't clobber it) before it will decide this scan at
+        # all. aig-mcp-scan is in the waited CONSTANT since Task 4, but this
+        # runtime leaves `sandbox_llm_configured` False, so it is not waited
+        # for here and the helper does not touch the blob written above.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id, skip=frozenset({"bandit"}))
 
         # A generous bound, not 20: worker_tick's internal claim counts (10
@@ -782,7 +815,9 @@ class TestLifecycleSync:
         from skillscan_core import toolchain_digest as compute_toolchain_digest
 
         c_hash = compute_content_hash(files)
-        t_digest = compute_toolchain_digest((_ENGINE.metadata,), runtime.policy.version)
+        t_digest = compute_toolchain_digest(
+            (_ENGINE.metadata,), runtime.policy.cache_policy_version
+        )
         async with inventory_sessionmaker() as session, session.begin():
             await register_skill_version(
                 session,
@@ -891,7 +926,9 @@ class TestLifecycleSync:
 
         c_hash = compute_content_hash(files)
         assert c_hash != baseline_hash  # sanity: this test only means something if they differ
-        t_digest = compute_toolchain_digest((_ENGINE.metadata,), runtime.policy.version)
+        t_digest = compute_toolchain_digest(
+            (_ENGINE.metadata,), runtime.policy.cache_policy_version
+        )
         async with inventory_sessionmaker() as session, session.begin():
             await register_skill_version(
                 session,
@@ -991,7 +1028,9 @@ class TestLifecycleSync:
         from monolith.modules.inventory.service import transition_skill
 
         c_hash = compute_content_hash(files)
-        t_digest = compute_toolchain_digest((_ENGINE.metadata,), runtime.policy.version)
+        t_digest = compute_toolchain_digest(
+            (_ENGINE.metadata,), runtime.policy.cache_policy_version
+        )
         async with inventory_sessionmaker() as session, session.begin():
             await register_skill_version(
                 session,
@@ -1080,7 +1119,9 @@ class TestLifecycleSync:
 
         from monolith.modules.inventory.service import transition_skill
 
-        t_digest = compute_toolchain_digest((_ENGINE.metadata,), runtime.policy.version)
+        t_digest = compute_toolchain_digest(
+            (_ENGINE.metadata,), runtime.policy.cache_policy_version
+        )
 
         async def run_one_version(files: list[tuple[str, int, bytes]]) -> str:
             """One full lap: register the version, enter `scanning`, run the
@@ -1642,7 +1683,7 @@ class TestToolchainDigestAdvance:
             gate_sessionmaker=gate_sessionmaker,
             inventory_sessionmaker=inventory_sessionmaker,
         )
-        current = runtime.current_toolchain_digest()
+        current = await runtime.current_toolchain_digest()
         skill_id = f"advance-{uuid.uuid4().hex[:12]}"
         c_hash = await self._register(
             inventory_sessionmaker, skill_id=skill_id, digest="old-digest"
@@ -1691,7 +1732,7 @@ class TestToolchainDigestAdvance:
             gate_sessionmaker=gate_sessionmaker,
             inventory_sessionmaker=inventory_sessionmaker,
         )
-        current = runtime.current_toolchain_digest()
+        current = await runtime.current_toolchain_digest()
         skill_id = f"advance-mismatch-{uuid.uuid4().hex[:12]}"
         c_hash = await self._register(
             inventory_sessionmaker, skill_id=skill_id, digest="old-digest"
@@ -1730,7 +1771,7 @@ class TestToolchainDigestAdvance:
             gate_sessionmaker=gate_sessionmaker,
             inventory_sessionmaker=inventory_sessionmaker,
         )
-        current = runtime.current_toolchain_digest()
+        current = await runtime.current_toolchain_digest()
 
         running_skill = f"advance-running-{uuid.uuid4().hex[:12]}"
         running_hash = await self._register(
@@ -1985,3 +2026,331 @@ class TestReportSchedules:
         assert len(mine) == 1
         assert mine[0]["template"] == "executive_summary"
         assert "total_verdicts" in mine[0]["summary"]
+
+
+class TestWorkerMetricsAreWritten:
+    """Task 13 (2026-07-29): `worker_failures_total` and
+    `audit_intent_unchained` (coding spec §11.7) had no production writer -
+    `SecurityMetrics` was never instantiated at all. Both are read here off
+    the runtime's own registry, which is the same object `GET /metrics`
+    serves (`ScanRuntime.security_metrics`, Task 12); the end-to-end scrape
+    is asserted in test_infra_router.py. Real MySQL/Redis - VM only.
+    """
+
+    @staticmethod
+    def _failures(runtime: ScanRuntime) -> float | None:
+        return runtime.security_metrics.registry.get_sample_value("skillscan_worker_failures_total")
+
+    @staticmethod
+    def _unchained(runtime: ScanRuntime) -> float | None:
+        return runtime.security_metrics.registry.get_sample_value(
+            "skillscan_audit_intent_unchained"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_infrastructure_failure_moves_worker_failures_total(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        # A REAL connection failure (a port nothing listens on), not a mock -
+        # same posture as test_infra_router's readyz test. This is the handler
+        # that fires on a Redis outage or a NOGROUP mid-run.
+        broken_redis: aioredis.Redis = aioredis.Redis.from_url("redis://localhost:1")
+        runtime = _runtime(
+            redis_client=broken_redis,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+        )
+        assert self._failures(runtime) == 0.0, "baseline must be 0 or the assertion is vacuous"
+
+        stop_event = asyncio.Event()
+
+        async def stop_after_one_tick() -> None:
+            await asyncio.sleep(0.3)
+            stop_event.set()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    run_worker_loop(
+                        runtime, interval_s=0.05, consumer="failmetric", stop_event=stop_event
+                    ),
+                    stop_after_one_tick(),
+                ),
+                timeout=10,
+            )
+        finally:
+            await broken_redis.aclose()
+
+        failures = self._failures(runtime)
+        assert failures is not None and failures >= 1.0, (
+            "a tick that died on a real Redis outage must be counted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_clean_shutdown_does_NOT_move_worker_failures_total(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        # THE load-bearing negative: every clean stop would otherwise put a
+        # guaranteed increment on the counter and make its baseline nonzero by
+        # design, so "nonzero means something is wrong" would never hold.
+        # Pre-set stop_event, same deterministic pattern as the consumer-group
+        # test above - the loop exits without running a tick at all.
+        stop_event = asyncio.Event()
+        stop_event.set()
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+        )
+        await asyncio.wait_for(
+            run_worker_loop(runtime, interval_s=0.05, consumer="cleanstop", stop_event=stop_event),
+            timeout=5,
+        )
+        assert self._failures(runtime) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_the_tick_sets_audit_intent_unchained_to_the_real_backlog(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        audit_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            audit_sessionmaker=audit_sessionmaker,
+        )
+        counts = await worker_tick(runtime, consumer=f"auditgauge-{uuid.uuid4().hex[:8]}")
+
+        # The gauge must agree with an independent read of the same table -
+        # not merely "is a number", which a stale or hardcoded value satisfies
+        # too. `counts` carries the same figure so a caller need not scrape.
+        async with audit_sessionmaker() as session:
+            actual = await count_unchained_intents(session)
+        assert self._unchained(runtime) == float(actual)
+        assert counts["audit_unchained"] == actual
+
+    @pytest.mark.asyncio
+    async def test_a_real_backlog_shows_as_nonzero_then_clears(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        audit_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        # A gauge only ever observed at 0 is indistinguishable from an unwired
+        # one - the exact defect Task 12 found on `reconciliation_inactive`.
+        # So construct a backlog the tick's own batch cannot clear, see the
+        # gauge rise, then drain it and see it fall.
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            audit_sessionmaker=audit_sessionmaker,
+        )
+        action = f"worker_gauge_{uuid.uuid4().hex[:12]}"
+        async with gate_sessionmaker() as session, session.begin():
+            for i in range(60):  # drain_pending_intents' default batch_size is 50
+                session.add(
+                    AuditIntentInsertOnly(operator="tester", action=action, payload={"i": i})
+                )
+
+        await worker_tick(runtime, consumer=f"auditgauge-{uuid.uuid4().hex[:8]}")
+        after_first = self._unchained(runtime)
+        assert after_first is not None and after_first > 0.0, (
+            "a backlog beyond one drain batch must show as a nonzero gauge"
+        )
+
+        # Second tick drains the remainder; the gauge must come back down.
+        await worker_tick(runtime, consumer=f"auditgauge-{uuid.uuid4().hex[:8]}")
+        after_second = self._unchained(runtime)
+        assert after_second is not None and after_second < after_first
+
+
+class TestEngineHealthRetentionIsDriven:
+    """Milestone C Task 9: the retention sweep has a LIVE CALLER.
+
+    VM-ONLY (real MySQL + Redis). `test_engine_health_retention.py` proves the
+    call site exists in the source; this proves the tick actually reaches the
+    database and deletes, which is the only version of the claim that survives
+    a refactor of how `worker_tick` composes its steps.
+
+    Milestone C has already found four instances of real code with no live
+    caller (`run_result_collector_tick`'s chart-level gap, the skillspector LLM
+    path, `batch_rescan_targets`, the seven unreadable metrics). A retention
+    sweep is the worst possible fifth: nothing observes a health row's
+    deletion, so an undriven sweep looks exactly like a working one until the
+    table is a year old.
+    """
+
+    @staticmethod
+    async def _insert_aged_health_row(
+        orchestration_sessionmaker: SessionmakerFixture, *, days_old: float
+    ) -> str:
+        scan_id = str(uuid.uuid4())
+        recorded_at = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - datetime.timedelta(
+            days=days_old
+        )
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanEngineHealthRow(
+                    scan_id=scan_id,
+                    engine_name="bandit",
+                    report_state="reported",
+                    engine_status="ok",
+                    analyze_duration_ms=12,
+                    finding_count=0,
+                    error=None,
+                    recorded_at=recorded_at,
+                )
+            )
+        return scan_id
+
+    @staticmethod
+    async def _exists(orchestration_sessionmaker: SessionmakerFixture, *, scan_id: str) -> bool:
+        async with orchestration_sessionmaker() as session:
+            row = (
+                await session.execute(
+                    select(ScanEngineHealthRow.engine_name).where(
+                        ScanEngineHealthRow.scan_id == scan_id
+                    )
+                )
+            ).first()
+        return row is not None
+
+    @pytest.mark.asyncio
+    async def test_one_tick_deletes_a_health_row_past_the_window(
+        self,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """THE DRIVEN-NESS PROOF. No direct call to the sweep anywhere in this
+        test - only `worker_tick`, the same entry point `run_worker_loop` calls
+        every second in the deployed pod."""
+        await redis_client.delete(_HEALTH_RETENTION_LEASE_KEY)
+        expired = await TestEngineHealthRetentionIsDriven._insert_aged_health_row(
+            orchestration_sessionmaker, days_old=DEFAULT_RETENTION_DAYS + 5
+        )
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+        )
+        counts = await worker_tick(runtime, consumer=f"retention-{uuid.uuid4().hex[:8]}")
+        assert counts["health_rows_pruned"] >= 1
+        assert not await TestEngineHealthRetentionIsDriven._exists(
+            orchestration_sessionmaker, scan_id=expired
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_tick_leaves_a_health_row_inside_the_window_alone(
+        self,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The other direction, through the same live path. A tick that deletes
+        current telemetry would still pass the test above."""
+        await redis_client.delete(_HEALTH_RETENTION_LEASE_KEY)
+        fresh = await TestEngineHealthRetentionIsDriven._insert_aged_health_row(
+            orchestration_sessionmaker, days_old=1.0
+        )
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+        )
+        await worker_tick(runtime, consumer=f"retention-{uuid.uuid4().hex[:8]}")
+        assert await TestEngineHealthRetentionIsDriven._exists(
+            orchestration_sessionmaker, scan_id=fresh
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_lease_keeps_the_next_tick_from_sweeping_again(
+        self,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The tick runs at 1.0 s; the sweep must not. Without the lease this
+        deployment would issue a DELETE per second against the table the
+        scoring transaction inserts into - and every replica would issue its
+        own."""
+        await redis_client.delete(_HEALTH_RETENTION_LEASE_KEY)
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+        )
+        await worker_tick(runtime, consumer=f"retention-{uuid.uuid4().hex[:8]}")
+        assert await redis_client.get(_HEALTH_RETENTION_LEASE_KEY) is not None
+        ttl = await redis_client.ttl(_HEALTH_RETENTION_LEASE_KEY)
+        assert 0 < ttl <= _HEALTH_RETENTION_INTERVAL_S, "the lease must expire on its own"
+
+        expired = await TestEngineHealthRetentionIsDriven._insert_aged_health_row(
+            orchestration_sessionmaker, days_old=DEFAULT_RETENTION_DAYS + 5
+        )
+        counts = await worker_tick(runtime, consumer=f"retention-{uuid.uuid4().hex[:8]}")
+        assert counts["health_rows_pruned"] == 0, "the lease did not hold the second tick off"
+        assert await TestEngineHealthRetentionIsDriven._exists(
+            orchestration_sessionmaker, scan_id=expired
+        )
+
+        # And it resumes once the lease is gone - a lease that is never
+        # released is retention that stops after one pass.
+        await redis_client.delete(_HEALTH_RETENTION_LEASE_KEY)
+        counts = await worker_tick(runtime, consumer=f"retention-{uuid.uuid4().hex[:8]}")
+        assert counts["health_rows_pruned"] >= 1
+        assert not await TestEngineHealthRetentionIsDriven._exists(
+            orchestration_sessionmaker, scan_id=expired
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_redis_outage_skips_the_pass_instead_of_killing_the_tick(
+        self,
+        blobstore: LocalFilesystemBlobStore,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """Retention is the least important thing in the tick. A lease that
+        cannot be taken must not sweep unleased (every replica deleting at once
+        is the contention this design avoids) and must not raise (worker_tick
+        has no per-step try/except, so a raise here would take out every step
+        ordered after it - which today is nothing, and tomorrow is whatever
+        someone appends).
+
+        Uses a REAL Redis client pointed at a closed port - not a mock - so the
+        exception is the one aioredis actually raises."""
+        dead = aioredis.Redis.from_url("redis://127.0.0.1:1/0", socket_connect_timeout=1)
+        runtime = _runtime(
+            redis_client=dead,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+        )
+        try:
+            assert await run_engine_health_retention(runtime) == 0
+        finally:
+            await dead.aclose()

@@ -313,6 +313,13 @@ async def get_marketplace_scan(
         # returns the same id), and §6.2 makes that 404 indistinguishable from
         # "no such scan" - so the marketplace could not even diagnose it.
         if not await is_scan_submitter(db_session, scan_id=scan_id, subject=session.subject):
+            # Task 13 (2026-07-29): `cross_scope_access_attempts_total`. This
+            # branch is the strongest form of the signal in the codebase -
+            # unlike the console's `get_scan`, there is no reviewer escape
+            # hatch here, so reaching it ALWAYS means one service account
+            # named another's scan_id. Counted here and not on the
+            # `identity is None` 404 above, which is an unknown scan.
+            runtime.security_metrics.record_cross_scope_attempt()
             raise HTTPException(status_code=404, detail="scan not found")
         # 里程碑 F Task 18: the tier THIS service account asked for, off its OWN
         # `scan_submitter` row - so the response can say whether the verdict it

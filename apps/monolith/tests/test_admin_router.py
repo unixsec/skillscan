@@ -6,6 +6,7 @@ override, matching test_router.py's established pattern.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import uuid
 from collections.abc import AsyncIterator
 
@@ -19,7 +20,7 @@ from common.engine_toggle import DISABLED_ENGINES_KEY
 from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from fastapi import FastAPI
 from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from monolith.main import create_app
 from monolith.modules.admin.breakglass import deactivate_breakglass
@@ -35,6 +36,7 @@ from monolith.modules.gateway.auth.middleware import (
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.intel.matcher import INTEL_ENGINE_NAME
+from monolith.modules.orchestration.models import ScanEngineHealthRow
 from monolith.tests.conftest import SessionmakerFixture
 
 _ENGINE = StaticKeywordEngine()
@@ -219,6 +221,357 @@ class TestListEngines:
             # 200 (toggled) or 409 (required floor engine, INV-1) - never 404,
             # which would mean the console renders a row nothing can act on.
             assert response.status_code in (200, 409), f"{name} listed but not addressable"
+
+
+class TestEngineHealthEndpoint:
+    """`GET /v1/admin/engines/health` against a REAL `scan_engine_health` table
+    (milestone C Task 10).
+
+    VM ONLY - these need real MySQL. The rules they exercise (window folding,
+    the three duration states, the counts) are proved without a database in
+    `test_engine_health_read.py`; what only a real server can prove is the part
+    those cannot touch: that the two-statement read actually returns rows under
+    `svc_orchestration`'s grant, that `LIMIT` on a grouped/ordered subquery
+    behaves as expected, and that a `not_reported` row survives the round trip
+    with `engine_status` genuinely NULL rather than coerced to a string.
+    """
+
+    @pytest_asyncio.fixture(autouse=True)
+    async def _empty_health_table(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> AsyncIterator[None]:
+        """Every other test in this repo isolates itself with a unique id, and
+        that is enough because it then reads back by that id.
+        `GET /v1/admin/engines/health` cannot: it folds a window over the WHOLE
+        table, so a sibling test's rows land inside the window and are counted.
+        `recorded_at` is a plain `DATETIME` (second granularity) and the whole
+        class runs inside one second, so "the newest scan" is not even
+        deterministic between them.
+
+        Measured on the VM 2026-07-29: without this, three of the eight fail
+        (`assert {'aig-mcp-scan', 'bandit'} >= {'bandit', 'yara'}` and
+        `assert 'currently_disabled' is None`) while each passes alone against
+        an empty table. The endpoint is behaving correctly in both cases - a
+        window holding a `not_reported` row for `yara` SHOULD attribute it -
+        so the fix belongs here, not in the read path.
+        """
+        async with orchestration_sessionmaker() as session, session.begin():
+            await session.execute(delete(ScanEngineHealthRow))
+        yield
+
+    @staticmethod
+    async def _insert_health(
+        sessionmaker: SessionmakerFixture,
+        rows: list[tuple[str, str, str, str | None, int | None, int | None, str | None]],
+        *,
+        recorded_at: datetime.datetime,
+    ) -> None:
+        async with sessionmaker() as session, session.begin():
+            for scan_id, engine, state, status, duration, findings, error in rows:
+                session.add(
+                    ScanEngineHealthRow(
+                        scan_id=scan_id,
+                        engine_name=engine,
+                        report_state=state,
+                        engine_status=status,
+                        analyze_duration_ms=duration,
+                        finding_count=findings,
+                        error=error,
+                        recorded_at=recorded_at,
+                    )
+                )
+
+    @pytest.mark.asyncio
+    async def test_returned_error_and_never_reported_arrive_as_different_values(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """ACCEPTANCE CRITERION 8, end to end over HTTP. Before this milestone
+        the storage layer could not express the difference at all: a missing
+        blob became a fabricated `EngineStatus.ERROR` so the gate would fail
+        closed, and the telemetry inherited the fabrication."""
+        _as_admin(app)
+        scan_id = f"health-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [
+                (scan_id, "bandit", "reported", "error", 90, 0, "adapter exited 1"),
+                (scan_id, "aig-mcp-scan", "not_reported", None, None, None, "no findings reported"),
+            ],
+            recorded_at=datetime.datetime.now(),
+        )
+        body = (await client.get("/v1/admin/engines/health")).json()
+        by_name = {e["name"]: e for e in body["engines"]}
+
+        bandit = by_name["bandit"]
+        assert (bandit["last_report_state"], bandit["last_engine_status"]) == ("reported", "error")
+        assert (
+            by_name["aig-mcp-scan"]["last_report_state"],
+            by_name["aig-mcp-scan"]["last_engine_status"],
+        ) == ("not_reported", None), (
+            "a never-reported engine came back with a non-null engine_status - the column "
+            "split is what makes 'returned ERROR' and 'never reported' different facts, and "
+            "a driver coercing NULL to '' would silently undo it"
+        )
+        assert by_name["bandit"]["counts"]["error"] >= 1
+        assert by_name["aig-mcp-scan"]["counts"]["not_reported"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_the_three_duration_states_survive_the_round_trip(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """A `0` that comes back as NULL (or a NULL that comes back as 0) would
+        be invisible in every pure test, because both live entirely inside the
+        driver + column type."""
+        _as_admin(app)
+        scan_id = f"health-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [
+                (scan_id, "static-keyword", "reported", "ok", 0, 0, None),
+                (scan_id, "yara", "reported", "ok", None, 0, None),
+                (scan_id, "bandit", "reported", "ok", 42, 1, None),
+            ],
+            recorded_at=datetime.datetime.now(),
+        )
+        by_name = {
+            e["name"]: e for e in (await client.get("/v1/admin/engines/health")).json()["engines"]
+        }
+        assert by_name["static-keyword"]["last_analyze_duration_ms"] == 0
+        assert by_name["yara"]["last_analyze_duration_ms"] is None
+        assert by_name["bandit"]["last_analyze_duration_ms"] == 42
+        assert by_name["static-keyword"]["measured_duration_count"] == 1
+        assert by_name["yara"]["measured_duration_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_window_is_counted_in_scans_and_reports_what_it_covered(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """`?scans=1` must return ONE scan's worth of history, not one ROW's.
+        This is the assertion that would catch a `LIMIT` applied to the wrong
+        statement - the ungrouped rows rather than the grouped scan ids."""
+        _as_admin(app)
+        base = datetime.datetime.now()
+        older, newer = f"h-{uuid.uuid4().hex[:12]}", f"h-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [
+                (older, "bandit", "reported", "error", 10, 0, "old failure"),
+                (older, "yara", "reported", "ok", 10, 0, None),
+            ],
+            recorded_at=base - datetime.timedelta(hours=1),
+        )
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [
+                (newer, "bandit", "reported", "ok", 11, 0, None),
+                (newer, "yara", "reported", "ok", 11, 0, None),
+            ],
+            recorded_at=base,
+        )
+        body = (await client.get("/v1/admin/engines/health?scans=1")).json()
+        assert body["window"]["requested_scans"] == 1
+        assert body["window"]["observed_scans"] == 1
+        by_name = {e["name"]: e for e in body["engines"]}
+        # Both engines of the newest scan are in the window; neither row of the
+        # older scan is, so the old failure must not be counted.
+        assert set(by_name) >= {"bandit", "yara"}
+        assert by_name["bandit"]["counts"]["error"] == 0
+        assert by_name["bandit"]["last_scan_id"] == newer
+
+    @pytest.mark.asyncio
+    async def test_an_out_of_range_window_is_rejected_rather_than_read_whole(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        _as_admin(app)
+        assert (await client.get("/v1/admin/engines/health?scans=100000")).status_code == 422
+        assert (await client.get("/v1/admin/engines/health?scans=0")).status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_engine_that_never_reported_is_attributed_to_the_toggle(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        redis_client: aioredis.Redis,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The Redis disabled set is one of only two authoritative sources for
+        WHY an engine did not report. The join has to be real: this test writes
+        the toggle through the same endpoint an operator would use, so a
+        change to the key name or the set semantics breaks it."""
+        _as_admin(app)
+        scan_id = f"health-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [(scan_id, "yara", "not_reported", None, None, None, "no findings reported")],
+            recorded_at=datetime.datetime.now(),
+        )
+        headers = _csrf_headers_and_cookies(client)
+        await client.patch("/v1/admin/engines/yara", json={"enabled": False}, headers=headers)
+        try:
+            by_name = {
+                e["name"]: e
+                for e in (await client.get("/v1/admin/engines/health")).json()["engines"]
+            }
+            assert by_name["yara"]["not_reported_attribution"] == "currently_disabled"
+            # 2026-07-29: the qualifier has to be ON THE WIRE, not only in the
+            # console's translated hint - a second consumer reading a bare
+            # `currently_disabled` inherits it as a fact about THIS scan.
+            assert by_name["yara"]["not_reported_attribution_basis"] == "current_config"
+        finally:
+            await redis_client.srem(DISABLED_ENGINES_KEY, "yara")  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_a_reporting_engine_gets_no_attribution_even_while_disabled(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        redis_client: aioredis.Redis,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """Attribution answers "why did it not report". Attaching it to an
+        engine that DID report would put a config note next to a healthy row
+        and make the toggle look like a failure cause."""
+        _as_admin(app)
+        scan_id = f"health-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [(scan_id, "yara", "reported", "ok", 7, 0, None)],
+            recorded_at=datetime.datetime.now(),
+        )
+        await redis_client.sadd(DISABLED_ENGINES_KEY, "yara")  # type: ignore[misc]
+        try:
+            by_name = {
+                e["name"]: e
+                for e in (await client.get("/v1/admin/engines/health")).json()["engines"]
+            }
+            assert by_name["yara"]["not_reported_attribution"] is None
+            # No token to qualify, so no basis: a basis on a null attribution
+            # would be a claim in its own right.
+            assert by_name["yara"]["not_reported_attribution_basis"] is None
+        finally:
+            await redis_client.srem(DISABLED_ENGINES_KEY, "yara")  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_the_console_will_not_call_an_engine_unbuilt_that_it_has_heard_from(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """THE VM's 2026-07-29 split brain, reproduced over HTTP.
+
+        `SKILLSCAN_VLLM_BASE_URL` was set on the engine-runner Deployment and
+        not on the monolith, so the engine-runner built `aig-mcp-scan` and ran
+        it on every scan while the monolith - which derives its LLM-gated set
+        from its OWN copy of that variable - believed the engine did not exist.
+        The page rendered "this deployment does not build this engine" beside
+        `failed 2` for that engine, in one row.
+
+        This fixture's ScanRuntime leaves `sandbox_llm_configured` at its
+        default False, which IS the monolith's half of that disagreement; the
+        `reported` row below is the engine-runner's half. The endpoint must
+        return `None`, not the false cause - and must not invent a replacement
+        one either.
+        """
+        _as_admin(app)
+        now = datetime.datetime.now()
+        older = f"health-{uuid.uuid4().hex[:12]}"
+        newer = f"health-{uuid.uuid4().hex[:12]}"
+        # The engine-runner delivered a result. It failed, which is still proof
+        # the engine was constructed - the VM's rows were errors too.
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [(older, "aig-mcp-scan", "reported", "error", 805, 0, "python3 exited 1")],
+            recorded_at=now - datetime.timedelta(minutes=5),
+        )
+        # ... and a later scan the monolith decided without waiting for it,
+        # which is what makes an attribution get computed at all.
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [(newer, "aig-mcp-scan", "not_reported", None, None, None, "no findings reported")],
+            recorded_at=now,
+        )
+
+        by_name = {
+            e["name"]: e for e in (await client.get("/v1/admin/engines/health")).json()["engines"]
+        }
+        aig = by_name["aig-mcp-scan"]
+        assert aig["last_report_state"] == "not_reported"
+        # The contradiction the console showed, asserted as data: a nonzero
+        # failure count and "not built here" cannot both be on this row.
+        assert aig["counts"]["error"] == 1
+        assert aig["not_reported_attribution"] is None
+        assert aig["not_reported_attribution_basis"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_llm_cause_states_this_services_config_and_says_so_on_the_wire(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The other half of the same split brain, and the half no evidence can
+        reach (2026-07-29 honesty review).
+
+        Above, the engine-runner's endpoint was DOWN, so `aig-mcp-scan` exited
+        in under a second and left `reported` rows the overrule could use. With
+        that endpoint UP the engine takes ~240 s, this monolith never waits for
+        it, and every row is `not_reported` - identical to a deployment that
+        genuinely does not build it. The token must therefore be true in both,
+        which is why it names THIS service's configuration rather than the
+        other pod's behaviour, and why the basis travels beside it.
+        """
+        _as_admin(app)
+        scan_id = f"health-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [(scan_id, "aig-mcp-scan", "not_reported", None, None, None, "no findings reported")],
+            recorded_at=datetime.datetime.now(),
+        )
+        by_name = {
+            e["name"]: e for e in (await client.get("/v1/admin/engines/health")).json()["engines"]
+        }
+        aig = by_name["aig-mcp-scan"]
+        # The precondition that makes this the unfalsifiable shape: zero
+        # delivered results, so the evidence overrule has nothing to fire on.
+        assert (aig["counts"]["ok"], aig["counts"]["partial"], aig["counts"]["error"]) == (0, 0, 0)
+        assert aig["not_reported_attribution"] == "llm_endpoint_unconfigured"
+        assert aig["not_reported_attribution_basis"] == "current_config"
+
+    @pytest.mark.asyncio
+    async def test_a_health_row_under_an_unknown_name_is_surfaced_not_dropped(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """`osv_scanner` is the LOCK-FILE key; the runtime name is
+        `osv-scanner`. A row written under the wrong namespace joins against
+        nothing in the console and would simply vanish - which is exactly how
+        `build_engine_coverage`'s disabled flag stayed wrong for years."""
+        _as_admin(app)
+        scan_id = f"health-{uuid.uuid4().hex[:12]}"
+        await self._insert_health(
+            orchestration_sessionmaker,
+            [(scan_id, "osv_scanner", "reported", "ok", 5, 0, None)],
+            recorded_at=datetime.datetime.now(),
+        )
+        body = (await client.get("/v1/admin/engines/health")).json()
+        assert "osv_scanner" in body["unregistered_engines"]
+
+    @pytest.mark.asyncio
+    async def test_non_admin_denied(self, app: FastAPI, client: httpx.AsyncClient) -> None:
+        _as_submitter(app)
+        assert (await client.get("/v1/admin/engines/health")).status_code == 403
 
 
 class TestSetEngineEnabled:

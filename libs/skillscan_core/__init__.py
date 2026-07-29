@@ -16,6 +16,7 @@ from skillscan_core.engines import (
 from skillscan_core.gate import decide
 from skillscan_core.models import (
     ALL_TRIFECTA_SIGNALS,
+    MAX_CATEGORY_WEIGHT,
     AllowlistEntry,
     CategoryWeights,
     DetectionCategory,
@@ -37,6 +38,7 @@ from skillscan_core.scoring import aggregate, evaluate_findings
 
 __all__ = [
     "ALL_TRIFECTA_SIGNALS",
+    "MAX_CATEGORY_WEIGHT",
     "AllowlistEntry",
     "CategoryWeights",
     "DetectionCategory",

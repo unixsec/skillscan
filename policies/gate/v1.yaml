@@ -3,6 +3,26 @@
 # every VerdictRow.policy_version records - bump it (new file, e.g. v2.yaml, or a
 # reviewed edit) only via a deliberate, PR-reviewed change, never silently in place.
 #
+# ⚠ EVERY SETTING BELOW IS BOUND TO THE SCAN CACHE (milestone C Task 11, INV-7).
+# `GatePolicy.cache_policy_version` hashes the PARSED policy - all of it - into
+# the toolchain digest, so editing any value here invalidates every cached
+# verdict and marks every published skill stale in `GET /v1/reeval`, whether or
+# not `version:` is bumped. That is deliberate: a verdict adjudicated under a
+# threshold you have since tightened is a stale verdict, and serving it is the
+# failure this binding exists to prevent. Bump `version:` anyway when you edit -
+# the version is what a verdict RECORDS, and a reader comparing two verdicts has
+# only that.
+#
+# What is FREE, because the digest reads the parsed policy and not the bytes:
+# comments (this file is mostly comment), reindenting, reordering any list,
+# duplicating a tier override, `1` vs `1.0` in a weight, adding a key the parser
+# ignores. What COSTS a re-evaluation: any change to a value the gate reads.
+#
+# OPERATIONAL NOTE: after a real edit, drain the resulting staleness through
+# `reeval` (`GET /v1/reeval` lists it, `POST /v1/reeval/{skill_id}` re-queues)
+# rather than waiting for organic re-submission - published verdicts are not
+# re-adjudicated by the cache going cold, only by a rescan.
+#
 # required_engines: the floor engines (services/engine_runner/detectors/*.py +
 # skillscan_core.StaticKeywordEngine) that INV-1 requires unconditionally, by their
 # real `EngineMetadata.name` values - a scan missing any of these is not required_ok.
@@ -52,3 +72,28 @@ tier_block_overrides:
 
 allowlistable_max_severity: HIGH
 fail_closed_verdict: BLOCK
+
+# category_weights: per-DetectionCategory multiplier on the 0-100 score's
+# penalty term (skillscan_core.CategoryWeights). Affects the SCORE only - never
+# the verdict, which is decided from severity/confidence thresholds before any
+# score is computed. Range [0.0, 10.0] per field; a negative value is refused
+# at load time (it would make a finding RAISE the score).
+#
+# The score is persisted on every verdict, so the INV-7 cache must not keep
+# serving scores computed under the old weights - see the ⚠ at the top of this
+# file: an edit here invalidates the cache whether or not `version:` is bumped.
+#
+# Every field defaults to 1.0 and the whole section may be omitted (a policy
+# file predating milestone C loads unchanged). Listed explicitly here, at the
+# default, so the knob is discoverable rather than folklore - declaring all-1.0
+# is indistinguishable from omitting the section, so writing it out changes no
+# digest and no score.
+category_weights:
+  instruction: 1.0
+  code: 1.0
+  data_credential: 1.0
+  network_intel: 1.0
+  permission: 1.0
+  file_package: 1.0
+  supply_chain: 1.0
+  bundled_component: 1.0

@@ -30,7 +30,8 @@ One `worker_tick()` drives, in order:
                          force through anything that waited past
                          ScanRuntime.sandbox_wait_timeout_s - see
                          SANDBOX_WAITED_ENGINE_NAMES below for what's waited
-                         on and why aig-mcp-scan is excluded
+                         on, and _active_sandbox_waited_engines for what a
+                         given deployment drops from that set
 5. lifecycle sync      - verdicts drive the §16.2 skill state machine
                          (scanning→published on PASS, scanning→review_pending
                          on REVIEW; review-approved skills →published). A
@@ -59,6 +60,12 @@ One `worker_tick()` drives, in order:
 9. report schedules    - fire due cron schedules (POST /v1/reports/schedule
                          finally executes; delivery = SIEM event when
                          configured, always audited via the generation itself)
+10. health retention   - orchestration.retention.sweep_engine_health_retention,
+                         behind an hourly Redis lease. THE ONLY RETENTION PATH
+                         IN THIS SYSTEM (design §3.1: findings blobs have no
+                         TTL and nothing prunes them). Last on purpose: it is
+                         the least important responsibility here and must never
+                         delay a decide - see `_HEALTH_RETENTION_LEASE_KEY`
 
 SECURITY: this module composes other modules the same way routers do - each
 step uses that module's OWN least-privilege session factory (svc_orchestration
@@ -81,13 +88,13 @@ import yaml
 from common import airlock
 from common.blobstore import artifact_key
 from common.log import get_logger
-from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
+from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES, llm_gated_engine_names
 from skillscan_core import GatePolicy
 from sqlalchemy import CursorResult, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from monolith.modules.admin.engine_registry import list_disabled_engines
-from monolith.modules.audit.service import drain_pending_intents
+from monolith.modules.audit.service import count_unchained_intents, drain_pending_intents
 from monolith.modules.gate.models import PolicyProposalRow, VerdictRow
 from monolith.modules.gate.policy import GatePolicyLoadError, parse_gate_policy
 from monolith.modules.gate.service import list_active_allowlist_entries
@@ -100,6 +107,7 @@ from monolith.modules.inventory.service import advance_baseline_on_publish, tran
 from monolith.modules.orchestration.drift import check_drift
 from monolith.modules.orchestration.floor import floor_engines
 from monolith.modules.orchestration.models import ScanJob
+from monolith.modules.orchestration.retention import sweep_engine_health_retention
 from monolith.modules.orchestration.service import (
     POISON_PILL_STATUS,
     STATE_DECIDED,
@@ -126,16 +134,30 @@ _WORKER_OPERATOR = "system:worker"
 # silently dropped aig-mcp-scan (computed and blob-written by engine-runner,
 # never aggregated into any verdict here) until this alias replaced it.
 SANDBOX_ADVISORY_ENGINE_NAMES: tuple[str, ...] = SANDBOX_ENGINE_NAMES
-# The sandbox engines the gate WAITS for (D2, 2026-07-27). aig-mcp-scan is
-# excluded unconditionally: it is only constructed when vllm_base_url is set
-# (sandbox_engines.py:137), so on a default deployment it never reports at all,
-# and even when enabled its 240s subprocess timeout would consume almost the
-# entire 300s wait window on its own - starving the other four. Its findings
-# therefore remain probabilistically visible; fixing that needs per-engine
-# timeouts, not a bigger global one.
-SANDBOX_WAITED_ENGINE_NAMES: tuple[str, ...] = tuple(
-    n for n in SANDBOX_ADVISORY_ENGINE_NAMES if n != "aig-mcp-scan"
-)
+# The sandbox engines the gate WAITS for (D2, 2026-07-27). Now the WHOLE tier:
+# aig-mcp-scan used to be subtracted here by name, for two reasons, both of
+# which milestone C Task 4 (2026-07-29) closed.
+#
+# The first was its timeout. Every static adapter shared one 60s constant and
+# aig alone escaped it via a single-engine environment variable, so its 240s
+# could only be traded against the whole tier's budget by moving the global
+# value - this comment used to say the fix "needs per-engine timeouts, not a
+# bigger global one". `engine_runner.timeouts` is that, and the engine-runner
+# now warns at startup when the configured per-engine timeouts cannot all fit
+# inside one job's `scan_deadline_s`. Waiting is safe regardless of how those
+# are tuned: `adapters/base.py` clamps every engine's timeout down to the
+# budget remaining on the job's shared `deadline_epoch`, so each engine reports
+# SOMETHING - OK, ERROR or TIMEOUT - before the deadline the wait is measured
+# against, and `sweep_sandbox_wait_timeouts`' own grace exists to let that last
+# report win the race.
+#
+# The second was deployment shape, and it is NOT solved by a name-keyed
+# exclusion in a constant: an engine the local engine-runner never constructs
+# can never report, so waiting for it burns the entire budget on every scan.
+# That is a property of the deployment, not of the tier, so it belongs with the
+# admin-disable filter in `worker_tick` rather than here - see
+# `_active_sandbox_waited_engines`.
+SANDBOX_WAITED_ENGINE_NAMES: tuple[str, ...] = SANDBOX_ADVISORY_ENGINE_NAMES
 # Engine marker for the sweep's "artifact vanished from the blob store"
 # dead-letter (audit-distinguishable from a real worker's poison-pill; the
 # collector keys off status, the engine field is informational).
@@ -148,6 +170,63 @@ _SCHEDULE_FIRED_PREFIX = "skillscan:reporting:schedule_fired:"
 # are harmless: the collector's state check under FOR UPDATE makes the second
 # decide a no-op, and engine re-runs just overwrite the same findings blobs.
 REQUEUE_QUEUED_AFTER_S = 60.0
+# Milestone C Task 9. The retention sweep must be DRIVEN, and the only live
+# driver this process has is `worker_tick` - observed on the VM at a 1.0 s
+# interval (Task 1, 1bfd580). A sweep on every tick would issue a DELETE per
+# second against the table the scoring transaction is inserting into, so the
+# tick calls it behind a lease instead: SET NX EX means the first replica to
+# arrive in a given hour runs it and every other tick, on every replica, is a
+# single Redis round trip that returns immediately. Same mechanism
+# `run_due_report_schedules` uses for its per-minute cross-replica dedup.
+#
+# ONE HOUR, chosen against the per-pass budget rather than against timeliness -
+# nothing observes a health row's deletion, so being an hour late costs
+# nothing. One pass removes up to 20,000 rows (1,333 scans, 2.8x the busiest
+# day this deployment has ever had), so 24 passes/day drain 67x the peak
+# observed production rate and a sweep outage of a full day is caught up by the
+# first pass after it. A longer interval would also mean a longer wait before
+# an operator could notice the counter is stuck at zero.
+_HEALTH_RETENTION_LEASE_KEY = "skillscan:orchestration:health_retention_lease"
+_HEALTH_RETENTION_INTERVAL_S = 3600
+
+
+def _active_sandbox_waited_engines(
+    *, disabled_engines: frozenset[str], sandbox_llm_configured: bool
+) -> tuple[str, ...]:
+    """`SANDBOX_WAITED_ENGINE_NAMES` minus the engines that cannot report on
+    THIS deployment right now. Waiting on one of those is not a slow decision,
+    it is the full `sandbox_wait_timeout_s` budget spent on every scan for
+    evidence that was never going to arrive.
+
+    Two ways an engine cannot report, and both are runtime facts rather than
+    tier membership, which is why they are filtered here instead of being
+    subtracted from the constant:
+
+    - ADMIN-DISABLED (Important 2, 2026-07-27 review). `engine_runner.worker`
+      skips a disabled engine with a bare `continue` - no blob, no result
+      message, ever. Read live each tick from the same Redis key the admin API
+      writes and the dashboard reads, so a re-enable takes effect on the next
+      tick exactly as the disable did.
+    - NOT CONSTRUCTED BY THIS DEPLOYMENT'S ENGINE-RUNNER. `sandbox_engines()`
+      omits its LLM-gated engines entirely when no internal endpoint is
+      configured (aig-mcp-scan has no static-only mode - see that function's
+      docstring), and `SKILLSCAN_VLLM_BASE_URL` is one ConfigMap key both
+      deployables consume, so `runtime.sandbox_llm_configured` answers for the
+      engine-runner too. The NAMES come from `llm_gated_engine_names()`, which
+      derives them from that same config gate rather than restating "aig" here
+      - this filter must not become the name-keyed special case it replaced.
+
+    Fail-safe direction: `sandbox_llm_configured` defaults to False, so a caller
+    that never wires it waits for less and decides sooner. The cost of guessing
+    wrong that way is a verdict that may miss an advisory engine's findings
+    (recorded in `reasons`); guessing wrong the other way stalls every scan for
+    the whole budget."""
+    llm_gated = llm_gated_engine_names()
+    return tuple(
+        name
+        for name in SANDBOX_WAITED_ENGINE_NAMES
+        if name not in disabled_engines and (sandbox_llm_configured or name not in llm_gated)
+    )
 
 
 def _naive_utcnow() -> datetime.datetime:
@@ -811,7 +890,7 @@ async def advance_scanned_toolchain_digests(
     """
     if runtime.inventory_session_factory is None:
         return 0
-    current_digest = runtime.current_toolchain_digest()
+    current_digest = await runtime.current_toolchain_digest()
     async with runtime.orchestration_session_factory() as orch_session:
         jobs = (
             (
@@ -952,6 +1031,45 @@ async def run_due_report_schedules(
     return fired
 
 
+async def run_engine_health_retention(
+    runtime: ScanRuntime, *, interval_s: int = _HEALTH_RETENTION_INTERVAL_S
+) -> int:
+    """Drive `scan_engine_health` retention, at most once per `interval_s` per
+    cluster. Returns rows deleted (0 when another tick already holds the lease).
+
+    THIS FUNCTION IS THE ANSWER TO "WHERE DOES THE SWEEP RUN". `worker_tick`
+    is the only live driver in this deployment - one background asyncio task in
+    the single monolith pod, ticking at 1.0 s, confirmed by observation on the
+    VM (Task 1, 1bfd580) rather than inferred from the source. Anything else
+    would have needed a scheduler this system does not have, and a sweep with
+    no scheduler is the "real code, no live caller" defect this milestone has
+    already found four times.
+
+    THE LEASE, not a timestamp column and not a per-process clock. `SET NX EX`
+    is the same primitive `run_due_report_schedules` uses, and it is correct
+    across replicas for the same reason: whichever pod gets there first runs
+    the pass, the rest see the key and return. A process-local "last run at"
+    would restart with the process, so a crash-looping pod would sweep on every
+    restart, and two replicas would each keep their own.
+
+    A Redis failure means the pass is SKIPPED, never that it runs unleased -
+    the failure mode of an unleased sweep is every replica deleting
+    concurrently, which is exactly the contention this design exists to avoid.
+    It is logged rather than raised: retention is the least important thing in
+    the tick and must not cost the steps ordered after it.
+    """
+    try:
+        acquired = await runtime.redis.set(_HEALTH_RETENTION_LEASE_KEY, "1", nx=True, ex=interval_s)
+    except (aioredis.RedisError, OSError):
+        _logger.exception(
+            "could not take the engine-health retention lease - skipping this pass",
+        )
+        return 0
+    if not acquired:
+        return 0
+    return await sweep_engine_health_retention(runtime.orchestration_session_factory)
+
+
 async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker") -> dict[str, int]:
     """One full pass over every background responsibility. Each step is
     independently useful and independently fallible - a step's failure is
@@ -974,8 +1092,17 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
         "lifecycle": 0,
         "toolchain_advanced": 0,
         "audit_chained": 0,
+        # Task 13: the backlog LEFT after this tick's drain, not work done -
+        # reported alongside the counters so a caller reading `counts` sees
+        # the same number `/metrics` reports for `audit_intent_unchained`,
+        # rather than having to scrape to find out.
+        "audit_unchained": 0,
         "outbox_dispatched": 0,
         "reports_fired": 0,
+        # Task 9: `scan_engine_health` rows deleted by this tick. Almost always
+        # 0 - the lease lets one tick an hour do the work - so the number that
+        # carries information is its SUM over a day, not its value on a tick.
+        "health_rows_pruned": 0,
     }
 
     if await reload_policy_if_changed(runtime):
@@ -1039,31 +1166,18 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
     # forced timeout, `reasons` gains `sandbox_wait_timeout:<engines>` so the
     # downgrade is visible via `GET /v1/scans/{id}`, never silent.
     #
-    # aig-mcp-scan is excluded from the WAITED set (SANDBOX_WAITED_ENGINE_NAMES)
-    # but stays in the AGGREGATED set below: it is only constructed when
-    # `vllm_base_url` is set, so a default deployment would otherwise wait the
-    # full budget for an engine that can never report, and even when enabled
-    # its 240s subprocess timeout would consume nearly the whole 300s window on
-    # its own, starving the other four. Its findings remain probabilistically
-    # visible - counted when it happens to have reported by decide time, same
-    # as before D2 - rather than reliably waited-for.
+    # The AGGREGATED set stays the whole tier unconditionally: aggregating a
+    # blob that happens to exist costs nothing and is what makes a findings
+    # record complete, whereas WAITING for one is a promise about time. The two
+    # sets are therefore filtered differently on purpose - see
+    # `_active_sandbox_waited_engines` for what can make an engine unwaitable
+    # on a given deployment (an admin disable, or an LLM-gated engine this
+    # deployment's engine-runner never constructs), and why neither is a
+    # property of the tier itself.
     aggregation_advisory_engines = dispatchable_advisory_engines + SANDBOX_ADVISORY_ENGINE_NAMES
-    # SECURITY/operability (Important 2, 2026-07-27 review): SANDBOX_WAITED_
-    # ENGINE_NAMES is a static constant - it never reflects the admin
-    # enable/disable toggle (PATCH /v1/admin/engines/{name}, gated only by
-    # `engine_registry.is_disableable`, which allows disabling any of these
-    # four since none is in `required_engines`). The engine-runner service
-    # skips a disabled engine with a bare `continue` (services/engine_runner/
-    # worker.py) - no blob, no result message, ever. Waiting on a name that
-    # can structurally never report would silently turn a routine admin
-    # disable into a 330s decision delay on EVERY scan from then on (still
-    # recorded in `reasons`, so not silent in the audit sense - but a steep,
-    # surprising operability cliff for one legitimate admin action). Read live
-    # each tick (`disabled_engines` above - the same Redis key the dashboard's
-    # engine-coverage panel and engine-runner's own dispatch gate read) so a
-    # re-enable takes effect on the very next tick, same as the disable did.
-    active_sandbox_waited_engines = tuple(
-        n for n in SANDBOX_WAITED_ENGINE_NAMES if n not in disabled_engines
+    active_sandbox_waited_engines = _active_sandbox_waited_engines(
+        disabled_engines=disabled_engines,
+        sandbox_llm_configured=runtime.sandbox_llm_configured,
     )
     counts["engine_jobs"] = await run_mock_engine_worker_tick(
         runtime.redis,
@@ -1118,6 +1232,29 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
 
     if runtime.audit_session_factory is not None:
         counts["audit_chained"] = len(await drain_pending_intents(runtime.audit_session_factory))
+        # Task 13 (2026-07-29): `audit_intent_unchained` (coding spec §11.7),
+        # observed AFTER the drain, not before - the number that matters is
+        # the backlog this tick could not clear, not the queue depth it
+        # started with. A steady 0 means the drain is keeping up; anything
+        # that stays nonzero across ticks means business events are sitting
+        # in `audit_intent` without a hash chaining them, which is the
+        # condition INV-12's tamper-evidence does not yet cover.
+        #
+        # Its own session, deliberately outside `drain_pending_intents`'s
+        # short transactions - a read that could contend with the drainer it
+        # is measuring would be an observation that changes the thing
+        # observed. Failure here must never cost the tick: the gauge is
+        # worth less than the drain, and the remaining steps below still
+        # need to run (same poison-pill isolation as every other step here).
+        try:
+            async with runtime.audit_session_factory() as audit_session:
+                counts["audit_unchained"] = await count_unchained_intents(audit_session)
+        except Exception:
+            _logger.exception(
+                "audit_intent_unchained gauge read failed - gauge left at its previous value"
+            )
+        else:
+            runtime.security_metrics.audit_intent_unchained.set(counts["audit_unchained"])
 
     if runtime.relay_session_factory is not None:
         counts["outbox_dispatched"] = await drain_pending_outbox(
@@ -1127,6 +1264,13 @@ async def worker_tick(runtime: ScanRuntime, *, consumer: str = "monolith-worker"
         )
 
     counts["reports_fired"] = await run_due_report_schedules(runtime)
+
+    # LAST, and deliberately so. Everything above moves a scan forward or
+    # records what happened to one; this only deletes telemetry that is 26 days
+    # old. Ordering it here means a slow or failing retention pass cannot delay
+    # a decide, a lifecycle transition or an audit chaining - and it can never
+    # touch a row this tick just wrote, since the cutoff is weeks in the past.
+    counts["health_rows_pruned"] = await run_engine_health_retention(runtime)
     return counts
 
 
@@ -1159,8 +1303,22 @@ async def run_worker_loop(
         try:
             await worker_tick(runtime, consumer=consumer)
         except asyncio.CancelledError:
+            # NOT counted: this is shutdown, the one way out of this loop that
+            # is supposed to happen. Counting it would put a guaranteed
+            # increment on every clean stop and make the metric's baseline
+            # nonzero by design.
             raise
         except (aioredis.RedisError, OSError):
+            # Task 13 (2026-07-29): `worker_failures_total` (coding spec
+            # §11.7's "worker 失败"). Counted at TICK level, in both handlers -
+            # the meaning is "a whole background tick died", not "a step
+            # degraded". Steps that swallow their own exception and carry on
+            # (the intel-matcher snapshot, a report schedule, one outbox row)
+            # deliberately do NOT count here: folding those in would mix a
+            # routine, self-healing degradation into the same unlabeled
+            # counter as a dead tick, and no consumer could then tell which
+            # had happened. See this module's own per-step handlers.
+            runtime.security_metrics.worker_failures_total.inc()
             _logger.exception("worker tick failed on infrastructure error - will retry")
             # A NOGROUP (Redis flushed/restarted mid-run) surfaces here - re-
             # ensure the groups so the loop self-heals instead of spinning.
@@ -1169,6 +1327,7 @@ async def run_worker_loop(
             except (aioredis.RedisError, OSError):
                 pass
         except Exception:
+            runtime.security_metrics.worker_failures_total.inc()
             _logger.exception("worker tick failed unexpectedly - will retry")
         try:
             if stop_event is not None:

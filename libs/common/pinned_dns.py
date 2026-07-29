@@ -35,6 +35,7 @@ import ipaddress
 import socket
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 # What socket.getaddrinfo() actually returns: a list of 5-tuples, the last
@@ -56,6 +57,50 @@ _pins: dict[str, tuple[list[_AddrInfo], float]] = {}
 
 _real_getaddrinfo = socket.getaddrinfo
 _installed = False
+
+# Task 13 (2026-07-29): an optional sink for "a hostname this process already
+# committed to as internal-only now resolves to a public address" - i.e. a
+# live DNS-rebinding attempt, caught at the moment a real connection was
+# about to be made. That is the ONE condition in this codebase that is
+# literally coding spec §11.7's `external_egress_attempts_total` ("对外出站
+# 尝试(须恒为 0,非 0 告警)"): an attempted outbound connection to a
+# non-internal address, observed in-process rather than inferred.
+#
+# A registered callback rather than an import of `SecurityMetrics`: this
+# module is a process-wide `socket` monkeypatch with no request, no app and
+# no `ScanRuntime` in scope, and it is imported by the engine-runner service
+# too, which has no metrics registry at all. A callback keeps the ONE
+# SecurityMetrics instance owned by `ScanRuntime` (Task 12) and merely points
+# this module at it, instead of creating a second registry here that
+# `GET /metrics` would never read - the failure mode that would look exactly
+# like working instrumentation.
+_ObservedRebinding = Callable[[str], None]
+_rebinding_observer: _ObservedRebinding | None = None
+
+
+def set_rebinding_observer(observer: _ObservedRebinding | None) -> None:
+    """Register (or clear, with None) the callback invoked when a pinned host
+    fails re-validation. Called once from `main.create_app`. Idempotent and
+    last-writer-wins: re-registering replaces, so repeated `create_app()`
+    calls in one process (tests) cannot accumulate observers and double-count."""
+    global _rebinding_observer
+    with _lock:
+        _rebinding_observer = observer
+
+
+def _notify_rebinding(hostname: str) -> None:
+    """SECURITY: observing must never be able to break resolving. A raising or
+    misbehaving observer is swallowed here - the ValueError that rejects the
+    rebound address is raised by the caller regardless, so the SECURITY
+    control holds even when its instrumentation does not."""
+    with _lock:
+        observer = _rebinding_observer
+    if observer is None:
+        return
+    try:
+        observer(hostname)
+    except Exception:  # noqa: BLE001 - see docstring: the control outranks the metric
+        pass
 
 
 def _validate_and_resolve(hostname: str) -> list[_AddrInfo]:
@@ -116,7 +161,23 @@ def _patched_getaddrinfo(
                 # (never silently fall through to a live, unvalidated lookup
                 # for a hostname this process has already committed to
                 # treating as internal-only).
-                infos = _validate_and_resolve(host)
+                try:
+                    infos = _validate_and_resolve(host)
+                except ValueError:
+                    # Task 13: THE external-egress attempt. This hostname
+                    # passed internal-only validation when it was pinned and
+                    # now does not - a caller is, right now, trying to open a
+                    # connection that would leave the internal network. The
+                    # raise below is what actually refuses it; this line is
+                    # what makes the refusal countable.
+                    #
+                    # Note a DNS *outage* also lands here (ValueError covers
+                    # "resolution failed"), so this counter is "attempted
+                    # egress OR lost the ability to prove it is internal" -
+                    # both of which must be zero on a healthy deployment, and
+                    # neither of which this process may treat as internal.
+                    _notify_rebinding(host)
+                    raise
                 with _lock:
                     _pins[host] = (infos, time.monotonic())
             return _reshape_for_port(infos, port)
@@ -135,8 +196,12 @@ def _install() -> None:
 def _reset_for_tests() -> None:
     """Test-only: clear all pins and uninstall the patch, restoring the real
     resolver. Never called from production code."""
-    global _installed
+    global _installed, _rebinding_observer
     with _lock:
         _pins.clear()
         socket.getaddrinfo = _real_getaddrinfo
         _installed = False
+        # Task 13: the observer is module-global too, so a test that registers
+        # one and does not clear it would leak into every later test in the
+        # same process - including counting into another test's registry.
+        _rebinding_observer = None

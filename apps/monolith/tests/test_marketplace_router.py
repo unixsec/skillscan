@@ -193,6 +193,19 @@ async def _submit(client_instance: httpx.AsyncClient) -> str:
     return scan_id
 
 
+async def _scrape_cross_scope(client_instance: httpx.AsyncClient) -> float:
+    """Task 13: read `cross_scope_access_attempts_total` off a REAL `/metrics`
+    scrape of this same app, never off the counter object. The defect class
+    being guarded against is an increment on a line that does not execute, and
+    only the exposition path proves the value a scraper would actually see."""
+    response = await client_instance.get("/metrics")
+    assert response.status_code == 200
+    for line in response.text.splitlines():
+        if line.startswith("skillscan_cross_scope_access_attempts_total "):
+            return float(line.rsplit(" ", 1)[1])
+    raise AssertionError("cross_scope_access_attempts_total missing from /metrics output")
+
+
 async def _force_state(
     orchestration_sessionmaker: SessionmakerFixture, scan_id: str, state: str
 ) -> None:
@@ -257,6 +270,7 @@ async def _seed_verdict(
     *,
     verdict: str = "REVIEW",
     issued_at: datetime.datetime = _SEEDED_ISSUED_AT,
+    policy_version: str = _SEEDED_POLICY_VERSION,
 ) -> None:
     async with gate_sessionmaker() as session, session.begin():
         session.add(
@@ -264,7 +278,7 @@ async def _seed_verdict(
                 scan_id=scan_id,
                 content_hash="c" * 64,
                 verdict=verdict,
-                policy_version=_SEEDED_POLICY_VERSION,
+                policy_version=policy_version,
                 jti=str(uuid.uuid4()),
                 jws_signature="eyJhbGciOiJSUzI1NiJ9.stub.sig",
                 effective_severity=3,
@@ -310,6 +324,61 @@ class TestAuthorizationMatrix:
         assert unknown.status_code == 404
         # The two cases must not be distinguishable by body either.
         assert response.json() == unknown.json()
+
+    @pytest.mark.asyncio
+    async def test_a_cross_account_read_moves_the_cross_scope_metric(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # Task 13 (2026-07-29): `cross_scope_access_attempts_total`. This
+        # branch is the strongest form of the signal in the codebase - there
+        # is no reviewer escape hatch on this surface, so reaching it always
+        # means one service account named another's scan_id. Scraped through
+        # the real `/metrics` endpoint, because an `.inc()` on a line that
+        # never runs reads identically to a working one from the source.
+        owner = _account("mkt-metric-owner")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
+        scan_id = await _submit(client)
+        before = await _scrape_cross_scope(client)
+
+        intruder = _account("mkt-metric-intruder")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(intruder, _BOTH)
+        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 404
+
+        assert await _scrape_cross_scope(client) == before + 1.0
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_scan_id_does_NOT_move_the_cross_scope_metric(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # §6.2 makes these two 404s deliberately indistinguishable to the
+        # caller; that is exactly why the distinction has to survive here.
+        subject = _account("mkt-metric-unknown")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        before = await _scrape_cross_scope(client)
+
+        assert (await client.get(f"/v1/market/scans/{uuid.uuid4()}")).status_code == 404
+
+        assert await _scrape_cross_scope(client) == before
+
+    @pytest.mark.asyncio
+    async def test_a_missing_scope_403_does_NOT_move_the_cross_scope_metric(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # A missing `scan:read` grant is a misconfigured client, and it is
+        # checked BEFORE ownership - the ownership branch is never reached, so
+        # nothing about which object was named was ever established.
+        owner = _account("mkt-metric-owner3")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
+        scan_id = await _submit(client)
+        before = await _scrape_cross_scope(client)
+
+        stranger = _account("mkt-metric-stranger")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(
+            stranger, _SUBMIT_ONLY
+        )
+        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 403
+
+        assert await _scrape_cross_scope(client) == before
 
     @pytest.mark.asyncio
     async def test_own_scan_without_read_scope_is_403(
@@ -741,7 +810,10 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
 
     @pytest.mark.asyncio
     async def test_a_public_caller_handed_an_internal_verdict_is_told_it_is_looser(
-        self, tiered_app: FastAPI, tiered_client: httpx.AsyncClient
+        self,
+        tiered_app: FastAPI,
+        tiered_client: httpx.AsyncClient,
+        gate_sessionmaker: SessionmakerFixture,
     ) -> None:
         package = _unique_package()
 
@@ -753,6 +825,19 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
             market_account, _BOTH, tier=TrustTier.PUBLIC
         )
         assert await _submit_market(tiered_client, package) == console_scan_id
+
+        # THE ADJUDICATION HAS TO EXIST for the basis to be able to name it.
+        # Submitting only queues a scan; nothing in this fixture runs a tick, so
+        # without this the verdict row is absent, `signed_policy_version` is
+        # None and `tier_divergence` correctly answers "current_policy" - which
+        # is what the VM run of 2026-07-29 measured
+        # (`assert 'current_policy' == 'signing_policy'`). The console-side
+        # sibling of this test (test_gateway_scan_detail.py) always seeded one;
+        # this copy was written without that step.
+        runtime: ScanRuntime = tiered_app.state.scan
+        await _seed_verdict(
+            gate_sessionmaker, console_scan_id, policy_version=runtime.policy.version
+        )
 
         body = (await tiered_client.get(f"/v1/market/scans/{console_scan_id}")).json()
         assert body["judged_at_tier"] == TrustTier.INTERNAL.value

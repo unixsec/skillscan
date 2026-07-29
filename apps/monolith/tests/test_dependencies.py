@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 from common.config import SessionSettings
 from common.errors import ERROR_CODE_HEADER
+from common.observability import SecurityMetrics
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import Response as StarletteResponse
@@ -480,6 +482,124 @@ class TestMachineReadableErrorCode:
 
     def test_authentication_failure_carries_the_authentication_required_code(self) -> None:
         client = TestClient(_build_app(_active_submitter))
+        response = client.get("/submit-only")
+        assert response.status_code == 401
+        assert response.headers[ERROR_CODE_HEADER] == "authentication_required"
+
+
+class TestIntrospectionFailuresAreCounted:
+    """Task 13 (2026-07-29): `introspection_failures_total` (coding spec
+    §11.7) had no production writer. The counting happens in
+    `get_session_context`, the one place in the auth path that can reach
+    `app.state.scan.security_metrics`; `IntrospectionUnavailableError` is what
+    carries the distinction there from `session.py`, which does the I/O.
+
+    No MySQL/Redis here - this whole module runs against the minimal
+    standalone app, and `app.state.scan` only ever needs to expose
+    `security_metrics`. The end-to-end assertion through the REAL app assembly
+    and a real `ScanRuntime` lives in `test_infra_router.py`.
+    """
+
+    @staticmethod
+    def _app_with_metrics(
+        handler: Callable[[httpx.Request], httpx.Response],
+    ) -> tuple[FastAPI, SecurityMetrics]:
+        app = _build_app(handler)
+        metrics = SecurityMetrics()
+        app.state.scan = SimpleNamespace(security_metrics=metrics)
+        return app, metrics
+
+    @staticmethod
+    def _value(metrics: SecurityMetrics) -> float | None:
+        return metrics.registry.get_sample_value("skillscan_introspection_failures_total")
+
+    def test_an_unreachable_idp_increments_the_counter(self) -> None:
+        def idp_is_down(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("introspection endpoint unreachable")
+
+        app, metrics = self._app_with_metrics(idp_is_down)
+        assert self._value(metrics) == 0.0, "baseline must be 0 or the next assertion is vacuous"
+
+        client = TestClient(app)
+        client.cookies.set(SESSION_COOKIE_NAME, "an-opaque-token")
+        response = client.get("/submit-only")
+
+        # SECURITY: still fail-closed, unchanged (FR-SES-050).
+        assert response.status_code == 401
+        assert self._value(metrics) == 1.0
+
+    def test_a_non_2xx_from_the_idp_increments_the_counter(self) -> None:
+        def idp_errors(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"error": "unavailable"})
+
+        app, metrics = self._app_with_metrics(idp_errors)
+        client = TestClient(app)
+        client.cookies.set(SESSION_COOKIE_NAME, "an-opaque-token")
+        assert client.get("/submit-only").status_code == 401
+        assert self._value(metrics) == 1.0
+
+    def test_a_non_json_object_answer_increments_the_counter(self) -> None:
+        # The IdP answered, but with something that tells us nothing about the
+        # token - we never learned whether it was valid, so this is an
+        # introspection failure, not a token verdict.
+        def idp_returns_a_list(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=["not", "an", "object"])
+
+        app, metrics = self._app_with_metrics(idp_returns_a_list)
+        client = TestClient(app)
+        client.cookies.set(SESSION_COOKIE_NAME, "an-opaque-token")
+        assert client.get("/submit-only").status_code == 401
+        assert self._value(metrics) == 1.0
+
+    def test_a_bearer_m2m_introspection_outage_counts_too(self) -> None:
+        # The M2M path lets `introspect_token`'s error propagate unwrapped, so
+        # it must land on the same counter - "is the IdP answering us" is not
+        # a per-credential-type question.
+        def idp_is_down(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("introspection endpoint unreachable")
+
+        app, metrics = self._app_with_metrics(idp_is_down)
+        client = TestClient(app)
+        response = client.get("/submit-only", headers={"Authorization": "Bearer m2m-token"})
+        assert response.status_code == 401
+        assert self._value(metrics) == 1.0
+
+    def test_an_expired_token_does_NOT_increment(self) -> None:
+        # THE load-bearing negative. An expired session is the system working,
+        # and it happens constantly on a healthy deployment. If it counted
+        # here, the counter would climb steadily forever and could never alert
+        # on the IdP outage it exists for.
+        def idp_says_expired(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"active": True, "sub": "alice", "exp": time.time() - 10}
+            )
+
+        app, metrics = self._app_with_metrics(idp_says_expired)
+        client = TestClient(app)
+        client.cookies.set(SESSION_COOKIE_NAME, "an-opaque-token")
+        assert client.get("/submit-only").status_code == 401
+        assert self._value(metrics) == 0.0
+
+    def test_an_inactive_or_revoked_token_does_NOT_increment(self) -> None:
+        def idp_says_inactive(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"active": False})
+
+        app, metrics = self._app_with_metrics(idp_says_inactive)
+        client = TestClient(app)
+        client.cookies.set(SESSION_COOKIE_NAME, "a-revoked-token")
+        assert client.get("/submit-only").status_code == 401
+        assert self._value(metrics) == 0.0
+
+    def test_a_missing_scan_runtime_degrades_to_no_metric_never_a_500(self) -> None:
+        # SECURITY: instrumentation must not be able to turn a correct
+        # fail-closed 401 into a 500 - which would also hand an attacker a way
+        # to distinguish "IdP down" from "token rejected" by status code.
+        # `_build_app` sets no `app.state.scan` at all, which is the case.
+        def idp_is_down(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("introspection endpoint unreachable")
+
+        client = TestClient(_build_app(idp_is_down))
+        client.cookies.set(SESSION_COOKIE_NAME, "an-opaque-token")
         response = client.get("/submit-only")
         assert response.status_code == 401
         assert response.headers[ERROR_CODE_HEADER] == "authentication_required"

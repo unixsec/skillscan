@@ -21,6 +21,7 @@ from common import airlock
 from common.blobstore import LocalFilesystemBlobStore, artifact_key, findings_key
 from schemas.findings import serialize_engine_result
 from skillscan_core import (
+    CategoryWeights,
     DetectionEngine,
     EngineCapability,
     EngineMetadata,
@@ -34,15 +35,24 @@ from skillscan_core import (
     Verdict,
 )
 from skillscan_core import content_hash as compute_content_hash
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import DBAPIError
 
 from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gate.service import decide_and_record as real_decide_and_record
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.orchestration import service as orchestration_service
-from monolith.modules.orchestration.models import ScanJob
+from monolith.modules.orchestration.models import ScanEngineHealthRow, ScanJob, ScanResultRow
+from monolith.modules.orchestration.retention import (
+    DEFAULT_RETENTION_DAYS,
+    RETENTION_DAYS_ENV,
+    sweep_engine_health_retention,
+)
 from monolith.modules.orchestration.service import (
+    RESULT_POISON_PILL_REASON,
+    STATE_DECIDED,
     SubmissionChannel,
+    _dead_letter_and_decide,
     _try_score_and_decide,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
@@ -83,12 +93,21 @@ def _write_engine_blob(
     engine_name: str,
     *,
     findings: Sequence[Finding] = (),
+    status: EngineStatus = EngineStatus.OK,
+    error: str | None = None,
+    analyze_duration_ms: int | None = None,
 ) -> None:
     """Writes a real, schema-valid findings blob directly to the blob store -
     the same shape `run_mock_engine_worker_tick`/the real engine-runner would
     write - without going through either dispatch path. Used by
     TestSandboxWait to simulate "this engine already reported" independent of
-    whichever engine (required or sandbox/advisory) is under test."""
+    whichever engine (required or sandbox/advisory) is under test.
+
+    `status`/`error`/`analyze_duration_ms` (milestone C Task 8) default to
+    exactly what this helper always wrote, so every existing caller produces a
+    byte-identical blob; TestEngineHealthRows varies them to exercise the three
+    duration states and the reported-ERROR case. `analyze_duration_ms=None`
+    OMITS the key, which is what a pre-Task-7 engine-runner image writes."""
     result = EngineResult(
         engine=EngineMetadata(
             name=engine_name,
@@ -97,13 +116,16 @@ def _write_engine_blob(
             capabilities=frozenset({EngineCapability.STATIC}),
         ),
         findings=tuple(findings),
-        status=EngineStatus.OK,
+        status=status,
         scan_mode=ScanMode.STATIC,
         llm_used=False,
+        error=error,
     )
     blobstore.put(
         findings_key(scan_id, engine_name),
-        json.dumps(serialize_engine_result(result)).encode("utf-8"),
+        json.dumps(serialize_engine_result(result, analyze_duration_ms=analyze_duration_ms)).encode(
+            "utf-8"
+        ),
     )
 
 
@@ -326,6 +348,123 @@ class TestSingleFlightDedup:
                 .all()
             )
         assert len(count) == 1
+
+
+class TestReweightingBreaksTheSingleFlightDedup:
+    """INV-7, milestone C acceptance criterion 5 - the DB-level half of
+    `tests/test_invariants.py::test_inv7_category_weight_change_invalidates_cache_key`.
+
+    Same bytes, same `policy.version`, one `category_weights` field changed:
+    the second submission must NOT be handed the first scan's job. It is the
+    same dedup mechanism `TestSingleFlightDedup` above proves works - here it
+    has to NOT fire, because the answer it would hand back carries a `score`
+    computed under the weights that were in force before the edit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_weight_change_alone_produces_a_second_scan_job(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        version = f"test-reweight-{uuid.uuid4().hex[:8]}"
+        unweighted = _policy(version=version)
+        reweighted = GatePolicy(
+            version=version,  # deliberately NOT bumped - that is the whole test
+            required_engines=frozenset({_ENGINE.metadata.name}),
+            hard_gate_rules=frozenset(),
+            fail_closed_verdict=Verdict.BLOCK,
+            category_weights=CategoryWeights(data_credential=2.0),
+        )
+        files = _unique_file(marker=uuid.uuid4().hex[:8], benign=True)
+
+        async with orchestration_sessionmaker() as session, session.begin():
+            scan_id_1 = await submit_scan(
+                session,
+                redis_client,
+                blobstore,
+                files=files,
+                submitter="alice",
+                engine_metadatas=(_ENGINE.metadata,),
+                policy=unweighted,
+                trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
+            )
+        async with orchestration_sessionmaker() as session, session.begin():
+            scan_id_2 = await submit_scan(
+                session,
+                redis_client,
+                blobstore,
+                files=files,
+                submitter="alice",
+                engine_metadatas=(_ENGINE.metadata,),
+                policy=reweighted,
+                trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
+            )
+
+        assert scan_id_1 != scan_id_2, (
+            "a category_weights change must invalidate the cache_key even with "
+            "policy.version untouched - otherwise the second submission is served "
+            "a score computed under the old weights"
+        )
+
+        async with orchestration_sessionmaker() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ScanJob).where(ScanJob.scan_id.in_([scan_id_1, scan_id_2]))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len({row.cache_key for row in rows}) == 2
+        # Same bytes: only the toolchain digest may differ, never the content hash.
+        assert len({row.content_hash for row in rows}) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unweighted_policy_still_dedups(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        # The control: declaring all-1.0 weights explicitly must not break
+        # single-flight against a policy that declared none. This is what stops
+        # the feature shipping as a mass rescan of every published skill.
+        version = f"test-reweight-noop-{uuid.uuid4().hex[:8]}"
+        implicit = _policy(version=version)
+        explicit = GatePolicy(
+            version=version,
+            required_engines=frozenset({_ENGINE.metadata.name}),
+            hard_gate_rules=frozenset(),
+            fail_closed_verdict=Verdict.BLOCK,
+            category_weights=CategoryWeights(),
+        )
+        files = _unique_file(marker=uuid.uuid4().hex[:8], benign=True)
+
+        ids = []
+        for policy in (implicit, explicit):
+            async with orchestration_sessionmaker() as session, session.begin():
+                ids.append(
+                    await submit_scan(
+                        session,
+                        redis_client,
+                        blobstore,
+                        files=files,
+                        submitter="alice",
+                        engine_metadatas=(_ENGINE.metadata,),
+                        policy=policy,
+                        trust_tier=TrustTier.INTERNAL,
+                        source=SubmissionChannel.CONSOLE,
+                        requested_trust_tier=TrustTier.INTERNAL,
+                    )
+                )
+        assert ids[0] == ids[1]
 
 
 class TestParseSkillNameRootPathOnly:
@@ -1654,3 +1793,766 @@ class TestResultMessageLossStillConverges:
                 await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
             ).scalar_one()
         assert job.state == "decided"
+
+
+async def _churn_result_messages(
+    redis_client: aioredis.Redis, scan_id: str, *, deliveries: int
+) -> tuple[str, ...]:
+    """Drive this scan's results-stream messages up to `deliveries` extra
+    redeliveries, by XCLAIMing them the way the scans-stream poison-pill test
+    already does. Returns their message ids.
+
+    XCLAIM (not JUSTID) is what increments `times_delivered`, which is the
+    counter `airlock.result_delivery_count` reads - so this reproduces a
+    collector that picked the message up and died before ACKing, `deliveries`
+    times over, without needing to actually break the scoring transaction.
+    """
+    claimed = await airlock.claim_results(
+        redis_client, consumer=f"churn-setup-{uuid.uuid4().hex[:8]}", count=200
+    )
+    message_ids = tuple(r.message_id for r in claimed if r.scan_id == scan_id)
+    assert message_ids, "setup: this scan's result messages must have been claimable"
+    for _ in range(deliveries):
+        await redis_client.xclaim(
+            airlock.RESULTS_STREAM,
+            airlock.ORCHESTRATORS_GROUP,
+            f"churner-{uuid.uuid4().hex[:8]}",
+            min_idle_time=0,
+            message_ids=list(message_ids),
+        )
+    return message_ids
+
+
+class TestResultPoisonPill:
+    """INV-5 on the RESULTS stream (2026-07-29, milestone C correctness review
+    N-1). The scans stream has capped redelivery since M3; this one never did.
+
+    THE HOLE. `run_result_collector_tick` deliberately leaves a scan_id's
+    messages unacked when deciding it raises, so a transient failure retries.
+    `reclaim_stale_results` hands them straight back. Nothing bounded that, so
+    a DETERMINISTIC failure inside `_try_score_and_decide` retried forever: the
+    scan never got a verdict and the stream never drained.
+
+    Milestone C Task 8 is what made that reachable rather than theoretical - it
+    put 15 `scan_engine_health` INSERTs, four CHECK constraints and a new GRANT
+    inside that transaction, every one of which fails identically on retry.
+
+    WHY THESE TESTS DO NOT BREAK THE TRANSACTION TO GET THERE. The cap's
+    contract is about the DELIVERY COUNT, not about any particular cause: "this
+    message has defeated every previous attempt". Driving the counter directly
+    (as `TestPoisonPill` already does for the scans stream) tests exactly that
+    contract, and does not quietly become a test of whichever failure mode was
+    fashionable when it was written. The scans are seeded with every required
+    blob present, so WITHOUT the cap they score cleanly - which is what makes
+    the first test's BLOCK assertion a real signal rather than a coincidence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_result_message_past_the_delivery_cap_dead_letters_to_block(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """Not unacked forever, and not silently dropped either: a real, signed,
+        audited fail-closed BLOCK carrying a reason that names the RESULTS
+        stream, so an operator is pointed at the database/grants/policy rather
+        than at the submitted package."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        await _churn_result_messages(
+            redis_client, scan_id, deliveries=airlock.MAX_DELIVERY_COUNT + 1
+        )
+
+        consumer = f"live-{uuid.uuid4().hex[:8]}"
+        job_row = None
+        for _ in range(10):
+            # Looped for the same reason TestPoisonPill loops: XAUTOCLAIM
+            # sweeps the shared group from "0" in bounded batches, so this
+            # scan's messages are not guaranteed to be in the first one.
+            await run_result_collector_tick(
+                redis_client,
+                blobstore,
+                orchestration_sessionmaker,
+                gate_sessionmaker,
+                policy=_POLICY,
+                default_trust_tier=TrustTier.INTERNAL,
+                allowlist=(),
+                signer=_signer(),
+                consumer=consumer,
+                reclaim_idle_ms=0,
+            )
+            async with orchestration_sessionmaker() as session:
+                job_row = (
+                    await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+                ).scalar_one()
+            if job_row.state == "failed":
+                break
+
+        assert job_row is not None and job_row.state == "failed"
+        async with gate_sessionmaker() as session:
+            verdict = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        assert verdict.verdict == "BLOCK"
+        assert any(RESULT_POISON_PILL_REASON in reason for reason in verdict.reasons), (
+            f"the dead-letter reason must name the results stream: {verdict.reasons}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_result_message_stops_churning_the_stream(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The other half of the contract, and the half an ack-and-drop fix
+        would also satisfy - so it is asserted separately rather than assumed
+        from the verdict: once dead-lettered, the message is ACKed and nothing
+        hands it back. Asserted by actually re-running the reclaim, not by
+        reading XPENDING bookkeeping."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        await _churn_result_messages(
+            redis_client, scan_id, deliveries=airlock.MAX_DELIVERY_COUNT + 1
+        )
+
+        consumer = f"live-{uuid.uuid4().hex[:8]}"
+        for _ in range(10):
+            await run_result_collector_tick(
+                redis_client,
+                blobstore,
+                orchestration_sessionmaker,
+                gate_sessionmaker,
+                policy=_POLICY,
+                default_trust_tier=TrustTier.INTERNAL,
+                allowlist=(),
+                signer=_signer(),
+                consumer=consumer,
+                reclaim_idle_ms=0,
+            )
+            async with orchestration_sessionmaker() as session:
+                state = (
+                    await session.execute(select(ScanJob.state).where(ScanJob.scan_id == scan_id))
+                ).scalar_one()
+            if state == "failed":
+                break
+        assert state == "failed", "setup: the scan must have been dead-lettered first"
+
+        still_pending = await airlock.reclaim_stale_results(
+            redis_client, consumer=f"sweeper-{uuid.uuid4().hex[:8]}", min_idle_ms=0
+        )
+        assert not [r for r in still_pending if r.scan_id == scan_id], (
+            "a dead-lettered scan's messages must be ACKed - anything else keeps the "
+            "results stream churning on a scan that already has its final verdict"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_redelivery_within_the_cap_is_still_scored_normally(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The cap must not fire on a scan that merely got redelivered once or
+        twice - that is what the reclaim path is FOR, and a cap that turned an
+        ordinary crash-recovery into a forced BLOCK would be worse than the
+        churn it replaces. Two extra deliveries plus the setup claim plus the
+        tick's own XAUTOCLAIM is 4, comfortably under MAX_DELIVERY_COUNT."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        await _churn_result_messages(redis_client, scan_id, deliveries=2)
+
+        await run_result_collector_tick(
+            redis_client,
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            consumer=f"live-{uuid.uuid4().hex[:8]}",
+            reclaim_idle_ms=0,
+        )
+        async with orchestration_sessionmaker() as session:
+            job = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert job.state == STATE_DECIDED
+        async with gate_sessionmaker() as session:
+            verdict = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        assert not any(RESULT_POISON_PILL_REASON in reason for reason in verdict.reasons)
+
+
+class TestEngineHealthRows:
+    """Milestone C Task 8: per-engine health reaches a queryable table.
+
+    VM-ONLY, and the point is not that these lines execute - the pure
+    capture-side tests in `test_engine_health.py` already cover the logic. The
+    point is the SCHEMA: this repo has shipped 1103 passing tests beside 88
+    "Unknown column" errors in the deployed database, because the suite builds
+    its own schema from head. Everything here fails loudly if
+    `scan_engine_health` is missing, mis-typed, or missing its CHECK
+    constraints on the database the test actually connects to.
+    """
+
+    @staticmethod
+    async def _health(
+        orchestration_sessionmaker: SessionmakerFixture, scan_id: str
+    ) -> dict[str, ScanEngineHealthRow]:
+        async with orchestration_sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(ScanEngineHealthRow).where(ScanEngineHealthRow.scan_id == scan_id)
+                )
+            ).scalars()
+            return {row.engine_name: row for row in rows}
+
+    @pytest.mark.asyncio
+    async def test_a_never_reported_engine_is_not_stored_as_an_error(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """ACCEPTANCE CRITERION 8, end to end against a real database. The
+        waited sandbox engine times out and is force-decided past; the required
+        engine reported fine. Before this table both facts were one column, and
+        the absence surfaced only as a `sandbox_wait_timeout:` substring inside
+        the verdict's reasons."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+            force_decide=True,
+        )
+        assert decided is True
+
+        health = await TestEngineHealthRows._health(orchestration_sessionmaker, scan_id)
+        assert "bandit" in health, "the engine that never reported must still get a row"
+        assert health["bandit"].report_state == "not_reported"
+        # NOT "error". `aggregate.unavailable_engine_result` fabricates
+        # EngineStatus.ERROR here so the gate fails closed; storing that
+        # fabrication is what made a never-constructed engine read as a
+        # permanently broken one.
+        assert health["bandit"].engine_status is None
+        assert health["bandit"].analyze_duration_ms is None
+
+        reported = health[next(iter(_POLICY.required_engines))]
+        assert reported.report_state == "reported"
+        assert reported.engine_status == EngineStatus.OK.value
+
+    @pytest.mark.asyncio
+    async def test_a_reported_error_keeps_its_own_status_and_message(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        _write_engine_blob(
+            blobstore,
+            scan_id,
+            "bandit",
+            status=EngineStatus.ERROR,
+            error="bandit: command not found",
+            analyze_duration_ms=12,
+        )
+        await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        health = await TestEngineHealthRows._health(orchestration_sessionmaker, scan_id)
+        assert health["bandit"].report_state == "reported"
+        assert health["bandit"].engine_status == EngineStatus.ERROR.value
+        assert health["bandit"].error == "bandit: command not found"
+        assert health["bandit"].analyze_duration_ms == 12
+
+    @pytest.mark.asyncio
+    async def test_zero_and_unmeasured_durations_are_different_stored_values(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """Task 7's three states, at rest. `0` is what an in-process floor
+        engine really measures; NULL is a blob from an engine-runner image that
+        does not emit the field yet. A NOT NULL DEFAULT 0 column would have
+        recorded the whole not-yet-upgraded pod as instant."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        _write_engine_blob(blobstore, scan_id, "bandit", analyze_duration_ms=0)
+        _write_engine_blob(blobstore, scan_id, "yara")  # key omitted entirely
+        await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit", "yara"),
+        )
+        health = await TestEngineHealthRows._health(orchestration_sessionmaker, scan_id)
+        assert health["bandit"].analyze_duration_ms == 0
+        assert health["yara"].analyze_duration_ms is None
+
+    @pytest.mark.asyncio
+    async def test_every_aggregated_engine_gets_exactly_one_row(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """The aggregation set is deduplicated (`waited_advisory_engines` and
+        `additional_engines` legitimately overlap in production), and the PK is
+        (scan_id, engine_name) - so an un-deduplicated write would be an
+        IntegrityError that aborts the whole decide, not a duplicate row."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        _write_engine_blob(blobstore, scan_id, "bandit")
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+            additional_engines=("bandit", "aig-mcp-scan"),
+        )
+        assert decided is True
+        health = await TestEngineHealthRows._health(orchestration_sessionmaker, scan_id)
+        assert set(health) == set(_POLICY.required_engines) | {"bandit", "aig-mcp-scan"}
+        # The LLM-gated engine this deployment's engine-runner never constructs
+        # is the standing real-world "never reported" case (design §8).
+        assert health["aig-mcp-scan"].report_state == "not_reported"
+
+    @pytest.mark.asyncio
+    async def test_an_engines_multi_kilobyte_error_does_not_abort_the_decide(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """MySQL runs in strict mode: an over-length value is an ERROR, not a
+        silent truncation, and this INSERT shares the scoring transaction - so
+        an untruncated adapter stderr dump would leave the scan permanently
+        undecided. Only a REAL database can prove the truncation is enough."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        _write_engine_blob(
+            blobstore, scan_id, "bandit", status=EngineStatus.ERROR, error="z" * 20000
+        )
+        decided = await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+            waited_advisory_engines=("bandit",),
+        )
+        assert decided is True
+        health = await TestEngineHealthRows._health(orchestration_sessionmaker, scan_id)
+        stored = health["bandit"].error
+        assert stored is not None and stored.endswith("... (truncated)")
+
+    @pytest.mark.asyncio
+    async def test_a_dead_lettered_scan_records_no_engine_health_at_all(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """A poison pill / rejected unpack is a CONTENT-level failure decided
+        without aggregating anything. Manufacturing `not_reported` rows for it
+        would attribute a content rejection to the engines."""
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        await _dead_letter_and_decide(
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            signer=_signer(),
+            operator="test",
+            reason="poison_pill:max_delivery_exceeded",
+        )
+        assert await TestEngineHealthRows._health(orchestration_sessionmaker, scan_id) == {}
+
+    @pytest.mark.asyncio
+    async def test_the_database_itself_refuses_a_fabricated_status(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """`chk_engine_health_status_iff_reported` - the criterion-8 pairing as
+        a DB constraint, not merely an application convention. Written as a
+        direct INSERT because the application path cannot produce this shape;
+        the constraint exists for the NEXT writer, which will not go through
+        `EngineHealthRecord`."""
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanEngineHealthRow(
+                    scan_id=str(uuid.uuid4()),
+                    engine_name="bandit",
+                    report_state="not_reported",
+                    engine_status="error",  # the exact conflation this table exists to stop
+                    analyze_duration_ms=None,
+                    finding_count=None,
+                    error=None,
+                    recorded_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+            with pytest.raises(DBAPIError, match=r"(?i)check constraint"):
+                await session.flush()
+
+    @pytest.mark.asyncio
+    async def test_the_database_itself_refuses_an_unknown_report_state(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """`chk_engine_health_report_state`. Its value domain is owned by
+        `aggregate.EngineReportState` and constrained here on purpose;
+        `engine_status`'s domain is deliberately NOT constrained, because that
+        enum belongs to `skillscan_core` and a new value there must not make
+        every decide abort at the database."""
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanEngineHealthRow(
+                    scan_id=str(uuid.uuid4()),
+                    engine_name="bandit",
+                    report_state="timeout",  # an EngineStatus value, not a report state
+                    engine_status=None,
+                    analyze_duration_ms=None,
+                    finding_count=None,
+                    error=None,
+                    recorded_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+            with pytest.raises(DBAPIError, match=r"(?i)check constraint"):
+                await session.flush()
+
+
+class TestEngineHealthRetention:
+    """Milestone C Task 9: the first retention path this system has ever had.
+
+    VM-ONLY. The sweep issues a real `DELETE ... LIMIT` against real InnoDB and
+    every property below is a property of the database, not of the Python:
+    `mysql_limit` is a dialect option that does not exist on SQLite, `rowcount`
+    on a bulk DELETE is a driver behaviour, and the READ COMMITTED execution
+    option only means anything against a server that takes gap locks. The pure
+    side (the window's derivation, the compiled SQL, the call-site guard) is in
+    `test_engine_health_retention.py` and runs anywhere.
+
+    MUTATION IN BOTH DIRECTIONS, because a deletion path that is only tested
+    for "it removes the right rows" is half tested. Half of the tests here
+    assert what the sweep must NOT touch - the boundary row, the fresh rows, the
+    scan_job and scan_result the health rows annotate, and the rows beyond one
+    pass's budget.
+    """
+
+    @staticmethod
+    async def _insert_health(
+        orchestration_sessionmaker: SessionmakerFixture,
+        *,
+        scan_id: str,
+        engines: Sequence[str],
+        recorded_at: datetime.datetime,
+    ) -> None:
+        async with orchestration_sessionmaker() as session, session.begin():
+            for engine_name in engines:
+                session.add(
+                    ScanEngineHealthRow(
+                        scan_id=scan_id,
+                        engine_name=engine_name,
+                        report_state="reported",
+                        engine_status="ok",
+                        analyze_duration_ms=0,
+                        finding_count=0,
+                        error=None,
+                        recorded_at=recorded_at,
+                    )
+                )
+
+    @staticmethod
+    async def _count(orchestration_sessionmaker: SessionmakerFixture, *, scan_id: str) -> int:
+        async with orchestration_sessionmaker() as session:
+            rows = (
+                await session.execute(
+                    select(ScanEngineHealthRow.engine_name).where(
+                        ScanEngineHealthRow.scan_id == scan_id
+                    )
+                )
+            ).all()
+        return len(rows)
+
+    @pytest.mark.asyncio
+    async def test_it_deletes_rows_past_the_window(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        old = str(uuid.uuid4())
+        await TestEngineHealthRetention._insert_health(
+            orchestration_sessionmaker,
+            scan_id=old,
+            engines=("bandit", "semgrep", "osv-scanner"),
+            recorded_at=now - datetime.timedelta(days=DEFAULT_RETENTION_DAYS + 1),
+        )
+        deleted = await sweep_engine_health_retention(orchestration_sessionmaker, now=now)
+        assert deleted >= 3
+        assert await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=old) == 0
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_delete_rows_inside_the_window(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """THE DIRECTION THAT MATTERS. A sweep that deletes too much passes
+        every "did it delete?" assertion ever written."""
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        fresh = str(uuid.uuid4())
+        just_inside = str(uuid.uuid4())
+        await TestEngineHealthRetention._insert_health(
+            orchestration_sessionmaker,
+            scan_id=fresh,
+            engines=("bandit", "semgrep"),
+            recorded_at=now - datetime.timedelta(minutes=1),
+        )
+        await TestEngineHealthRetention._insert_health(
+            orchestration_sessionmaker,
+            scan_id=just_inside,
+            engines=("bandit",),
+            # One second younger than the cutoff: inside, and the row a sweep
+            # with an off-by-one window would take.
+            recorded_at=now
+            - datetime.timedelta(days=DEFAULT_RETENTION_DAYS)
+            + datetime.timedelta(seconds=1),
+        )
+        await sweep_engine_health_retention(orchestration_sessionmaker, now=now)
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=fresh) == 2
+        )
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=just_inside)
+            == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_row_exactly_at_the_cutoff_survives(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """`<`, not `<=`. Arbitrary at microsecond resolution, and asserted
+        anyway so a later edit cannot flip it unobserved."""
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        boundary = str(uuid.uuid4())
+        await TestEngineHealthRetention._insert_health(
+            orchestration_sessionmaker,
+            scan_id=boundary,
+            engines=("bandit",),
+            # MySQL DATETIME (no fractional seconds on this column) - truncate
+            # so the stored value is EXACTLY the cutoff the sweep computes.
+            recorded_at=(now - datetime.timedelta(days=DEFAULT_RETENTION_DAYS)).replace(
+                microsecond=0
+            ),
+        )
+        await sweep_engine_health_retention(
+            orchestration_sessionmaker, now=now.replace(microsecond=0)
+        )
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=boundary)
+            == 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_it_never_touches_the_scan_it_annotates(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        blobstore: LocalFilesystemBlobStore,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """A real, fully decided scan whose health rows have aged out. The
+        health rows go; the scan_job, the scan_result and the verdict stay.
+
+        `scan_engine_health` has no FK to `scan_job` (see d5a1c07f9e42), so
+        nothing at the database level would stop a cascade written by mistake -
+        this is the assertion that stands in for the constraint that is not
+        there.
+        """
+        scan_id = await _seed_scan_with_all_required_blobs(
+            orchestration_sessionmaker, blobstore, redis_client
+        )
+        assert await _try_score_and_decide(
+            blobstore,
+            orchestration_sessionmaker,
+            gate_sessionmaker,
+            scan_id=scan_id,
+            required_engines=tuple(sorted(_POLICY.required_engines)),
+            policy=_POLICY,
+            default_trust_tier=TrustTier.INTERNAL,
+            allowlist=(),
+            signer=_signer(),
+            operator="test",
+        )
+        assert await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=scan_id)
+
+        # Age this scan's health rows past the window without touching the scan.
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        async with orchestration_sessionmaker() as session, session.begin():
+            await session.execute(
+                update(ScanEngineHealthRow)
+                .where(ScanEngineHealthRow.scan_id == scan_id)
+                .values(recorded_at=now - datetime.timedelta(days=DEFAULT_RETENTION_DAYS + 2))
+            )
+
+        await sweep_engine_health_retention(orchestration_sessionmaker, now=now)
+
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=scan_id) == 0
+        )
+        async with orchestration_sessionmaker() as session:
+            job = await session.get(ScanJob, scan_id)
+            result = (
+                await session.execute(select(ScanResultRow).where(ScanResultRow.scan_id == scan_id))
+            ).scalar_one_or_none()
+        assert job is not None, "the retention sweep deleted a scan_job row"
+        assert job.state == STATE_DECIDED
+        assert result is not None, "the retention sweep deleted a scan_result row"
+        async with gate_sessionmaker() as gate_session:
+            verdict = (
+                await gate_session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one_or_none()
+        assert verdict is not None, "the retention sweep reached across into gate's tables"
+
+    @pytest.mark.asyncio
+    async def test_a_pass_stops_at_its_budget_and_the_next_one_converges(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """The bound is real, not decorative: with more eligible rows than one
+        pass may take, EXACTLY the budget goes and the remainder survives until
+        the next pass. This is what makes a sweep that overlaps a burst of
+        scans harmless - it never grows its own footprint to catch up."""
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        scan_id = str(uuid.uuid4())
+        engines = tuple(f"synthetic-engine-{i:03d}" for i in range(9))
+        await TestEngineHealthRetention._insert_health(
+            orchestration_sessionmaker,
+            scan_id=scan_id,
+            engines=engines,
+            recorded_at=now - datetime.timedelta(days=DEFAULT_RETENTION_DAYS + 3),
+        )
+        # batch_size x max_batches = 4, against 9 eligible rows for this scan.
+        first = await sweep_engine_health_retention(
+            orchestration_sessionmaker, now=now, batch_size=2, max_batches=2
+        )
+        assert first == 4, "a pass must stop at its budget, not run to completion"
+        # `>=`, not `==`: the DELETE has no ORDER BY and this suite shares one
+        # MySQL, so another test's aged rows may legitimately be among the four
+        # this pass took. What is being asserted is that AT MOST the budget went,
+        # which is the property. Asserting exactly which rows went would be
+        # asserting an ordering the statement does not promise.
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=scan_id)
+            >= len(engines) - 4
+        )
+
+        for _ in range(10):
+            if not await sweep_engine_health_retention(orchestration_sessionmaker, now=now):
+                break
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=scan_id) == 0
+        ), "repeated bounded passes must converge"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_table_costs_one_statement_and_reports_zero(
+        self, orchestration_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """The ordinary case, 23 hours out of 24. A short first batch must end
+        the pass rather than spend the remaining budget on empty statements."""
+        deleted = await sweep_engine_health_retention(
+            orchestration_sessionmaker,
+            # A cutoff before this schema existed: nothing can be eligible.
+            now=datetime.datetime(2020, 1, 1),
+        )
+        assert deleted == 0
+
+    @pytest.mark.asyncio
+    async def test_the_window_is_read_from_the_environment_at_sweep_time(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The env knob is live, not a module constant captured at import. A
+        deployment that needs 90 days sets the variable; a deployment that
+        needs one day gets one day, and both take effect on the next pass."""
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+        scan_id = str(uuid.uuid4())
+        await TestEngineHealthRetention._insert_health(
+            orchestration_sessionmaker,
+            scan_id=scan_id,
+            engines=("bandit", "semgrep"),
+            # Inside the 26-day default, outside a 2-day override.
+            recorded_at=now - datetime.timedelta(days=5),
+        )
+        monkeypatch.setenv(RETENTION_DAYS_ENV, str(DEFAULT_RETENTION_DAYS + 10))
+        await sweep_engine_health_retention(orchestration_sessionmaker, now=now)
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=scan_id) == 2
+        )
+
+        monkeypatch.setenv(RETENTION_DAYS_ENV, "2")
+        await sweep_engine_health_retention(orchestration_sessionmaker, now=now)
+        assert (
+            await TestEngineHealthRetention._count(orchestration_sessionmaker, scan_id=scan_id) == 0
+        )

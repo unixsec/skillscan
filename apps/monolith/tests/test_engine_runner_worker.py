@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import uuid
 
 import pytest
@@ -57,9 +58,14 @@ class _FixedEngine:
     deterministically on any host, regardless of which real OSS binaries
     happen to be installed."""
 
-    def __init__(self, name: str, *, status: EngineStatus = EngineStatus.OK) -> None:
+    def __init__(
+        self, name: str, *, status: EngineStatus = EngineStatus.OK, sleep_s: float = 0.0
+    ) -> None:
         self._name = name
         self._status = status
+        # `sleep_s` (milestone C Task 7) buys a duration big enough to assert
+        # on. Default 0.0, so every pre-existing test double is unchanged.
+        self._sleep_s = sleep_s
 
     @property
     def metadata(self) -> EngineMetadata:
@@ -71,6 +77,8 @@ class _FixedEngine:
         )
 
     def analyze(self, files: dict[str, bytes], *, deadline: float | None = None) -> EngineResult:
+        if self._sleep_s:
+            time.sleep(self._sleep_s)
         return EngineResult(
             engine=self.metadata,
             findings=(),
@@ -107,6 +115,27 @@ async def _produce_job(
         ),  # today's real required_engines, irrelevant to this consumer
     )
     return scan_id, message_id
+
+
+async def _claim_result_for(
+    redis_client: aioredis.Redis, *, scan_id: str, engine: str
+) -> airlock.ResultMessage | None:
+    """Drain `skillscan:results` until this scan's own message surfaces.
+
+    Same reason as the inline loop in the first test below: `redis_client` is a
+    real, shared, un-flushed instance, `claim_results` reads `>` (never the same
+    message twice), and other tests' backlog can push this one past a single
+    bounded window. Each call only ever advances, so looping makes guaranteed
+    progress.
+    """
+    for _ in range(50):
+        results = await airlock.claim_results(redis_client, consumer="collector-test", count=50)
+        for r in results:
+            if r.scan_id == scan_id and r.engine == engine:
+                return r
+        if not results:
+            break
+    return None
 
 
 class TestSandboxEngineTickConsumesIndependently:
@@ -187,6 +216,83 @@ class TestSandboxEngineTickConsumesIndependently:
             assert not blobstore.exists(f"findings/{scan_id}/fixed-disabled.json")
         finally:
             await redis_client.srem(DISABLED_ENGINES_KEY, "fixed-disabled")  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_reports_per_engine_analyze_duration_on_both_the_stream_and_the_blob(
+        self, redis_client: aioredis.Redis, blobstore: LocalFilesystemBlobStore
+    ) -> None:
+        """Milestone C Task 7, against REAL Redis - acceptance criterion 7's
+        "duration" half for the sandbox tier.
+
+        The interval is the wall-clock span of one `engine.analyze()` call,
+        nothing wider (see `airlock.ResultMessage.analyze_duration_ms`), so a
+        double that sleeps 60ms must report >=60ms and must NOT pick up the
+        artifact fetch, the hardened unpack or the blob write.
+
+        The blob and the stream entry are written from the same variable in the
+        same loop iteration, so they are asserted EQUAL rather than each
+        checked in isolation - a future refactor that measures twice would
+        produce two nearly-equal numbers and pass a weaker assertion.
+        """
+        await airlock.ensure_groups(redis_client)
+        await ensure_sandbox_group(redis_client)
+        scan_id, _message_id = await _produce_job(
+            redis_client, blobstore, files=[("skill.py", 0o644, b"print('hi')\n")]
+        )
+        engines_by_name: dict[str, DetectionEngine] = {
+            "fixed-slow": _FixedEngine("fixed-slow", sleep_s=0.06),
+        }
+
+        await sandbox_engine_tick(
+            redis_client,
+            blobstore,
+            engines_by_name=engines_by_name,
+            consumer=f"test-{uuid.uuid4().hex[:8]}",
+            count=50,
+        )
+
+        payload = json.loads(blobstore.get(f"findings/{scan_id}/fixed-slow.json"))
+        assert payload["analyze_duration_ms"] >= 60
+
+        message = await _claim_result_for(redis_client, scan_id=scan_id, engine="fixed-slow")
+        assert message is not None
+        assert message.analyze_duration_ms == payload["analyze_duration_ms"]
+
+    @pytest.mark.asyncio
+    async def test_a_pre_task_7_result_message_still_parses_with_no_duration(
+        self, redis_client: aioredis.Redis
+    ) -> None:
+        """THE MIXED-VERSION WINDOW, end to end on real Redis.
+
+        `produce_result`/`ResultMessage` cross two independently deployed
+        images, so a rollout always has a period where the engine-runner pod is
+        still on a pre-Task-7 build. That producer's entry is XADDed here
+        verbatim - four fields, no `analyze_duration_ms` - and the CURRENT
+        consumer must read it without raising and without inventing a number.
+
+        `is None`, not falsy: a `.get(field, 0)` default would pass a truthiness
+        check while recording "every engine on the old pod finished instantly",
+        silently poisoning the dataset this task exists to create. (Also
+        mutation-tested at the parse level in
+        `tests/test_airlock_result_duration.py`.)
+        """
+        await airlock.ensure_groups(redis_client)
+        scan_id = str(uuid.uuid4())
+        await redis_client.xadd(
+            airlock.RESULTS_STREAM,
+            {
+                "scan_id": scan_id,
+                "findings_key": f"findings/{scan_id}/legacy-engine.json",
+                "engine": "legacy-engine",
+                "status": "ok",
+            },
+        )
+
+        message = await _claim_result_for(redis_client, scan_id=scan_id, engine="legacy-engine")
+        assert message is not None
+        assert message.analyze_duration_ms is None
+        assert message.status == "ok"
+        assert message.findings_key == f"findings/{scan_id}/legacy-engine.json"
 
     @pytest.mark.asyncio
     async def test_does_not_compete_with_the_floor_engine_consumer_group(

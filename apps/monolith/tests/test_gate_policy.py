@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from skillscan_core import Severity, TrustTier, Verdict
+from skillscan_core import CategoryWeights, Severity, TrustTier, Verdict
 
 from monolith.modules.gate.policy import (
     GatePolicyLoadError,
@@ -163,6 +163,157 @@ class TestParseGatePolicy:
         assert policy.review_on_severity is Severity.MEDIUM
         assert policy.allowlistable_max_severity is Severity.MEDIUM
         assert policy.fail_closed_verdict is Verdict.BLOCK
+
+
+class TestCategoryWeights:
+    """Milestone C Task 5: `category_weights:` in the versioned policy file."""
+
+    def test_absent_section_gives_the_all_one_default(self) -> None:
+        # A policy file written before this section existed must keep loading
+        # and behave exactly as it did.
+        policy = parse_gate_policy(_minimal_raw())
+        assert policy.category_weights == CategoryWeights()
+
+    def test_explicit_all_one_section_is_indistinguishable_from_absent(self) -> None:
+        # ...which is the operationally load-bearing half: adding the section
+        # at its default, purely to make the knob discoverable, must not cost a
+        # rescan. (Task 11 bound the WHOLE policy, so `cache_policy_version` is
+        # no longer the bare version for anything - but two policies that mean
+        # the same thing must still agree, or the digest would move on a
+        # cosmetic edit.)
+        absent = parse_gate_policy(_minimal_raw())
+        explicit = parse_gate_policy(
+            _minimal_raw(category_weights={"code": 1.0, "supply_chain": 1.0})
+        )
+        assert explicit.category_weights == CategoryWeights()
+        assert explicit.cache_policy_version == absent.cache_policy_version
+
+    def test_partial_section_leaves_the_rest_at_one(self) -> None:
+        policy = parse_gate_policy(_minimal_raw(category_weights={"data_credential": 2.5}))
+        assert policy.category_weights.data_credential == 2.5
+        assert policy.category_weights.code == 1.0
+
+    def test_a_weighted_policy_moves_the_cache_policy_version(self) -> None:
+        # INV-7: this is what stops the cache serving a score computed under
+        # the old weights when the operator forgets to bump `version:`.
+        unweighted = parse_gate_policy(_minimal_raw())
+        policy = parse_gate_policy(_minimal_raw(category_weights={"data_credential": 2.5}))
+        assert policy.version == unweighted.version == "v1"
+        assert policy.cache_policy_version != unweighted.cache_policy_version
+
+    def test_yaml_integer_weight_equals_the_float_default(self) -> None:
+        # YAML writes `1`, not `1.0` - int/float must not be two different
+        # policies as far as the cache is concerned.
+        policy = parse_gate_policy(_minimal_raw(category_weights={"code": 1}))
+        assert policy.category_weights == CategoryWeights()
+        assert policy.cache_policy_version == parse_gate_policy(_minimal_raw()).cache_policy_version
+
+    def test_negative_weight_refused_and_names_the_field(self) -> None:
+        # SECURITY: a negative weight inverts the penalty - the finding would
+        # RAISE the score.
+        with pytest.raises(GatePolicyLoadError, match="permission"):
+            parse_gate_policy(_minimal_raw(category_weights={"permission": -1.0}))
+
+    def test_absurd_weight_refused_and_names_the_field(self) -> None:
+        with pytest.raises(GatePolicyLoadError, match="supply_chain"):
+            parse_gate_policy(_minimal_raw(category_weights={"supply_chain": 100.0}))
+
+    def test_unknown_category_refused(self) -> None:
+        # `data_credentials` (plural) would otherwise load as "weights
+        # configured" while weighting nothing at all.
+        with pytest.raises(GatePolicyLoadError, match="unknown category"):
+            parse_gate_policy(_minimal_raw(category_weights={"data_credentials": 2.0}))
+
+    def test_non_numeric_weight_refused_and_names_the_field(self) -> None:
+        with pytest.raises(GatePolicyLoadError, match="category_weights.code"):
+            parse_gate_policy(_minimal_raw(category_weights={"code": "heavy"}))
+
+    def test_boolean_weight_refused(self) -> None:
+        # bool is an int subclass; `code: true` must not quietly read as 1.0.
+        with pytest.raises(GatePolicyLoadError, match="category_weights.code"):
+            parse_gate_policy(_minimal_raw(category_weights={"code": True}))
+
+    def test_non_mapping_section_refused(self) -> None:
+        with pytest.raises(GatePolicyLoadError, match="category_weights"):
+            parse_gate_policy(_minimal_raw(category_weights=[1.0, 2.0]))
+
+    def test_real_v1_yaml_is_unweighted(self) -> None:
+        # The shipped policy declares the section explicitly at the default, so
+        # the knob is discoverable - and that must change no digest relative to
+        # the same policy with the section omitted.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert policy.category_weights == CategoryWeights()
+        assert policy.version == "v1"
+
+
+class TestPolicyThresholdsBindTheCacheKey:
+    """INV-7, milestone C Task 11: an in-place edit to a THRESHOLD must
+    invalidate the cache, exactly as an in-place edit to a weight does.
+
+    Task 5 bound `category_weights`, which move the persisted `score`. These
+    fields move the persisted VERDICT: an operator who tightens
+    `block_on_severity` and leaves `version:` alone was still served the
+    adjudication computed under the old threshold - a package that should now
+    BLOCK kept answering PASS for as long as the cache held. Exercised through
+    the real LOADER (not just the dataclass) because the file is where the
+    in-place edit actually happens.
+    """
+
+    def test_tightening_block_on_severity_moves_the_digest(self) -> None:
+        lenient = parse_gate_policy(_minimal_raw(block_on_severity="CRITICAL"))
+        tightened = parse_gate_policy(_minimal_raw(block_on_severity="HIGH"))
+        assert lenient.version == tightened.version == "v1"
+        assert lenient.cache_policy_version != tightened.cache_policy_version
+
+    def test_adding_a_tier_override_moves_the_digest(self) -> None:
+        base = parse_gate_policy(_minimal_raw())
+        tightened = parse_gate_policy(
+            _minimal_raw(tier_block_overrides=[{"tier": "public", "severity": "HIGH"}])
+        )
+        assert base.cache_policy_version != tightened.cache_policy_version
+
+    def test_reordering_tier_overrides_does_not_move_the_digest(self) -> None:
+        # `block_threshold` takes min() over the matches, so order and
+        # duplication are not policy - a reordered list must not cost a rescan.
+        one_way = parse_gate_policy(
+            _minimal_raw(
+                tier_block_overrides=[
+                    {"tier": "public", "severity": "HIGH"},
+                    {"tier": "partner", "severity": "HIGH"},
+                ]
+            )
+        )
+        other_way = parse_gate_policy(
+            _minimal_raw(
+                tier_block_overrides=[
+                    {"tier": "partner", "severity": "HIGH"},
+                    {"tier": "public", "severity": "HIGH"},
+                    {"tier": "public", "severity": "HIGH"},
+                ]
+            )
+        )
+        assert one_way.cache_policy_version == other_way.cache_policy_version
+
+    def test_every_other_adjudication_field_moves_the_digest(self) -> None:
+        base = parse_gate_policy(_minimal_raw()).cache_policy_version
+        for key, value in (
+            ("required_engines", ["static-keyword", "inhouse-pii"]),
+            ("hard_gate_rules", ["pii.us_ssn"]),
+            ("review_confidence", 0.95),
+            ("review_on_severity", "MEDIUM"),
+            ("allowlistable_max_severity", "MEDIUM"),
+            ("fail_closed_verdict", "REVIEW"),
+        ):
+            assert parse_gate_policy(_minimal_raw(**{key: value})).cache_policy_version != base, key
+
+    def test_a_comment_only_edit_is_free(self) -> None:
+        # The digest reads the PARSED policy, not the file's bytes - which is
+        # what keeps policies/gate/v1.yaml (majority comment) editable without
+        # invalidating the entire published inventory. Modelled here as a key
+        # the parser ignores entirely.
+        base = parse_gate_policy(_minimal_raw())
+        annotated = parse_gate_policy(_minimal_raw(owner="platform-security", note="see PR #123"))
+        assert base.cache_policy_version == annotated.cache_policy_version
 
 
 class TestTierDirection:

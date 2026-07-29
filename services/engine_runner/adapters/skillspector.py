@@ -119,6 +119,7 @@ from skillscan_core import (
     Severity,
 )
 
+from ..timeouts import DEFAULT_ENGINE_TIMEOUT_S
 from .base import SubprocessEngineAdapter
 
 _LEVEL_TO_SEVERITY = {
@@ -611,6 +612,7 @@ def make_adapter(
     use_llm: bool = True,
     osv_proxy_url: str | None = None,
     api_key: str | None = None,
+    timeout_s: float = DEFAULT_ENGINE_TIMEOUT_S,
 ) -> SubprocessEngineAdapter:
     # SECURITY (Finding #16): validated once here (fail fast on an obviously-
     # bad config at startup), but the REAL, load-bearing check is inside
@@ -682,4 +684,5 @@ def make_adapter(
         parse_output=parse_output,
         env=_build_env,
         treat_nonzero_exit_as_error=False,
+        timeout_s=timeout_s,
     )

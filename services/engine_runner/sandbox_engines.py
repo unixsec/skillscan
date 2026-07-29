@@ -17,11 +17,13 @@ fake-precise hash.
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 
 from skillscan_core import DetectionEngine
 
 from engine_runner.adapters import aig, bandit, osv, skillspector, yara
+from engine_runner.timeouts import EngineTimeouts
 
 _RULESET_DIGEST = "live-cli-probe"
 
@@ -69,7 +71,7 @@ def sandbox_engines(
     yara_rules_dir: Path = _DEFAULT_YARA_RULES_DIR,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
-    llm_engine_timeout_s: float = 240.0,
+    engine_timeouts: EngineTimeouts | None = None,
 ) -> dict[str, DetectionEngine]:
     """Fresh adapter instances each call. A binary that isn't installed on this
     host does not crash construction or the caller's loop - `SubprocessEngineAdapter.
@@ -105,12 +107,31 @@ def sandbox_engines(
     key against an unauthenticated internal deployment; aig-mcp-scan falls
     back to its own placeholder key and a generic default model in that
     case) - set them when the internal deployment enforces its own auth
-    and/or serves a specific named model."""
+    and/or serves a specific named model.
+
+    `engine_timeouts` (milestone C Task 4) resolves each engine's subprocess
+    timeout by its OWN name - `None` means the built-in table
+    (`engine_runner.timeouts`), which reproduces the previous behaviour
+    exactly: 60s everywhere, 240s for aig-mcp-scan. Every adapter is now
+    passed one explicitly, so adding an engine without deciding its timeout
+    is no longer possible by omission."""
+    timeouts = engine_timeouts if engine_timeouts is not None else EngineTimeouts()
     instances: list[DetectionEngine] = [
-        bandit.make_adapter(ruleset_digest=_RULESET_DIGEST, version="1.9.4"),
-        osv.make_adapter(ruleset_digest=_RULESET_DIGEST, version="2.4.0"),
+        bandit.make_adapter(
+            ruleset_digest=_RULESET_DIGEST,
+            version="1.9.4",
+            timeout_s=timeouts.for_engine("bandit"),
+        ),
+        osv.make_adapter(
+            ruleset_digest=_RULESET_DIGEST,
+            version="2.4.0",
+            timeout_s=timeouts.for_engine("osv-scanner"),
+        ),
         yara.make_adapter(
-            rules_path=yara_rules_dir, ruleset_digest=_RULESET_DIGEST, version="4.5.7"
+            rules_path=yara_rules_dir,
+            ruleset_digest=_RULESET_DIGEST,
+            version="4.5.7",
+            timeout_s=timeouts.for_engine("yara"),
         ),
     ]
     if vllm_base_url:
@@ -122,6 +143,7 @@ def sandbox_engines(
                 version="2.3.9",
                 use_llm=True,
                 api_key=llm_api_key,
+                timeout_s=timeouts.for_engine("skillspector"),
             )
         )
     else:
@@ -132,6 +154,7 @@ def sandbox_engines(
                 # vendor/skillspector/pyproject.toml's own version; pinned commit is dde36f2
                 version="2.3.9",
                 use_llm=False,
+                timeout_s=timeouts.for_engine("skillspector"),
             )
         )
     if vllm_base_url:
@@ -147,7 +170,7 @@ def sandbox_engines(
                 version="v4.1.15",  # `git -C vendor/aig describe --tags` - pinned commit 31b2184
                 model=llm_model or "gpt-4o-mini",
                 api_key=llm_api_key,
-                timeout_s=llm_engine_timeout_s,
+                timeout_s=timeouts.for_engine("aig-mcp-scan"),
             )
         )
     return {engine.metadata.name: engine for engine in instances}
@@ -161,3 +184,28 @@ def sandbox_engine_names(
             vllm_base_url=vllm_base_url, llm_api_key=llm_api_key, llm_model=llm_model
         ).keys()
     )
+
+
+@cache
+def llm_gated_engine_names() -> frozenset[str]:
+    """The sandbox engines this service constructs ONLY when an LLM endpoint is
+    configured - i.e. the ones that, on a deployment without one, never run,
+    never write a findings blob and never produce a result message.
+
+    DERIVED, not a literal: it is the difference between the full universe
+    (`SANDBOX_ENGINE_NAMES`) and what `sandbox_engines()`'s own config gate
+    builds with no endpoint. A future engine that joins (or leaves) that gate is
+    therefore picked up here without a second edit - the class of miss milestone
+    D produced five times over.
+
+    WHO NEEDS IT: `apps/monolith/worker.py` decides how long the gate waits for
+    the sandbox tier. Waiting on an engine that structurally cannot report costs
+    every scan the full wait budget and delivers nothing, so the monolith
+    subtracts these names unless its own `vllm_base_url` is configured - the
+    same shape as the admin-disable filter already applied there, and the reason
+    aig-mcp-scan can now be a full member of `SANDBOX_WAITED_ENGINE_NAMES`
+    instead of being hardcoded out of it.
+
+    Cached: the answer is a property of this module's source, not of any input,
+    and it is consulted once per worker tick."""
+    return frozenset(SANDBOX_ENGINE_NAMES) - sandbox_engine_names()

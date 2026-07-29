@@ -32,24 +32,27 @@ Two complementary checks, because either alone has a hole:
 Plus `TestYaraRuleFilesDeclareCatalogIds`, because `yara.py` is data-driven:
 its ids live in `policies/yara/*.yar` meta fields, not in Python at all.
 
-SKIPPING: the catalog spreadsheet is a working document that does not ship to
-the VM (its checkout arrives by rsync with `--exclude=*.xlsx`), so every test
-here skips cleanly when the file is absent rather than failing there. It runs
-for real in the local kernel suite (`uv run pytest tests/ -q`), where the file
-is present.
+WHY THIS READS A MANIFEST AND NOT THE .xlsx (2026-07-29, milestone C task 6).
+This module used to read the spreadsheet directly and `raise SkipTest` when it
+was absent. The .xlsx is gitignored (`.gitignore:35 /*.xlsx`) and excluded from
+the deploy rsync, so "absent" meant the VM, CI, and every fresh clone: the
+guard ran on exactly one machine and skipped silently on all the others - and a
+skip is indistinguishable from a pass in every summary anyone reads. That is
+the same blindness that let `SUP-01` through, relocated one level up: a check
+that looks like verification and verifies nothing where it matters.
 
-Reading the .xlsx uses stdlib `zipfile` + `xml.etree` (an xlsx IS a zip of
-XML) rather than `openpyxl`, so this guard adds no dependency to a repo whose
-kernel suite is deliberately dependency-light.
+So the ids are extracted into `policies/detection_catalog.json` by
+`scripts/gen_detection_catalog.py` and checked in. The manifest travels with
+the repository, so every assertion below now runs everywhere, and a MISSING
+manifest is a hard failure (`load_manifest_ids` raises) rather than a skip.
+The .xlsx remains the authority; `TestManifestMatchesTheAuthoritativeXlsx`
+below is what stops the two from drifting apart.
 
-SECURITY (stdlib XML): the parsed input is one repo-local, version-controlled
-working document read by a local test - never scanned content, never anything
-a submitter controls, so this is not an untrusted-XML parsing surface at all.
-`xml.etree.ElementTree` additionally does not resolve external entities and
-raises on an undefined entity rather than expanding it, so neither XXE nor
-billion-laughs applies here. `defusedxml` is deliberately not pulled in for
-this: adding a dependency to read a developer spreadsheet would cost more
-than it buys.
+`policies/` is COPYd into both the monolith and engine-runner images, so unlike
+the spreadsheet the manifest is also readable at runtime - `test_item_id`
+validation outside test time is now possible. Wiring a runtime consumer is a
+separate decision (what should a bad id do to a live scan?) and is not part of
+this guard.
 """
 
 from __future__ import annotations
@@ -57,22 +60,25 @@ from __future__ import annotations
 import ast
 import json
 import re
+import subprocess
+import sys
 import unittest
-import zipfile
 from pathlib import Path
-from xml.etree import ElementTree
+
+from scripts.gen_detection_catalog import (
+    CATALOG_ITEM_COUNT as _CATALOG_ITEM_COUNT,
+)
+from scripts.gen_detection_catalog import (
+    CATALOG_XLSX as _CATALOG_XLSX,
+)
+from scripts.gen_detection_catalog import (
+    MANIFEST_PATH as _MANIFEST_PATH,
+)
+from scripts.gen_detection_catalog import (
+    load_manifest_ids,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_CATALOG_XLSX = _REPO_ROOT / "企业Skill安全评估测试维度清单.xlsx"
-
-# The catalog has 62 items. Asserted exactly (not `>= 60`) on purpose: this is
-# an authoritative registry, so a legitimate change to it must be a deliberate,
-# reviewed edit here rather than something a parser bug can silently absorb.
-_CATALOG_ITEM_COUNT = 62
-
-_SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-_ITEM_ID_COLUMN = "C"  # 条目编号
-_ITEM_ID_HEADER = "条目编号"
 
 # Used ONLY to decide "is this string literal trying to be a catalog id?" -
 # never to decide whether an id is valid (that is membership, below). Kept
@@ -91,54 +97,17 @@ _YARA_RULES_DIR = _REPO_ROOT / "policies" / "yara"
 _YARA_FINDINGS_JSON = re.compile(r'findings_json\s*=\s*"((?:[^"\\]|\\.)*)"')
 
 
-def _cell_text(cell: ElementTree.Element, shared_strings: list[str]) -> str:
-    value = cell.find(f"{_SHEET_NS}v")
-    if cell.get("t") == "inlineStr":
-        return "".join(t.text or "" for t in cell.iter(f"{_SHEET_NS}t"))
-    if value is None or value.text is None:
-        return ""
-    if cell.get("t") == "s":
-        return shared_strings[int(value.text)]
-    return value.text
-
-
-def _read_catalog_ids() -> frozenset[str]:
-    """Every 条目编号 (column C) of the authoritative catalog, verbatim.
-
-    Deliberately NOT filtered by shape - filtering here would reintroduce the
-    exact assumption that let `SUP-01` through.
-    """
-    with zipfile.ZipFile(_CATALOG_XLSX) as archive:
-        shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
-        shared_strings = [
-            "".join(t.text or "" for t in si.iter(f"{_SHEET_NS}t"))
-            for si in shared_root.findall(f"{_SHEET_NS}si")
-        ]
-        sheet_root = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
-
-    ids: list[str] = []
-    for row in sheet_root.iter(f"{_SHEET_NS}row"):
-        for cell in row.findall(f"{_SHEET_NS}c"):
-            ref = cell.get("r") or ""
-            if re.match(rf"^{_ITEM_ID_COLUMN}\d+$", ref) is None:
-                continue
-            text = _cell_text(cell, shared_strings).strip()
-            if text and text != _ITEM_ID_HEADER:
-                ids.append(text)
-    return frozenset(ids)
-
-
 class _CatalogTestCase(unittest.TestCase):
     catalog: frozenset[str]
 
     @classmethod
     def setUpClass(cls) -> None:
-        if not _CATALOG_XLSX.exists():
-            raise unittest.SkipTest(
-                f"detection catalog {_CATALOG_XLSX.name} is not present in this checkout "
-                "(the VM rsync excludes *.xlsx) - membership cannot be verified here"
-            )
-        cls.catalog = _read_catalog_ids()
+        # NOT a skip. `load_manifest_ids` raises - with instructions - when the
+        # manifest is missing or malformed, because a guard that quietly opts
+        # out where it is most needed is the defect this file was rewritten to
+        # remove. The manifest is version-controlled, so "missing" means the
+        # checkout is broken, not that verification is impossible here.
+        cls.catalog = load_manifest_ids()
 
     def assert_are_catalog_items(self, ids: object, *, source: str) -> None:
         unknown = sorted(i for i in ids if i not in self.catalog)  # type: ignore[union-attr]
@@ -153,15 +122,16 @@ class _CatalogTestCase(unittest.TestCase):
 
 
 class TestCatalogParse(_CatalogTestCase):
-    """If the parser silently returned garbage, every membership assertion
-    below would pass or fail for the wrong reason."""
+    """If the manifest silently held garbage, every membership assertion below
+    would pass or fail for the wrong reason. These run everywhere, including
+    where the spreadsheet does not exist."""
 
     def test_the_catalog_has_its_expected_item_count(self) -> None:
         self.assertEqual(len(self.catalog), _CATALOG_ITEM_COUNT)
 
     def test_known_anchor_items_are_present(self) -> None:
-        # One per dimension actually referenced by the engines, so a parser
-        # that read the wrong column/sheet cannot pass this.
+        # One per dimension actually referenced by the engines, so a manifest
+        # generated from the wrong column/sheet cannot pass this.
         for anchor in ("INTEL-01", "CODE-01", "CRED-04", "NET-06", "PROMPT-01", "SUPPLY-02"):
             self.assertIn(anchor, self.catalog)
 
@@ -169,6 +139,47 @@ class TestCatalogParse(_CatalogTestCase):
         # F-1: osv.py shipped "SUP-01" for its entire life. Shape-identical to
         # a real id, absent from the catalog.
         self.assertNotIn("SUP-01", self.catalog)
+
+
+class TestManifestMatchesTheAuthoritativeXlsx(unittest.TestCase):
+    """The drift guard - the entire cost of generating the manifest.
+
+    A generated file checked in beside its source is a SECOND source of truth
+    unless something fails when the two disagree. This is that something.
+
+    It necessarily needs the spreadsheet, so it cannot run where the
+    spreadsheet is absent - and that is the honest division of labour rather
+    than the old skip-everything: the membership guard above (the half that
+    catches `SUP-01`-class defects) now runs unconditionally in every
+    environment, while only this reconciliation depends on the .xlsx. The
+    .xlsx is gitignored and exists on exactly one machine, so it can only be
+    EDITED there; a check that runs there covers the whole mutation surface.
+
+    Belt and braces: `deploy_and_test_vm.sh` step 1 runs the same `--check` on
+    the Mac before anything is rsynced, where a missing spreadsheet is itself a
+    hard failure.
+    """
+
+    def test_the_checked_in_manifest_is_what_the_spreadsheet_generates(self) -> None:
+        if not _CATALOG_XLSX.is_file():
+            raise unittest.SkipTest(
+                f"{_CATALOG_XLSX.name} is not in this checkout (it is gitignored, and "
+                "lives only on the authoring machine), so manifest-vs-spreadsheet "
+                f"reconciliation is impossible here. {_MANIFEST_PATH.name} itself IS "
+                "verified above - only this reconciliation is skipped."
+            )
+        completed = subprocess.run(
+            [sys.executable, "scripts/gen_detection_catalog.py", "--check"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"{_MANIFEST_PATH.name} has drifted from {_CATALOG_XLSX.name}:\n"
+            f"{completed.stdout}{completed.stderr}",
+        )
 
 
 class TestMappingTablesAreCatalogMembers(_CatalogTestCase):

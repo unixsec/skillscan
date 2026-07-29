@@ -546,6 +546,57 @@ const zh: Dict = {
   'adminEngines.disable': '停用',
   'adminEngines.enable': '启用',
   'adminEngines.cannotDisableRequired': '必需的基线引擎不能被停用',
+  // 引擎最近一次运行结果。「返回错误」与「从未上报」必须是两个不同的值：
+  // 前者是引擎自己说它失败了，后者是我们根本没收到它的结果（里程碑 C 验收第 8 条）。
+  'engineHealth.ok': '正常',
+  'engineHealth.partial': '部分完成',
+  'engineHealth.error': '返回错误',
+  'engineHealth.timeout': '引擎超时',
+  'engineHealth.not_reported': '从未上报',
+  'engineHealth.unreadable': '结果不可读',
+  'engineHealth.unobserved': '窗口内无记录',
+  'engineHealth.unknown': '未知状态',
+  'adminEngines.colLastResult': '最近一次结果',
+  'adminEngines.colLastDuration': '最近一次耗时',
+  'adminEngines.colWindowCounts': '窗口内统计',
+  'adminEngines.windowLoading': '正在读取引擎健康数据…',
+  'adminEngines.windowCaption':
+    '下方健康数据取自最近 {observed} 次仍有记录的扫描（请求 {requested} 次），时间范围 {from} 至 {to}。只覆盖仍在保留期内的扫描，不是引擎的全部历史。',
+  'adminEngines.windowEmpty':
+    '保留期内没有任何扫描的引擎健康记录（请求 {requested} 次）。因此本页不对任何引擎的运行情况作出判断——没有记录不等于引擎没有上报。',
+  'adminEngines.windowUnavailable': '引擎健康数据不可用；下方仅显示引擎清单与启停状态。',
+  'adminEngines.healthUnavailable':
+    '读取引擎健康数据失败（{message}）。引擎清单与启停操作不受影响；健康列显示为无记录，这是读取失败，不是引擎的状态。',
+  'adminEngines.duration.measured': '{ms} 毫秒',
+  'adminEngines.duration.subMillisecond': '<1 毫秒',
+  'adminEngines.duration.subMillisecondHint':
+    '这是真实测量值（0 毫秒）：进程内的基线引擎确实在不到半毫秒内完成，不是「未测量」。',
+  'adminEngines.duration.notMeasured': '未测量',
+  'adminEngines.duration.notMeasuredHint':
+    '引擎有上报，但结果里没有耗时字段——通常是 engine-runner 镜像早于该字段。这与测得 0 毫秒是两回事。',
+  'adminEngines.duration.unreadableHint':
+    '引擎确实写出了结果，但结果无法解析（schema 不符，或键名与内容中的引擎名不一致），所以 analyze() 是运行过的，只是耗时无从得知。这不是「什么都没跑」。',
+  'adminEngines.duration.maxHint': '窗口内最慢一次：{ms} 毫秒（该窗口内共 {count} 次测到耗时）',
+  'adminEngines.countsCell':
+    '{observed} 次观测：正常 {ok} · 失败 {error} · 从未上报 {notReported} · 不可读 {unreadable} · 部分完成 {partial}',
+  // 「从未上报」有五种成因，只有两种能读到来源（Redis 停用集合、本服务
+  // 自己的 LLM 端点配置）。其余三种不作推断。
+  // 2026-07-29：原 never_constructed（「本部署不构建该引擎」）是对另一个进程
+  // 的断言，本进程无法核实——engine-runner 有端点而本服务没有时，该断言就是
+  // 假的。现在只陈述本服务自己观测到的事实，构建与否写成条件句。
+  'adminEngines.attribution.llm_endpoint_unconfigured': '当前配置：本服务未配置内部 LLM 端点',
+  'adminEngines.attribution.currently_disabled': '当前配置：该引擎已被停用',
+  'adminEngines.attribution.unknown': '原因未记录',
+  'adminEngines.attributionHint.llm_endpoint_unconfigured':
+    '读取的是本服务（monolith）自己的配置：这里没有配置内部 LLM 端点。engine-runner 在同样的配置下不会构建该引擎，因此不会写出任何结果——但那是另一个进程，本页读不到它的配置。若两边配置不一致（engine-runner 有端点而本服务没有），该引擎其实在运行，只是结果没在等待窗口内回来。这也不是这些扫描当时的配置。',
+  'adminEngines.attributionHint.currently_disabled':
+    '依据当前部署配置：该引擎现在处于停用状态，engine-runner 会直接跳过它。这是现在的配置，不代表这些扫描运行时它就是停用的。',
+  'adminEngines.attributionHint.unknown':
+    '未上报可能是未派发、仍在运行、写入结果前崩溃等。系统没有观测到具体成因，因此这里不作推断——猜出来的原因看起来和观测到的一模一样。',
+  'adminEngines.versionUnavailable.sandboxed_image':
+    '不可读取（沙箱镜像）',
+  'adminEngines.unregisteredEngines':
+    '健康记录中出现了当前清单里没有的引擎：{names}。可能是已下线但仍在保留期内的引擎，也可能是写入时用错了名字空间。',
 
   'adminPolicy.title': '管理 · 策略',
   'adminPolicy.proposeFailed': '提议提交失败',
@@ -1198,6 +1249,63 @@ const en: Dict = {
   'adminEngines.disable': 'Disable',
   'adminEngines.enable': 'Enable',
   'adminEngines.cannotDisableRequired': 'required floor engines cannot be disabled',
+  // "returned an error" and "never reported" must be two different values:
+  // the first is the engine saying it failed, the second is us never hearing
+  // from it at all (milestone C acceptance criterion 8).
+  'engineHealth.ok': 'ok',
+  'engineHealth.partial': 'partial',
+  'engineHealth.error': 'returned an error',
+  'engineHealth.timeout': 'timed out',
+  'engineHealth.not_reported': 'never reported',
+  'engineHealth.unreadable': 'result unreadable',
+  'engineHealth.unobserved': 'no record in window',
+  'engineHealth.unknown': 'unknown state',
+  'adminEngines.colLastResult': 'Last result',
+  'adminEngines.colLastDuration': 'Last duration',
+  'adminEngines.colWindowCounts': 'In window',
+  'adminEngines.windowLoading': 'Loading engine health…',
+  'adminEngines.windowCaption':
+    'Health below covers the last {observed} scans that still have records (requested {requested}), from {from} to {to}. It covers only scans still inside the retention window - not an engine’s full history.',
+  'adminEngines.windowEmpty':
+    'No engine health records are retained (requested {requested} scans), so this page makes no claim about any engine. No records is not the same as an engine not reporting.',
+  'adminEngines.windowUnavailable':
+    'Engine health is unavailable; the table below shows the engine list and enable/disable state only.',
+  'adminEngines.healthUnavailable':
+    'Could not load engine health ({message}). The engine list and the enable/disable actions are unaffected; the health columns show no record, which is a failed read - not an engine state.',
+  'adminEngines.duration.measured': '{ms} ms',
+  'adminEngines.duration.subMillisecond': '<1 ms',
+  'adminEngines.duration.subMillisecondHint':
+    'A real measurement (0 ms): in-process floor engines genuinely finish in under half a millisecond. This is not "not measured".',
+  'adminEngines.duration.notMeasured': 'not measured',
+  'adminEngines.duration.notMeasuredHint':
+    'The engine reported, but its result carried no duration - usually an engine-runner image older than the field. Different from a measured 0 ms.',
+  'adminEngines.duration.unreadableHint':
+    'The engine did write a result and it could not be parsed (schema violation, or an engine name inside that did not match the key it was stored under). analyze() DID run; only its timing is unknown. This is not "nothing ran".',
+  'adminEngines.duration.maxHint':
+    'Slowest in window: {ms} ms (over the {count} runs in it that were timed)',
+  'adminEngines.countsCell':
+    '{observed} observed: ok {ok} · failed {error} · never reported {notReported} · unreadable {unreadable} · partial {partial}',
+  // "never reported" has five causes; only two have a readable source (the
+  // Redis disabled set, and this service's own LLM endpoint config). The
+  // other three are not inferred.
+  // 2026-07-29: the former `never_constructed` ("not built in this
+  // deployment") was an assertion about a DIFFERENT process that this one
+  // cannot check - and is simply false when the engine-runner has an endpoint
+  // and this service does not. It now states only what this service observed,
+  // and puts the construction claim in a conditional.
+  'adminEngines.attribution.llm_endpoint_unconfigured':
+    'current config: no internal LLM endpoint on this service',
+  'adminEngines.attribution.currently_disabled': 'current config: engine is disabled',
+  'adminEngines.attribution.unknown': 'cause not recorded',
+  'adminEngines.attributionHint.llm_endpoint_unconfigured':
+    'Read from THIS service’s own configuration: no internal LLM endpoint is set here. An engine-runner sharing that configuration never constructs this engine and so can never write a result - but that is a different process, and this page cannot read its configuration. If the two disagree (the engine-runner has an endpoint, this service does not), the engine is in fact running and its result simply did not arrive inside the wait window. It is also not an observation of what was true when those scans ran.',
+  'adminEngines.attributionHint.currently_disabled':
+    'From the CURRENT deployment config: this engine is switched off right now and the engine-runner skips it. That is the configuration today, not evidence that it was off while those scans ran.',
+  'adminEngines.attributionHint.unknown':
+    'Not reporting can mean never dispatched, still running, or crashed before writing its result. The cause was not observed, so none is inferred here - a guessed cause looks exactly like an observed one.',
+  'adminEngines.versionUnavailable.sandboxed_image': 'not readable (sandboxed image)',
+  'adminEngines.unregisteredEngines':
+    'Health records exist for engines that are not in the current listing: {names}. Either a decommissioned engine still inside the retention window, or a row written under the wrong name namespace.',
 
   'adminPolicy.title': 'Admin · Policy',
   'adminPolicy.proposeFailed': 'proposal failed',

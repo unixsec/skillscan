@@ -15,6 +15,7 @@ import uuid
 import jwt as pyjwt
 import pytest
 from skillscan_core import (
+    CategoryWeights,
     DetectionCategory,
     EngineCapability,
     Finding,
@@ -200,6 +201,88 @@ class TestDecideAndRecord:
             ).scalar_one()
         claims = pyjwt.decode(row.jws_signature, options={"verify_signature": False})
         assert claims["score"] == row.score
+
+
+class TestDecideAndRecordUsesPolicyWeights:
+    """Milestone C Task 5: `decide_and_record` is the configuration entry point
+    - it used to call `decide()` with no weights at all, so the policy's
+    `category_weights` reached nothing.
+
+    The finding is CODE/CRITICAL/0.95 (`_critical_finding`), so the BLOCK-band
+    score is 17 at weight 1.0 and 7 at 2.0.
+    """
+
+    def _weighted_policy(self, *, version: str, code_weight: float) -> GatePolicy:
+        return GatePolicy(
+            version=version,
+            required_engines=frozenset(),
+            hard_gate_rules=frozenset(),
+            fail_closed_verdict=Verdict.BLOCK,
+            category_weights=CategoryWeights(code=code_weight),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_persisted_score_reflects_the_policy_weight(
+        self, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        version = f"test-w-{uuid.uuid4().hex[:8]}"
+        recorded: dict[float, int] = {}
+        for weight in (1.0, 2.0):
+            scan_id = str(uuid.uuid4())
+            content_hash = uuid.uuid4().hex + uuid.uuid4().hex
+            async with gate_sessionmaker() as session, session.begin():
+                await decide_and_record(
+                    session,
+                    scan_id=scan_id,
+                    scan_result=_scan_result(
+                        content_hash=content_hash, findings=(_critical_finding(),)
+                    ),
+                    policy=self._weighted_policy(version=version, code_weight=weight),
+                    trust_tier=TrustTier.INTERNAL,
+                    allowlist=(),
+                    signer=LocalDevSigner(),
+                    operator="tester",
+                    now=time.time(),
+                )
+            async with gate_sessionmaker() as session:
+                row = (
+                    await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+                ).scalar_one()
+            recorded[weight] = row.score
+            # The weight must not leak into what the verdict RECORDS - only
+            # into what the toolchain digest binds (cache_policy_version).
+            assert row.policy_version == version
+
+        assert recorded == {1.0: 17, 2.0: 7}
+
+    @pytest.mark.asyncio
+    async def test_the_weighted_score_is_the_one_that_gets_signed(
+        self, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        scan_id = str(uuid.uuid4())
+        content_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        async with gate_sessionmaker() as session, session.begin():
+            await decide_and_record(
+                session,
+                scan_id=scan_id,
+                scan_result=_scan_result(
+                    content_hash=content_hash, findings=(_critical_finding(),)
+                ),
+                policy=self._weighted_policy(
+                    version=f"test-w-{uuid.uuid4().hex[:8]}", code_weight=2.0
+                ),
+                trust_tier=TrustTier.INTERNAL,
+                allowlist=(),
+                signer=LocalDevSigner(),
+                operator="tester",
+                now=time.time(),
+            )
+        async with gate_sessionmaker() as session:
+            row = (
+                await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
+            ).scalar_one()
+        claims = pyjwt.decode(row.jws_signature, options={"verify_signature": False})
+        assert claims["score"] == row.score == 7
 
 
 class TestListIssuedVerdicts:

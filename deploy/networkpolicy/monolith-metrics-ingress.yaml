@@ -1,0 +1,49 @@
+# Prometheus-scrape ingress for the monolith's `GET /metrics`
+# (2026-07-29, milestone C engine-management).
+#
+# SECURITY: Prometheus scraping conventionally carries no authentication, so
+# this NetworkPolicy - additive on top of default-deny.yaml - is the ONLY
+# protection `GET /metrics` has. Same shape as redis-ingress.yaml/
+# mysql-ingress.yaml: name the real consumer explicitly rather than opening
+# the whole component the way web-ingress.yaml's ingress side does (that one
+# documents why it can't - the ingress controller's identity is genuinely
+# cluster-specific and unknowable at chart-authoring time; a metrics scraper
+# has the same problem, so the label below is a documented ASSUMPTION, not a
+# measured fact - see the note below).
+#
+# COARSER THAN IT LOOKS: this app has one listener (containerPort 8000) and
+# NetworkPolicy cannot filter by HTTP path, only by source pod - it cannot
+# scope a peer to /metrics alone. Whatever is allowed to match this rule can
+# reach the full API surface on port 8000, not just /metrics. That is an
+# accepted, documented limitation (same one web-ingress.yaml already accepts
+# for its own ingress-controller rule), not an oversight - if this project
+# ever adds a second listener/service mesh, revisit narrowing this for real.
+#
+# NOT YET EXERCISED: no Prometheus (or any scraper) is deployed anywhere in
+# this repo/cluster as of 2026-07-29 - checked (grep across deploy/ and
+# docs/ for "prometheus"/"ServiceMonitor" turns up nothing but this task's
+# own planning docs), not assumed. This file exists so a real deployment
+# does not silently get default-denied the way milestone-E found this same
+# directory's policies had already done to a differently-named namespace -
+# `app.kubernetes.io/name: prometheus` is the label kube-prometheus-stack /
+# the Prometheus Operator give their own pod by default; MEASURE your actual
+# scraper's labels (`kubectl get pod --show-labels`) before relying on this
+# in a real install rather than assuming this default matches.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: monolith-metrics-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: core-monolith
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 8000
+          protocol: TCP

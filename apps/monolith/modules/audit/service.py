@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -196,6 +196,37 @@ async def drain_pending_intents(
             break
         chained.append(entry)
     return chained
+
+
+async def count_unchained_intents(session: AsyncSession) -> int:
+    """How many `audit_intent` rows are still waiting to be chained, right now.
+
+    SECURITY (Task 13, 2026-07-29): this is the read behind the
+    `audit_intent_unchained` gauge (coding spec §11.7). A backlog that grows
+    without bound means business events are being RECORDED but never made
+    tamper-evident - the ledger's INV-12 guarantee covers only what has
+    actually been chained, so an unchained intent is an audit record with no
+    hash protecting it yet. Until this existed there was no query in the
+    codebase that could answer the question at all: the only unchained-row
+    predicate was `_drain_one_with_retry`'s `LIMIT 1` claim, which by
+    construction can never distinguish "one pending" from "fifty thousand
+    pending".
+
+    Deliberately a plain COUNT with no `FOR UPDATE`, no isolation change and
+    no participation in the drain's transaction: this is an observation, and
+    it must never be able to block or deadlock the drainer it is observing.
+    The count it returns is therefore a snapshot that may be stale the moment
+    it is read, which is exactly the right semantics for a gauge. The initial
+    migration already carries `INDEX idx_unchained (chained, id)`, so this is
+    an index-only scan rather than a table scan of the whole intent history.
+    """
+    return int(
+        (
+            await session.execute(
+                select(func.count()).select_from(AuditIntent).where(AuditIntent.chained.is_(False))
+            )
+        ).scalar_one()
+    )
 
 
 async def verify_chain(session: AsyncSession) -> bool:

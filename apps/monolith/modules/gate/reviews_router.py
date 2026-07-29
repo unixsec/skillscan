@@ -181,6 +181,10 @@ async def decide_review(
                 reviewer=session.subject,
                 reason=body.reason,
                 signer=runtime.signer,
+                # The score this decision writes is recomputed under the
+                # policy's `category_weights` (milestone C Task 5), so the
+                # policy this process has loaded has to come along.
+                policy=runtime.policy,
             )
     except InvalidDecisionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

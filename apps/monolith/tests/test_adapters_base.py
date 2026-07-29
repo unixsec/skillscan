@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
-from engine_runner.adapters.base import SubprocessEngineAdapter
+from engine_runner.adapters.base import EngineHadNothingInScope, SubprocessEngineAdapter
 from skillscan_core import (
     DetectionCategory,
     EngineCapability,
@@ -386,6 +386,70 @@ class TestFailClosedOnUnusableOutput:
         assert result.status is EngineStatus.OK
         assert result.usable
         assert result.findings == ()
+
+
+class TestNothingInScope:
+    """The third outcome, added 2026-07-29 after milestone C's engine-health
+    table showed `osv-scanner` returning ERROR on 100% of a real corpus while
+    behaving exactly as documented (exit 128, "No package sources found" - a
+    Skill package declares no dependency manifest for an SCA engine to read).
+    """
+
+    @staticmethod
+    def _nothing_in_scope_parse(
+        _completed: subprocess.CompletedProcess[bytes],
+        _target_dir: Path,
+        _files: dict[str, bytes],
+    ) -> tuple[Finding, ...]:
+        raise EngineHadNothingInScope("no package sources to scan")
+
+    def _adapter(self) -> SubprocessEngineAdapter:
+        return SubprocessEngineAdapter(
+            metadata=_metadata(),
+            build_argv=lambda _target_dir: [sys.executable, "-c", "pass"],
+            parse_output=self._nothing_in_scope_parse,
+        )
+
+    def test_maps_to_partial_not_error(self) -> None:
+        result = self._adapter().analyze({})
+        assert result.status is EngineStatus.PARTIAL
+
+    def test_is_usable_so_it_counts_as_the_engine_having_answered(self) -> None:
+        # `PARTIAL` is in `EngineResult.usable`'s allowed set, so a policy that
+        # requires this engine is satisfied by it. That is the intended
+        # reading: the engine ran and gave a definite answer about what it
+        # could see. It is NOT satisfied by the ERROR path, which is why this
+        # distinction cannot be left to the message text alone.
+        result = self._adapter().analyze({})
+        assert result.usable
+
+    def test_carries_the_reason_so_zero_findings_is_not_read_as_a_clean_audit(self) -> None:
+        # The whole point of not returning a bare `()`: something has to
+        # survive to `scan_engine_health.error` and the console, or PARTIAL
+        # with no findings is indistinguishable on screen from OK with none.
+        result = self._adapter().analyze({})
+        assert result.error is not None and "no package sources to scan" in result.error
+        assert result.findings == ()
+
+    def test_a_plain_exception_from_the_same_parser_is_still_error(self) -> None:
+        # Guards the handler ORDER in `analyze`: the new branch must catch
+        # exactly its own exception type and leave the blanket fail-closed
+        # handler in charge of everything else.
+        def exploding_parse(
+            _completed: subprocess.CompletedProcess[bytes],
+            _target_dir: Path,
+            _files: dict[str, bytes],
+        ) -> tuple[Finding, ...]:
+            raise RuntimeError("genuinely broken")
+
+        adapter = SubprocessEngineAdapter(
+            metadata=_metadata(),
+            build_argv=lambda _target_dir: [sys.executable, "-c", "pass"],
+            parse_output=exploding_parse,
+        )
+        result = adapter.analyze({})
+        assert result.status is EngineStatus.ERROR
+        assert not result.usable
 
 
 class TestPathEscapeDefenseInDepth:

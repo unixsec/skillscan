@@ -1299,6 +1299,121 @@ class TestSkillOwnership:
         assert "quarantin" not in response.json()["detail"].lower()
 
 
+class TestCrossScopeAttemptsAreCounted:
+    """Task 13 (2026-07-29): `cross_scope_access_attempts_total` (coding spec
+    §11.7) - one of the two security-named signals Task 12 found had no
+    production writer at all.
+
+    Every assertion here goes through a REAL `/metrics` scrape of the same
+    running app, not a direct read of the counter object: the failure mode
+    being guarded against is an `.inc()` on a line that never executes, and a
+    counter read in-process would not distinguish that from a working one any
+    better than reading the source would. Needs real MySQL/Redis (the app
+    fixture above) - VM only.
+    """
+
+    @staticmethod
+    async def _scrape(client: httpx.AsyncClient) -> float:
+        response = await client.get("/metrics")
+        assert response.status_code == 200
+        for line in response.text.splitlines():
+            if line.startswith("skillscan_cross_scope_access_attempts_total "):
+                return float(line.rsplit(" ", 1)[1])
+        raise AssertionError("cross_scope_access_attempts_total missing from /metrics output")
+
+    async def _submit_as_alice(self, app: FastAPI, client: httpx.AsyncClient) -> str:
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        tar_bytes = _make_tar_bytes(f"print({uuid.uuid4().hex!r})\n".encode())
+        response = await client.post(
+            "/v1/scans", files={"package": ("skill.tar", tar_bytes, "application/x-tar")}
+        )
+        return str(response.json()["scan_id"])
+
+    @pytest.mark.asyncio
+    async def test_reading_another_submitters_scan_moves_the_metric(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        scan_id = await self._submit_as_alice(app, client)
+        before = await self._scrape(client)
+
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "mallory", frozenset({"submitter"})
+        )
+        assert (await client.get(f"/v1/scans/{scan_id}")).status_code == 404
+
+        assert await self._scrape(client) == before + 1.0
+
+    @pytest.mark.asyncio
+    async def test_the_sarif_path_moves_it_too(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # The two IDOR checks are duplicated one path segment apart; an
+        # instrumentation gap on one of them is the same shape of defect as
+        # the authz gap the C2 fix closed.
+        scan_id = await self._submit_as_alice(app, client)
+        before = await self._scrape(client)
+
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "mallory", frozenset({"submitter"})
+        )
+        assert (await client.get(f"/v1/scans/{scan_id}/sarif")).status_code == 404
+
+        assert await self._scrape(client) == before + 1.0
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_scan_id_does_NOT_move_it(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # THE load-bearing negative. Both branches return an identical 404 by
+        # design, so if the counter sat on the wrong one - or on both - every
+        # stale bookmark and typo would read as an IDOR probe and the signal
+        # would be worthless. Nothing distinguishes them but the branch.
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "mallory", frozenset({"submitter"})
+        )
+        before = await self._scrape(client)
+
+        response = await client.get(f"/v1/scans/{uuid.uuid4()}")
+        assert response.status_code == 404
+
+        assert await self._scrape(client) == before
+
+    @pytest.mark.asyncio
+    async def test_an_authorized_read_does_NOT_move_it(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        scan_id = await self._submit_as_alice(app, client)
+        before = await self._scrape(client)
+
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "bob", frozenset({"approver"})
+        )
+        assert (await client.get(f"/v1/scans/{scan_id}")).status_code == 200
+
+        assert await self._scrape(client) == before
+
+    @pytest.mark.asyncio
+    async def test_a_plain_role_denial_does_NOT_move_it(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # A missing role is coarse RBAC, not an object-level attempt - see
+        # `SecurityMetrics.record_cross_scope_attempt`'s docstring for why
+        # folding it in would swamp the IDOR signal. Asserted here rather than
+        # in test_observability.py because "this code path does not increment"
+        # can only be shown where the code path actually runs.
+        before = await self._scrape(client)
+
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "mallory", frozenset({"submitter"})
+        )
+        response = await client.get("/v1/allowlist")
+        assert response.status_code == 403
+
+        assert await self._scrape(client) == before
+
+
 class TestObjectLevelAuthorization:
     @pytest.mark.asyncio
     async def test_other_submitter_cannot_read_scan(

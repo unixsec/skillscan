@@ -16,7 +16,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 VM=parallels@10.211.55.10
 VM_PATH=/home/parallels/skillscan
 
-echo "=== [1/8] static gates: ruff + mypy (the same three .ci/pipeline.yml runs) ==="
+echo "=== [1/9] static gates: ruff + mypy (the same three .ci/pipeline.yml runs) ==="
 # Deliberately run these HERE, on the Mac, before anything is shipped anywhere:
 # they need no MySQL/Redis/k3s, so CLAUDE.md's VM-only rule (which covers
 # deployment and integration testing) does not apply - and running them FIRST
@@ -30,7 +30,27 @@ uv run mypy
 # script's docstring for why ruff's banned-api cannot express this rule).
 python3 scripts/check_import_boundaries.py
 
-echo "=== [2/8] rsync working tree to VM ($VM_PATH) ==="
+# Detection-catalog drift, and it MUST run here rather than on the VM: the
+# authoritative 企业Skill安全评估测试维度清单.xlsx is gitignored and excluded from
+# the rsync below, so this Mac is the only machine that has it - and therefore
+# the only machine where it can be edited. `policies/detection_catalog.json` is
+# what every other environment validates test_item_ids against, so an edit to
+# the spreadsheet that never reached the manifest would leave two disagreeing
+# sources of truth with nothing to notice. `--check` fails if the spreadsheet
+# is missing too: silently passing on absence is exactly the defect that let
+# the catalog guard sit switched off on the VM for its whole life (milestone C
+# task 6).
+uv run python scripts/gen_detection_catalog.py --check
+
+echo "=== [2/9] rsync working tree to VM ($VM_PATH) ==="
+# `--exclude=*.xlsx` KEPT deliberately: the detection catalog is a binary
+# working document holding 62 items of security content, and it does not belong
+# on the VM. Its ids now travel instead as policies/detection_catalog.json -
+# generated, checked in, and drift-guarded in step 1 - which is what
+# tests/test_test_item_catalog.py reads. Until that manifest existed, this one
+# exclusion silently switched that guard off for every run on this VM.
+# (No comment lines inside the argument list below: a `#` after a `\`-joined
+# line terminates the whole rsync command.)
 rsync -az --delete \
   --exclude='.git' \
   --exclude='.venv' \
@@ -47,7 +67,7 @@ rsync -az --delete \
   --exclude='deploy_and_test_vm.sh' \
   ./ "$VM:$VM_PATH/"
 
-echo "=== [3/8] rebuild all 3 images on the VM ==="
+echo "=== [3/9] rebuild all 3 images on the VM ==="
 ssh "$VM" bash -s <<'REMOTE_BUILD'
 set -euo pipefail
 cd /home/parallels/skillscan
@@ -59,7 +79,7 @@ echo "--- web ---"
 docker build -f web/Dockerfile -t skillscan/web:dev .
 REMOTE_BUILD
 
-echo "=== [4/8] import images into k3s containerd + rollout restart ==="
+echo "=== [4/9] import images into k3s containerd + rollout restart ==="
 ssh "$VM" bash -s <<'REMOTE_IMPORT'
 set -euo pipefail
 for img in monolith engine-runner web; do
@@ -91,7 +111,7 @@ echo "--- pods after rollout ---"
 kubectl get pods -n skillscan -o wide
 REMOTE_IMPORT
 
-echo "=== [5/8] migrate the REAL k3s database (NOT the throwaway test pair) ==="
+echo "=== [5/9] migrate the REAL k3s database (NOT the throwaway test pair) ==="
 # Added 2026-07-28 after a schema change shipped without this. Step 8 migrates a
 # THROWAWAY database it creates itself, so the suite went 1103-green while the
 # deployed monolith logged 88 "Unknown column 'sandbox_wait_started_at'" errors
@@ -135,27 +155,27 @@ fi
 # does not crash - engines connect lazily, so the process starts healthy and only
 # that module's writes fail. `marketplace_api`'s audit write swallows its own
 # errors by design (it must never fail a poll), so the symptom is an empty audit
-# table on a system that looks fine. Run it, then VERIFY the users exist rather
-# than trusting the exit code.
-echo "--- applying least-privilege grants to the k3s database ---"
+# table on a system that looks fine.
+#
+# ORDERING CONSTRAINT (2026-07-29, milestone C correctness review N-1): this
+# step MUST follow the migration above and must never be skipped when the
+# migration ran. A migration that creates a table grants nothing, so between the
+# two the deployment has a schema its module users cannot write to. Milestone C
+# Task 8 is when that stopped being harmless: `scan_engine_health`'s INSERTs
+# live inside the transaction that scores EVERY scan, so a migrated-but-
+# ungranted database fails every decide, permanently and silently.
+#
+# The check below no longer asks "does the user exist" - a user can exist and
+# hold none of the grants a just-migrated schema needs, which is exactly this
+# failure. `--verify` (folded into setup_grants.py's normal run, and available
+# standalone for an out-of-band migration) asserts every manifest grant is
+# actually IN EFFECT, per user AND per host.
+echo "--- applying least-privilege grants to the k3s database, then verifying they took ---"
 SKILLSCAN_ADMIN_DB_DSN="mysql://root@127.0.0.1:13306/skillscan" uv run python3 db/setup_grants.py
-
-echo "--- verifying every module user in the manifest actually exists ---"
-missing=""
-for u in $(grep -oE '^\s{2}svc_[a-z_]+' policies/grants/manifest.yaml | tr -d ' :' | sort -u); do
-  found=$(mysql -uroot -h 127.0.0.1 -P 13306 -N -e \
-    "SELECT COUNT(*) FROM mysql.user WHERE user='$u';")
-  [ "$found" = "0" ] && missing="$missing $u"
-done
-if [ -n "$missing" ]; then
-  echo "!!! these module users are in the grants manifest but NOT in the database:$missing"
-  echo "!!! their modules will start fine and fail every write silently. Refusing to continue."
-  exit 1
-fi
-echo "--- all manifest users present"
+echo "--- every manifest grant is in effect"
 REMOTE_MIGRATE
 
-echo "=== [6/8] health check ==="
+echo "=== [6/9] health check ==="
 ssh "$VM" bash -s <<'REMOTE_HEALTH'
 set -euo pipefail
 # --field-selector=status.phase=Running: right after `rollout restart`, the
@@ -175,10 +195,37 @@ for path in ('/healthz', '/readyz'):
 "
 REMOTE_HEALTH
 
-echo "=== [7/8] sweep for stray dev processes that could race the test suite ==="
+echo "=== [7/9] NetworkPolicy posture of the LIVE namespace ==="
+# Added 2026-07-29, after TWO config drifts in one day that nothing could see.
+# `~/k8s/10-data.yaml` had lost the label mysql's and redis's policies select
+# on, and the deployed `monolith-ingress` had lost its `from` selector - so
+# anything in the namespace could reach the monolith on 8000, measured with an
+# unlabelled probe pod that read all 16 /metrics series. A task that same
+# morning had added `monolith-metrics-ingress` BECAUSE it checked that
+# `monolith-ingress` only allowed web: it had read the checked-in file, not the
+# cluster.
+#
+# Runs against the live namespace and nothing else - the throwaway environments
+# the test suite builds have no NetworkPolicy to check, which is precisely why
+# a green suite said nothing about either drift. See the script's own docstring
+# for why this asks whether the policies DO anything rather than comparing them
+# to deploy/networkpolicy/*.yaml (measured: 3 of 4 differences there are
+# legitimate on this VM, and a check that cries wolf is a check nobody runs).
+ssh "$VM" bash -s <<'REMOTE_NETPOL'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+cd /home/parallels/skillscan
+kubectl -n skillscan get networkpolicy -o json > /tmp/skillscan-netpol.json
+kubectl -n skillscan get pods -o json > /tmp/skillscan-pods.json
+python3 deploy/check_netpol_posture.py \
+  --from-json /tmp/skillscan-netpol.json /tmp/skillscan-pods.json
+rm -f /tmp/skillscan-netpol.json /tmp/skillscan-pods.json
+REMOTE_NETPOL
+
+echo "=== [8/9] sweep for stray dev processes that could race the test suite ==="
 ssh "$VM" "ps aux | grep -E 'run_local\.py|uvicorn' | grep -v grep || echo '(none found)'"
 
-echo "=== [8/8] fresh throwaway MySQL/Redis + full pytest suite ==="
+echo "=== [9/9] fresh throwaway MySQL/Redis + full pytest suite ==="
 ssh "$VM" bash -s <<'REMOTE_TEST'
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
@@ -217,11 +264,19 @@ SKILLSCAN_MIGRATION_DB_URL="mysql+aiomysql://root@localhost/skillscan" uv run al
 SKILLSCAN_ADMIN_DB_DSN="mysql://root@localhost/skillscan" uv run python3 db/setup_grants.py
 
 echo "--- full pytest suite ---"
+# `tests/` (the dependency-light kernel suite) is listed EXPLICITLY because
+# pyproject's testpaths is only `apps/monolith/tests`, so a bare pytest never
+# collected it here. That omission is half of why the detection-catalog guard
+# had never once executed on this VM (the other half was the rsync excluding
+# the .xlsx it used to read). Adding the path is what makes step 1's manifest
+# actually get checked against the live engine sources in the deployed
+# checkout - milestone C task 6.
+#
 # Capture rather than pipe: `... | tail` reports tail's exit code, not pytest's,
 # which historically made a failing suite look successful. Capturing also lets
 # the known-failure filter below inspect the actual FAILED lines.
 set +e
-pytest_out=$(uv run pytest apps/monolith/tests/ -q 2>&1)
+pytest_out=$(uv run pytest apps/monolith/tests/ tests/ -q 2>&1)
 pytest_rc=$?
 set -e
 echo "$pytest_out" | tail -100

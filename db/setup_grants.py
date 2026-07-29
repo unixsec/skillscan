@@ -10,10 +10,44 @@ so this script is runnable out of the box in a local test environment. Productio
 must set every `password_env` explicitly (sourced from Vault, coding spec §13) -
 this script does not enforce that itself since it has no way to distinguish a
 local dev run from a misconfigured production run.
+
+--verify (2026-07-29, milestone C correctness review N-1): reads the grants
+back and fails if any manifest entry is not actually in effect.
+
+THE HAZARD IT EXISTS FOR. `alembic upgrade head` and this script are two
+separate operations, and a migration that CREATEs a table nothing has granted
+yet leaves a deployment whose schema is current and whose privileges are not.
+Before milestone C that cost nothing user-visible: every table an existing
+module wrote to already carried its grant. Task 8 changed that - it added
+`scan_engine_health` and its INSERTs run inside the transaction that scores
+every scan, so on a database migrated without re-running this script, EVERY
+decide fails, permanently and identically, and the scan never gets a verdict.
+Nothing about that state announces itself: the pods start healthy (SQLAlchemy
+connects lazily and the grant is only tested by the INSERT).
+
+WHY VERIFICATION RATHER THAN AUTOMATION. Applying the manifest from alembic's
+`env.py` would make the bad order impossible, which is strictly stronger, and
+it was the first design. It was rejected: the two operations deliberately use
+DIFFERENT credentials (`SKILLSCAN_MIGRATION_DB_URL`, a SQLAlchemy async URL,
+vs `SKILLSCAN_ADMIN_DB_DSN`, a pymysql DSN), so coupling them means either
+translating one into the other - a new place for the parsing bugs this file's
+own comments already record three of - or requiring GRANT OPTION on the
+migration credential, which would make a legitimate DDL-only migration fail.
+It would also fire on `alembic upgrade` in offline/`--sql` mode, where there
+is no connection to grant through.
+
+So the ordering stays explicit and gets a check with teeth instead: the deploy
+script runs the migration, applies the manifest, and then asserts the manifest
+is IN EFFECT - which catches the grants never running, the grants running
+before the migration, and a manifest that was never told about a new table.
+The code-time half of the same defect (a migration adding a table nobody put
+in the manifest at all) is caught earlier and without any database, by
+`tests/test_grants_manifest.py`.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -112,7 +146,106 @@ def apply_manifest(
     connection.commit()
 
 
+#: `GRANT ALL` expands server-side into MySQL's full per-table privilege list,
+#: whose exact membership is a server-version detail. Rather than pin that list,
+#: verification probes the four privileges "ALL" unambiguously implies on every
+#: MySQL 8: all four are present if the GRANT landed, and all four are absent if
+#: it did not, which is the only distinction --verify needs to draw.
+_ALL_PRIVILEGE_PROBE: tuple[str, ...] = ("SELECT", "INSERT", "UPDATE", "DELETE")
+
+#: One expected/observed grant: (user, host, object, privilege). `object` is a
+#: table name, or "*" for a database-scoped privilege (LOCK TABLES).
+Grant = tuple[str, str, str, str]
+
+
+def _privilege_names(privileges: str | list[str]) -> tuple[str, ...]:
+    if privileges == "ALL":
+        return _ALL_PRIVILEGE_PROBE
+    if isinstance(privileges, list):
+        return tuple(p.upper() for p in privileges)
+    raise ValueError(f"invalid privilege spec: {privileges!r}")
+
+
+def expected_grants(manifest: dict) -> frozenset[Grant]:
+    """Every grant the manifest asks for, PER HOST.
+
+    Per host, not unioned across hosts, deliberately: `_GRANT_HOSTS` exists
+    because a user granted only at '@localhost' is invisible to a driver
+    connecting over TCP (see its comment - that cost a full debugging session
+    once already). A check that accepted "granted from at least one host" would
+    call exactly that half-applied state healthy.
+
+    Pure - no database connection, so `tests/test_grants_manifest.py` can
+    exercise the comparison on this machine.
+    """
+    expected: set[Grant] = set()
+    for username, spec in manifest["users"].items():
+        for host in _GRANT_HOSTS:
+            for table, privileges in (spec.get("tables") or {}).items():
+                for privilege in _privilege_names(privileges):
+                    expected.add((username, host, table, privilege))
+            for db_privilege in spec.get("database_privileges", []):
+                expected.add((username, host, "*", db_privilege.upper()))
+    return frozenset(expected)
+
+
+def missing_grants(manifest: dict, granted: frozenset[Grant]) -> tuple[str, ...]:
+    """Human-readable descriptions of manifest grants that are NOT in effect.
+    Empty means the manifest is fully applied. Pure."""
+    return tuple(
+        f"{privilege} ON {obj} TO '{user}'@'{host}'"
+        for user, host, obj, privilege in sorted(expected_grants(manifest) - granted)
+    )
+
+
+def _split_grantee(grantee: str) -> tuple[str, str]:
+    """`'svc_gate'@'localhost'` -> `('svc_gate', 'localhost')`."""
+    user, _, host = grantee.partition("@")
+    return user.strip().strip("'"), host.strip().strip("'")
+
+
+def fetch_granted(connection: pymysql.connections.Connection, database: str) -> frozenset[Grant]:
+    """What MySQL actually grants on `database` right now."""
+    granted: set[Grant] = set()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE "
+            "FROM information_schema.TABLE_PRIVILEGES WHERE TABLE_SCHEMA = %s",
+            (database,),
+        )
+        for grantee, table, privilege in cursor.fetchall():
+            user, host = _split_grantee(grantee)
+            granted.add((user, host, table, privilege.upper()))
+        # Database-scoped grants (LOCK TABLES) live in a different view -
+        # `GRANT ... ON db.*` never appears in TABLE_PRIVILEGES at all.
+        cursor.execute(
+            "SELECT GRANTEE, PRIVILEGE_TYPE "
+            "FROM information_schema.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA = %s",
+            (database,),
+        )
+        for grantee, privilege in cursor.fetchall():
+            user, host = _split_grantee(grantee)
+            granted.add((user, host, "*", privilege.upper()))
+    return frozenset(granted)
+
+
+def verify_manifest_applied(
+    connection: pymysql.connections.Connection, manifest: dict, database: str
+) -> tuple[str, ...]:
+    """Read the grants back and return what is missing. See this module's
+    docstring for the deployment hazard this closes."""
+    return missing_grants(manifest, fetch_granted(connection, database))
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="only check that the manifest is already in effect; apply nothing",
+    )
+    args = parser.parse_args()
+
     manifest_path = Path(__file__).resolve().parent.parent / "policies" / "grants" / "manifest.yaml"
     manifest = load_manifest(manifest_path)
 
@@ -147,10 +280,33 @@ def main() -> int:
         host=host or "localhost", port=port, user=user, password=password, database=database
     )
     try:
-        print(f"Applying {manifest_path} to database {database!r}...")
-        apply_manifest(connection, manifest, database)
+        if not args.verify:
+            print(f"Applying {manifest_path} to database {database!r}...")
+            apply_manifest(connection, manifest, database)
+        # Verified even on the apply path, not only under --verify: this file
+        # already records two bugs where apply_manifest ran to completion and
+        # granted something other than what was asked for (the '@localhost'
+        # socket special-case, the mogrify '%' collision). "The script exited 0"
+        # has never been the same claim as "the manifest is in effect".
+        print(f"Verifying {manifest_path} is in effect on database {database!r}...")
+        missing = verify_manifest_applied(connection, manifest, database)
     finally:
         connection.close()
+
+    if missing:
+        print(
+            f"!!! {len(missing)} grant(s) in the manifest are NOT in effect on {database!r}.",
+            file=sys.stderr,
+        )
+        print(
+            "!!! A module whose grant is missing does not crash - it starts healthy and "
+            "fails only when it writes. If a migration just added a table, this is that "
+            "table's grant: run this script without --verify.",
+            file=sys.stderr,
+        )
+        for description in missing:
+            print(f"  MISSING: GRANT {description}", file=sys.stderr)
+        return 1
     print("Done.")
     return 0
 

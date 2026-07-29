@@ -33,9 +33,16 @@ from pathlib import Path
 from common.log import get_logger
 from skillscan_core import EngineMetadata, EngineResult, EngineStatus, Finding, ScanMode
 
+from engine_runner.timeouts import DEFAULT_ENGINE_TIMEOUT_S
+
 _logger = get_logger("skillscan.engine_runner.adapter")
 
-_DEFAULT_TIMEOUT_S = 60.0
+# The former `_DEFAULT_TIMEOUT_S = 60.0` now lives in `engine_runner.timeouts`
+# as `DEFAULT_ENGINE_TIMEOUT_S` (milestone C Task 4), with the same value: the
+# fallback for an engine that has neither a deployment override nor a built-in
+# per-engine default. It moved so that "what timeout does this engine get" has
+# exactly one answer, instead of a constant here plus a single-engine
+# environment variable read in main.py.
 
 # `parse_output(completed, target_dir, files)` - the full CompletedProcess
 # (stdout/stderr/returncode), the temp dir the scanned files were materialized
@@ -48,6 +55,31 @@ _DEFAULT_TIMEOUT_S = 60.0
 ParseOutput = Callable[
     [subprocess.CompletedProcess[bytes], Path, dict[str, bytes]], tuple[Finding, ...]
 ]
+
+
+class EngineHadNothingInScope(Exception):
+    """The engine ran to completion and correctly found nothing it could
+    examine - NOT a failure, and NOT a clean scan either.
+
+    The third answer this class previously could not express. `parse_output`
+    had exactly two outcomes: return findings (-> `EngineStatus.OK`, "I
+    examined this package") or raise (-> `EngineStatus.ERROR`, "I could not
+    complete"). An engine handed input outside its own domain fits neither,
+    and forcing it into one of them is a lie in whichever direction it is
+    forced: OK-with-zero-findings claims a check that never happened (exactly
+    the false negative this module's docstring exists to prevent), and ERROR
+    reports a broken engine that is in fact working perfectly.
+
+    Maps to `EngineStatus.PARTIAL` - "degraded success" - which
+    `EngineResult.usable` already accepts and which
+    `orchestration.engine_health.FAILED_ENGINE_STATUSES` already, deliberately,
+    excludes from the failure count. The console has rendered `partial` since
+    Task 10. Nothing downstream needed teaching; the state was always there and
+    nothing raised it.
+
+    RAISE THIS ONLY for "this input has nothing for me", never for "I could not
+    read the input" - the second is an error and must stay one.
+    """
 
 
 class SubprocessEngineAdapter:
@@ -67,7 +99,7 @@ class SubprocessEngineAdapter:
         build_argv: Callable[[Path], Sequence[str]],
         parse_output: ParseOutput,
         env: dict[str, str] | Callable[[], dict[str, str]] | None = None,
-        timeout_s: float = _DEFAULT_TIMEOUT_S,
+        timeout_s: float = DEFAULT_ENGINE_TIMEOUT_S,
         treat_nonzero_exit_as_error: bool = True,
         run_in_target_dir: bool = False,
     ) -> None:
@@ -189,6 +221,15 @@ class SubprocessEngineAdapter:
 
             try:
                 findings = self._parse_output(completed, target_dir, files)
+            except EngineHadNothingInScope as exc:
+                # Deliberately BEFORE the blanket handler below - this is the
+                # one exception that is not a failure, and it must not be
+                # swallowed into ERROR by the `except Exception` that follows.
+                _logger.info(
+                    "engine had nothing in scope",
+                    extra={"context": {"engine": self._metadata.name, "reason": str(exc)}},
+                )
+                return self._nothing_in_scope(str(exc))
             except Exception as exc:  # noqa: BLE001 - any parse failure must fail-closed, not propagate
                 _logger.exception(
                     "engine output failed to parse",
@@ -209,6 +250,21 @@ class SubprocessEngineAdapter:
             engine=self._metadata,
             findings=(),
             status=status,
+            scan_mode=ScanMode.STATIC,
+            llm_used=False,
+            error=reason,
+        )
+
+    def _nothing_in_scope(self, reason: str) -> EngineResult:
+        # Same empty findings tuple as `_unusable`, deliberately a DIFFERENT
+        # status: `PARTIAL` is usable, so this result counts as the engine
+        # having answered. `error` still carries the reason - the column is the
+        # only place the console can show WHY zero findings is not the same
+        # claim as a clean scan, and nothing constrains it to failures.
+        return EngineResult(
+            engine=self._metadata,
+            findings=(),
+            status=EngineStatus.PARTIAL,
             scan_mode=ScanMode.STATIC,
             llm_used=False,
             error=reason,

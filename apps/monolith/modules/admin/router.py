@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from common.log import get_logger
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -39,6 +39,12 @@ from monolith.modules.gateway.auth.middleware import (
 from monolith.modules.gateway.auth.rbac import KNOWN_ROLES
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
+from monolith.modules.orchestration.engine_health import (
+    DEFAULT_WINDOW_SCANS,
+    MAX_WINDOW_SCANS,
+    EngineHealthSummary,
+    load_recent_engine_health,
+)
 from monolith.modules.orchestration.floor import floor_engine_names
 
 from . import accounts_service, breakglass, local_auth
@@ -54,6 +60,9 @@ from .engine_registry import (
     known_engine_names,
     known_engine_rows,
     list_disabled_engines,
+    llm_unconfigured_engine_names,
+    not_reported_attribution,
+    not_reported_attribution_basis,
     set_engine_enabled,
 )
 from .models import GroupRoleMappingRow, LocalAccountRow
@@ -103,6 +112,120 @@ async def list_engines(
     disabled = await list_disabled_engines(runtime.redis)
     return {
         "engines": known_engine_rows(runtime.engine_metadatas, required=required, disabled=disabled)
+    }
+
+
+def _engine_health_to_dict(
+    summary: EngineHealthSummary, *, disabled: frozenset[str], llm_unconfigured: frozenset[str]
+) -> dict[str, Any]:
+    attribution = (
+        not_reported_attribution(
+            summary.engine_name,
+            disabled=disabled,
+            llm_unconfigured=llm_unconfigured,
+            # The engine-runner's own evidence, from this same window. Without
+            # it the LLM branch is free to contradict the failure count printed
+            # beside it - see that function's docstring for the deployment where
+            # it did, and for the split-brain shape this evidence cannot reach.
+            reported_in_window=summary.counts.reported,
+        )
+        if summary.last_report_state == "not_reported"
+        else None
+    )
+    return {
+        "name": summary.engine_name,
+        "observed_scans": summary.observed_scans,
+        "counts": {
+            "ok": summary.counts.ok,
+            "partial": summary.counts.partial,
+            "error": summary.counts.error,
+            "not_reported": summary.counts.not_reported,
+            "unreadable": summary.counts.unreadable,
+        },
+        "last_scan_id": summary.last_scan_id,
+        "last_recorded_at": summary.last_recorded_at.isoformat(),
+        # THE acceptance-criterion-8 pair, kept as two fields all the way to
+        # the browser: `report_state` is whether we heard anything at all,
+        # `engine_status` is what the engine said. "returned ERROR" is
+        # ("reported", "error"); "never reported at all" is ("not_reported",
+        # null). Merging them into one status string here would undo the
+        # column split Task 8 enforced with a DB CHECK constraint.
+        "last_report_state": summary.last_report_state,
+        "last_engine_status": summary.last_engine_status,
+        # Task 7's three states, forwarded verbatim. `null` is NOT MEASURED and
+        # `0` is a real sub-millisecond measurement; no default is substituted
+        # here, and the console renders them differently.
+        "last_analyze_duration_ms": summary.last_analyze_duration_ms,
+        "max_analyze_duration_ms": summary.max_analyze_duration_ms,
+        "measured_duration_count": summary.measured_duration_count,
+        "last_finding_count": summary.last_finding_count,
+        "last_error": summary.last_error,
+        # Only ever non-null for a `not_reported` last row, and only for the
+        # two causes with a source this process can read - see
+        # `engine_registry.not_reported_attribution`.
+        "not_reported_attribution": attribution,
+        # The qualifier, ON THE WIRE beside the token rather than only in the
+        # console's translated hints (2026-07-29): `currently_disabled` alone
+        # reads to any other consumer as a fact about the scan it is attached
+        # to, and it is not one. Both tokens are configuration read at REQUEST
+        # time; nothing here recorded the configuration those scans ran under.
+        "not_reported_attribution_basis": not_reported_attribution_basis(attribution),
+    }
+
+
+@router.get("/engines/health")
+async def get_engine_health(
+    scans: int = Query(default=DEFAULT_WINDOW_SCANS, ge=1, le=MAX_WINDOW_SCANS),
+    session: SessionContext = Depends(_admin_only),
+    runtime: ScanRuntime = Depends(_get_scan_runtime),
+) -> dict[str, Any]:
+    """Per-engine recent status, duration and failure counts (milestone C Task
+    10, design §9.7/§9.8).
+
+    A SEPARATE endpoint from `GET /engines`, not extra fields on it, for one
+    operational reason: that listing drives the enable/disable buttons, and an
+    admin must still be able to switch an engine off when the orchestration
+    database is unreachable. Folding a DB read into it would make a telemetry
+    outage look like a broken engine console.
+
+    Reads through `orchestration_session_factory` - `scan_engine_health` is
+    orchestration's own table and `svc_orchestration` already holds the grant.
+    Deliberately NOT a new `svc_admin` GRANT: `db/setup_grants.py` is additive
+    with no REVOKE, so a grant issued here could never be taken back off a dev
+    database, and Task 8 left that decision open on exactly those terms.
+    """
+    async with runtime.orchestration_session_factory() as orchestration_session:
+        report = await load_recent_engine_health(orchestration_session, requested_scans=scans)
+    disabled = await list_disabled_engines(runtime.redis)
+    llm_unconfigured = llm_unconfigured_engine_names(
+        sandbox_llm_configured=runtime.sandbox_llm_configured
+    )
+    known = known_engine_names(runtime.engine_metadatas)
+    return {
+        "window": {
+            "requested_scans": report.window.requested_scans,
+            "observed_scans": report.window.observed_scans,
+            "started_at": (
+                None if report.window.started_at is None else report.window.started_at.isoformat()
+            ),
+            "ended_at": (
+                None if report.window.ended_at is None else report.window.ended_at.isoformat()
+            ),
+        },
+        "engines": [
+            _engine_health_to_dict(summary, disabled=disabled, llm_unconfigured=llm_unconfigured)
+            for summary in report.engines
+        ],
+        # Health rows for names this deployment no longer lists. Normally
+        # empty; non-empty means either a decommissioned engine still inside
+        # the retention window (benign, and worth seeing) or a row written
+        # under a `vendor/engines.lock.yaml` key instead of a runtime name -
+        # the namespace defect milestone C exists to close, which would
+        # otherwise be invisible because the console joins by name and a
+        # mis-keyed row simply never matches anything.
+        "unregistered_engines": sorted(
+            summary.engine_name for summary in report.engines if summary.engine_name not in known
+        ),
     }
 
 
