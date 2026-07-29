@@ -148,6 +148,30 @@ class TestAggregate(unittest.TestCase):
         result = scan_result_from_findings([], policy, engine_status=EngineStatus.ERROR)
         self.assertFalse(result.required_ok)
 
+    def test_a_required_engine_with_nothing_in_scope_still_satisfies_required_ok(self) -> None:
+        """PINNED, not endorsed (2026-07-29 honesty review).
+
+        `EngineResult.usable` accepts PARTIAL, and `aggregate` derives
+        `required_ok` from the same set - so a REQUIRED engine reporting "I ran
+        and there was nothing here I could examine" counts as INV-1's floor
+        backstop being met by an engine that examined nothing.
+
+        It cannot happen today: the shipped policy requires exactly the floor
+        set (asserted in `test_engine_tier_registry.py`) and PARTIAL has one
+        producer, `SubprocessEngineAdapter._nothing_in_scope`, which no
+        in-process floor detector goes through. PARTIAL only became producible
+        at all in milestone C, which is why this is written down now rather
+        than discovered later from a PASS nobody can explain.
+
+        This test asserts the CURRENT behaviour on purpose. If a future change
+        makes it fail, that change is either the deliberate tightening
+        `scoring.aggregate`'s comment describes - in which case update this -
+        or an accident, in which case it just caught one."""
+        policy = default_policy()
+        result = scan_result_from_findings([], policy, engine_status=EngineStatus.PARTIAL)
+        self.assertTrue(result.required_ok)
+        self.assertEqual(result.missing_or_failed_required, ())
+
     def test_findings_capped_and_pre_cap_hard_gate_preserved(self) -> None:
         policy = default_policy(hard_gate_rules=frozenset({"gate.hit"}))
         filler = [

@@ -19,9 +19,8 @@ test_item_id mapping (2026-07-27 hardening, D7): this adapter used to pass
 bandit's own `test_id` (e.g. "B608") straight through to `test_item_id`
 whenever it wasn't one of the two originally-mapped groups below - a raw
 engine id never matches a detection-catalog id, so every one of those
-findings counted as UNCOVERED in any report keyed on the catalog (the
-systemic problem `doc/devfile/oss-vs-custom-report.html` documented
-2026-07-09). Fixed two ways: (1) the two pre-existing groups were themselves
+findings counted as UNCOVERED in any report keyed on the catalog - the
+systemic problem the 2026-07-09 capability audit identified. Fixed two ways: (1) the two pre-existing groups were themselves
 mislabelled (CODE-12 is "进程创建"/process creation in the catalog, not weak
 crypto; FILE-04 is "任意文件读取"/arbitrary file read, not TOCTOU/symlink) -
 corrected to CODE-10/FILE-06. (2) added explicit groups for the common

@@ -183,6 +183,15 @@ class EngineResult:
     @property
     def usable(self) -> bool:
         # SECURITY: ERROR/TIMEOUT results are never usable - fail-closed at the source.
+        #
+        # PARTIAL IS ACCEPTED, and this property has a second reader that makes
+        # that more than a findings-inclusion decision: `scoring.aggregate`
+        # computes `required_ok` from the same set, so a REQUIRED engine
+        # reporting "nothing in scope" (the only thing PARTIAL means today -
+        # `SubprocessEngineAdapter._nothing_in_scope`) would satisfy INV-1's
+        # floor backstop having examined nothing. Inert on two conditions that
+        # hold today; see the comment at that call site before widening either
+        # this status set or `required_engines`.
         return self.status in (EngineStatus.OK, EngineStatus.PARTIAL)
 
 

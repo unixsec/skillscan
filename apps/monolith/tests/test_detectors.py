@@ -516,8 +516,8 @@ def test_ruleset_digest_changes_when_module_confidence_changes(
 
 # SECURITY (D7, 2026-07-27): the detection-catalog test_item_id on each finding
 # is what compliance reporting counts by - a mislabelled id makes real,
-# working coverage look absent (see doc/devfile/oss-vs-custom-report.html's
-# 2026-07-09 capability audit). `_all_floor_findings` runs every floor
+# working coverage look absent, as the 2026-07-09 capability audit found.
+# `_all_floor_findings` runs every floor
 # in-house detector (the same six covered by
 # `test_floor_detectors_honour_an_expired_deadline` above) against one fixture
 # and pools their findings so a single parametrized test can check each

@@ -85,6 +85,27 @@ def aggregate(
     # somehow being bypassed upstream (e.g. deserialized data).
     safe_results = tuple(r for r in engine_results if not r.engine.requires_network)
 
+    # LATENT, and recorded here rather than fixed (2026-07-29 honesty review).
+    # `usable` accepts PARTIAL as well as OK (models.EngineResult.usable), so a
+    # REQUIRED engine answering "I ran, and there was nothing here I could
+    # examine" satisfies `required_ok` with zero findings - INV-1's floor
+    # backstop counted as met by an engine that examined nothing.
+    #
+    # Inert today, on TWO conditions, neither of which this expression checks:
+    #   1. `policies/gate/v1.yaml`'s `required_engines` is exactly the floor set
+    #      (`test_engine_tier_registry.py` asserts that equality), and
+    #   2. PARTIAL has exactly one producer - `SubprocessEngineAdapter.
+    #      _nothing_in_scope`, used only by sandbox engines. No in-process floor
+    #      detector can reach it, and osv-scanner (the engine that made PARTIAL
+    #      producible at all, this milestone) cannot be required.
+    #
+    # Left as-is deliberately: tightening this to OK-only would change a
+    # FAIL-CLOSED gate's semantics, and the case it would newly block - a
+    # required engine legitimately finding nothing in scope - does not exist yet
+    # and cannot be reasoned about from an example nobody has. If a floor
+    # detector ever grows a nothing-in-scope path, or a PARTIAL-capable engine
+    # is ever added to `required_engines`, revisit HERE first: INV-1 is
+    # fail-closed by design and this is the line that would quietly stop being.
     present_and_usable = {r.engine.name for r in safe_results if r.usable}
     missing_or_failed = tuple(
         sorted(name for name in policy.required_engines if name not in present_and_usable)

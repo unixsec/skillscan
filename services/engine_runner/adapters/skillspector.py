@@ -3,9 +3,9 @@
 test_item_id mapping (2026-07-27 hardening, D7): `test_item_id=ruleId` used to
 pass skillspector's own SARIF ruleId (e.g. "TP1", "P1", "PE3") straight
 through - a raw engine id never matches a detection-catalog id, so every one
-of those findings counted as UNCOVERED in any report keyed on the catalog
-(the systemic problem `doc/devfile/oss-vs-custom-report.html` documented
-2026-07-09). `_TEST_ITEM_ID_BY_RULE_ID` below now classifies every ruleId
+of those findings counted as UNCOVERED in any report keyed on the catalog -
+the systemic problem the 2026-07-09 capability audit identified.
+`_TEST_ITEM_ID_BY_RULE_ID` below now classifies every ruleId
 this adapter has a fixed, confirmed label for (the same set `_RULE_ID_TITLES`
 covers, per the vendored static analyzers) into its real catalog entry;
 anything not in the table - including every LLM-driven free-text ruleId,
