@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { LOCALE_STORAGE_KEY, TRANSLATIONS, type Locale } from './translations'
+import { LOCALE_STORAGE_KEY, makeTranslate, type Locale } from './translations'
 
 const HTML_LANG: Record<Locale, string> = { zh: 'zh-CN', en: 'en' }
 
@@ -16,13 +16,6 @@ function readInitialLocale(): Locale {
   return stored === 'en' ? 'en' : 'zh' // SECURITY-irrelevant UX default: Chinese
 }
 
-function interpolate(template: string, params?: Record<string, string | number>): string {
-  if (!params) return template
-  return template.replace(/\{(\w+)\}/g, (match, key: string) =>
-    key in params ? String(params[key]) : match,
-  )
-}
-
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [locale, setLocaleState] = useState<Locale>(readInitialLocale)
 
@@ -35,11 +28,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(LOCALE_STORAGE_KEY, next)
   }
 
-  const t = useMemo(() => {
-    const dict = TRANSLATIONS[locale]
-    return (key: string, params?: Record<string, string | number>) =>
-      interpolate(dict[key] ?? key, params)
-  }, [locale])
+  const t = useMemo(() => makeTranslate(locale), [locale])
 
   return <I18nCtx.Provider value={{ locale, setLocale, t }}>{children}</I18nCtx.Provider>
 }

@@ -612,7 +612,7 @@ async def login_breakglass(
         max_age_s=breakglass.BREAKGLASS_SESSION_TTL_S,
     )
     csrf_token = generate_csrf_token()
-    set_csrf_cookie(response, csrf_token, max_age_s=breakglass.BREAKGLASS_SESSION_TTL_S)
+    set_csrf_cookie(response, csrf_token)
 
     # SECURITY (§16.3): full audit + SecOps alert on every LOGIN too, not just
     # activation - a break-glass session being USED is exactly as significant
@@ -663,7 +663,7 @@ async def login_local(
         max_age_s=local_auth.LOCAL_SESSION_TTL_S,
     )
     csrf_token = generate_csrf_token()
-    set_csrf_cookie(response, csrf_token, max_age_s=local_auth.LOCAL_SESSION_TTL_S)
+    set_csrf_cookie(response, csrf_token)
 
     # SECURITY (§16.3 precedent): full audit on every local-account login too,
     # same posture as break-glass logins.

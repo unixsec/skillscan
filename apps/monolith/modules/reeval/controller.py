@@ -114,27 +114,57 @@ def build_rescan_job(
 async def list_published_toolchain_statuses(
     session: AsyncSession,
 ) -> Sequence[PublishedToolchainStatus]:
-    """SECURITY: read-only (svc_reeval: skill/skill_version [SELECT]). One row
-    per skill_version - a skill with multiple historical content_hash
-    versions on record appears once per version, since scanning/rescanning is
-    inherently content-addressable (INV-6), not skill_id-addressable."""
+    """SECURITY: read-only (svc_reeval: skill/skill_version [SELECT]). ONE row
+    per skill - its CURRENT (most recently registered) version.
+
+    2026-07-29 (milestone F Task 11 follow-up I4): this used to be one row per
+    skill_VERSION, on the reasoning that rescanning is content-addressable
+    (INV-6) rather than skill_id-addressable. That was harmless only because a
+    skill could never have more than one version - `"submitted"` appeared 0
+    times as a target in `lifecycle.VALID_TRANSITIONS`, so no v2 could exist.
+    Task 11 removed that lockout, and with it the join started fanning out
+    over every version a skill had ever had: `POST /v1/reeval/{skill_id}`
+    queued a rescan of every historical package, and `GET /v1/reeval` reported
+    a staleness row for each. Re-evaluation exists to re-apply CURRENT
+    detection to what is live, not to resurrect superseded content.
+
+    "Current" is the newest `skill_version.created_at`, the same definition
+    `reeval.router._drift_summary` already uses when it resolves a skill's
+    `latest_content_hash`. A lifecycle-state filter would be more precise
+    still, but `skill_lifecycle_event` is deliberately outside svc_reeval's
+    grants (policies/grants/manifest.yaml) and widening them for this is not
+    worth the blast radius.
+
+    Collapsed in Python (`ORDER BY created_at DESC` + `setdefault`) rather
+    than with a window function - the same idiom `worker.sync_lifecycle_tick`
+    uses on `skill_lifecycle_event`, and the row count here is one per skill
+    version in the whole inventory. `content_hash` is the secondary sort key
+    purely so an exact `created_at` tie resolves deterministically rather than
+    by driver order; the column is `DATETIME(6)`, so that is a tiebreak for
+    completeness, not an expected case.
+    """
     result = await session.execute(
         select(
             SkillReadOnly.skill_id,
             SkillReadOnly.trust_tier,
             SkillVersionReadOnly.content_hash,
             SkillVersionReadOnly.toolchain_digest,
-        ).join(SkillVersionReadOnly, SkillVersionReadOnly.skill_id == SkillReadOnly.skill_id)
-    )
-    return tuple(
-        PublishedToolchainStatus(
-            skill_id=row.skill_id,
-            trust_tier=TrustTier(row.trust_tier),
-            content_hash=row.content_hash,
-            recorded_toolchain_digest=row.toolchain_digest,
         )
-        for row in result
+        .join(SkillVersionReadOnly, SkillVersionReadOnly.skill_id == SkillReadOnly.skill_id)
+        .order_by(SkillVersionReadOnly.created_at.desc(), SkillVersionReadOnly.content_hash.asc())
     )
+    latest_by_skill: dict[str, PublishedToolchainStatus] = {}
+    for row in result:  # newest first - first hit per skill wins
+        latest_by_skill.setdefault(
+            str(row.skill_id),
+            PublishedToolchainStatus(
+                skill_id=row.skill_id,
+                trust_tier=TrustTier(row.trust_tier),
+                content_hash=row.content_hash,
+                recorded_toolchain_digest=row.toolchain_digest,
+            ),
+        )
+    return tuple(latest_by_skill.values())
 
 
 async def trigger_rescans(

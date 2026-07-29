@@ -65,6 +65,99 @@ SESSION_COOKIE_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# SECURITY/BUG (2026-07-29): how long the CSRF cookie lives, deliberately
+# DECOUPLED from the lifetime of whichever session minted it.
+#
+# There are four session cookie names but only ONE csrf_token cookie name, so
+# every login overwrites the previous login's CSRF cookie - value AND expiry.
+# When each login stamped the CSRF cookie with its own session's TTL, a 900s
+# break-glass login on top of an 8h local/SAML/OIDC session left that 8h
+# session holding a CSRF cookie that expired in 15 minutes. After it did, the
+# survivor's GETs still worked (CSRF only guards state-changing methods) and
+# EVERY write returned 403: a console the user can browse but cannot save
+# anything in, with nothing pointing at the cause. Same family as the cookie
+# enumeration gap in docs/MAINTENANCE_GUIDE.md §4.2 - one hardcoded cookie
+# name assuming every session type is the same thing.
+#
+# The invariant that has to hold is "a readable CSRF cookie exists for as long
+# as ANY session cookie does". Because every login writes both cookies in the
+# same response, that reduces to: this value >= every session TTL. It is set
+# well above the longest one (8h) rather than equal to it so that raising a
+# session TTL - SKILLSCAN_LOCAL_SESSION_TTL_S or
+# SKILLSCAN_BREAKGLASS_SESSION_TTL_S, both env-overridable - does not silently
+# reintroduce the bug.
+#
+# ENFORCED, not just documented (2026-07-29, milestones E+F review). Both
+# env-overridable TTLs go through `session_ttl_from_env` below, which REFUSES a
+# value above this ceiling at import. Until then the only thing standing behind
+# this comment was test_middleware.py's TestCsrfCookieOutlivesEverySessionType,
+# which discovers those same module attributes - it read exactly what the code
+# read, so under CI defaults it could only ever compare 604800 against 28800
+# and 900, and an operator setting SKILLSCAN_LOCAL_SESSION_TTL_S=1209600
+# reintroduced the break-glass bug a0a0ba5 fixed with the suite green. That
+# discovery test still earns its keep for the HARDCODED TTLs (saml.py,
+# login_router.py), where the constant it reads really is the value shipped.
+#
+# Lengthening it costs nothing: a double-submit token is not a credential (see
+# set_csrf_cookie), it is a value the same-origin page must be able to READ.
+# A leftover one with no session cookie beside it authenticates nothing -
+# require_csrf exempts such a request and authentication then answers 401.
+CSRF_COOKIE_MAX_AGE_S = 604800  # 7d
+
+
+class SessionTtlTooLongError(RuntimeError):
+    """SECURITY: a configured session TTL outlives the shared CSRF cookie."""
+
+
+def session_ttl_from_env(var: str, default_s: int) -> int:
+    """Reads an env-overridable session TTL and REFUSES one that outlives the
+    shared CSRF cookie. Raises `SessionTtlTooLongError` at import time.
+
+    SECURITY/BUG (2026-07-29, milestones E+F review): the ceiling above was
+    documented as enforced by `test_middleware.py`'s
+    TestCsrfCookieOutlivesEverySessionType, and for the two env-driven TTLs it
+    was not enforced by anything at all. That test DISCOVERS the module
+    attributes `LOCAL_SESSION_TTL_S` and `BREAKGLASS_SESSION_TTL_S`, which are
+    themselves `int(os.environ.get(...))` evaluated at import - so it read
+    exactly what the code read, and under CI defaults could only ever compare
+    604800 against 28800 and 900. Setting SKILLSCAN_LOCAL_SESSION_TTL_S to
+    1209600 reintroduced the break-glass bug a0a0ba5 fixed, with the suite
+    fully green: a guard asserted against the constant the implementation
+    itself reads is not a guard.
+
+    Raising is the point, and it is deliberately not a clamp-and-warn. A
+    silently shortened session is the same class of confusing failure the
+    ceiling exists to prevent (the operator asked for 14 days and would get 7
+    with no signal); refusing to start names the misconfiguration while
+    someone is still looking at a terminal. It fires at IMPORT, so the process
+    cannot come up half-configured and fail later on a write.
+
+    The value is validated here rather than at each call site so a fifth
+    session type cannot be added with its own bespoke `int(os.environ.get(...))`
+    and no check - the same reasoning `set_csrf_cookie` uses for taking no
+    max_age parameter.
+    """
+    raw = os.environ.get(var)
+    if raw is None:
+        ttl_s = default_s
+    else:
+        try:
+            ttl_s = int(raw)
+        except ValueError as exc:
+            raise SessionTtlTooLongError(
+                f"{var}={raw!r} is not an integer number of seconds"
+            ) from exc
+    if ttl_s > CSRF_COOKIE_MAX_AGE_S:
+        raise SessionTtlTooLongError(
+            f"{var}={ttl_s}s outlives the shared CSRF cookie "
+            f"({CSRF_COOKIE_MAX_AGE_S}s). Every login overwrites the one "
+            f"`csrf_token` cookie, so such a session would keep working for "
+            f"reads and start failing every write with a bare 403 once that "
+            f"cookie expired. Lower the TTL, or raise CSRF_COOKIE_MAX_AGE_S "
+            f"above it first."
+        )
+    return ttl_s
+
 
 def request_has_session_cookie(request: Request) -> bool:
     """True if the request carries ANY cookie-authenticated session (see
@@ -120,15 +213,23 @@ def set_session_cookie(response: Response, *, name: str, value: str, max_age_s: 
     )
 
 
-def set_csrf_cookie(response: Response, token: str, *, max_age_s: int) -> None:
+def set_csrf_cookie(response: Response, token: str) -> None:
     # SECURITY: deliberately NOT HttpOnly - the frontend must be able to read
     # this value to echo it back in X-CSRF-Token. It carries no authentication
     # power on its own. Secure/SameSite follow the same env-driven policy as the
     # session cookie so both survive (or don't) together.
+    #
+    # There is deliberately NO max_age parameter: the lifetime is a property of
+    # the shared cookie name, not of the login that happens to be writing it
+    # (see CSRF_COOKIE_MAX_AGE_S). Taking a per-login TTL here is what let a
+    # 900s break-glass login expire an 8h session's CSRF cookie out from under
+    # it. Removing the parameter is also what makes "every login path is
+    # covered" a fact mypy checks rather than something someone has to
+    # remember - a login path that missed this fix would not compile.
     response.set_cookie(
         key=CSRF_COOKIE_NAME,
         value=token,
-        max_age=max_age_s,
+        max_age=CSRF_COOKIE_MAX_AGE_S,
         httponly=False,
         secure=_cookie_secure(),
         samesite=_cookie_samesite(),

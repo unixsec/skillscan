@@ -50,6 +50,7 @@ from .middleware import (
 from .oidc import AuthorizationRequestState, OidcError, begin_authorization, complete_authorization
 from .rbac import resolve_roles
 from .saml import (
+    SAML_SESSION_TTL_S,
     SamlError,
     SamlRequestTracker,
     build_request_data,
@@ -195,7 +196,7 @@ async def oidc_callback(
         max_age_s=_OIDC_SESSION_COOKIE_TTL_S,
     )
     csrf_token = generate_csrf_token()
-    set_csrf_cookie(response, csrf_token, max_age_s=_OIDC_SESSION_COOKIE_TTL_S)
+    set_csrf_cookie(response, csrf_token)
     return {"status": "ok", "subject": identity.subject}
 
 
@@ -258,10 +259,20 @@ async def saml_acs(request: Request, response: Response) -> dict[str, str]:
         response,
         name=SAML_SESSION_COOKIE_NAME,
         value=session_token,
-        max_age_s=28800,  # matches saml.py's SAML_SESSION_TTL_S
+        # The CONSTANT, not a copy of its value (2026-07-29, milestones E+F
+        # review). This read `28800  # matches saml.py's SAML_SESSION_TTL_S`,
+        # and the two were kept in agreement by that comment alone: the Redis
+        # session record is created with `SAML_SESSION_TTL_S` while the cookie
+        # carrying it got a literal, so changing the constant would have
+        # silently desynchronized them - the cookie outliving the session
+        # (requests failing with a cookie present) or dying before it (a live
+        # session the browser stops sending). Worse, the discovery test in
+        # test_middleware.py reads the CONSTANT, so it would have kept
+        # validating a number this line no longer used.
+        max_age_s=SAML_SESSION_TTL_S,
     )
     csrf_token = generate_csrf_token()
-    set_csrf_cookie(response, csrf_token, max_age_s=28800)
+    set_csrf_cookie(response, csrf_token)
     return {"status": "ok", "subject": identity.name_id}
 
 

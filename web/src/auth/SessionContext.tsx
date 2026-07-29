@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { api, ApiError } from '../api/client'
+import { api, ApiError, setSessionExpiredListener } from '../api/client'
 import type { Session } from '../api/types'
 
 interface SessionState {
@@ -26,6 +26,18 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
   const [generation, setGeneration] = useState(0)
+
+  // A 401/CSRF-expiry on ANY request redirects to /login from inside
+  // client.ts. Dropping the in-memory session here too matters because the
+  // redirect is not instantaneous: React keeps rendering until the browser
+  // unloads the document, and a stale session object during that window makes
+  // RequireSession keep rendering protected pages (and, if the navigation is
+  // ever swapped for an SPA one, would make the login page think it is already
+  // signed in).
+  useEffect(() => {
+    setSessionExpiredListener(() => setSession(null))
+    return () => setSessionExpiredListener(null)
+  }, [])
 
   useEffect(() => {
     let cancelled = false

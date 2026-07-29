@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import enum
 import io
 import json
 import tarfile
@@ -86,6 +87,34 @@ SCAN_STATES: frozenset[str] = frozenset(
 # The two non-terminal states: a job here has not been scored yet, so it is
 # still claimable by the collector, the dead-letter path and the sweeps.
 _UNSCORED_STATES: tuple[str, ...] = (STATE_QUEUED, STATE_RUNNING)
+
+
+class SubmissionChannel(enum.StrEnum):
+    """Which door one submission arrived through (里程碑 F Task 12).
+
+    Persisted per `scan_submitter` row, ASSIGNED AT INSERT TIME. It is a known
+    fact at that moment - the handler that calls `submit_scan` IS the channel -
+    and this enum exists so it gets stored rather than reconstructed later.
+
+    SECURITY: never derive this from the submitter STRING. "service accounts
+    are named with such-and-such a prefix" is a shape check standing in for a
+    membership check, and this repository has already paid for that once: a
+    catalog audit that validated finding ids against `[A-Z]{3,7}-\\d{2}` but
+    never against the 62-item catalog let the nonexistent id `SUP-01` through.
+    The only other place the distinction exists at all is
+    `SessionContext.is_machine`, which is per-request auth state that dies with
+    the request - which is exactly why milestone F Task 2 could not produce
+    this field without a schema change.
+
+    Lives HERE rather than on `models.py` so `marketplace_api.router` can name
+    its own channel without importing orchestration's ORM classes - the same
+    plain-values-cross-the-boundary rule `is_scan_submitter` documents
+    (scripts/check_import_boundaries.py).
+    """
+
+    CONSOLE = "console"
+    MARKETPLACE = "marketplace"
+
 
 # SECURITY: sentinel engine-status values a worker reports on the results
 # stream to signal the orchestrator to dead-letter a job immediately, carrying
@@ -171,6 +200,8 @@ async def submit_scan(
     engine_metadatas: Sequence[EngineMetadata],
     policy: GatePolicy,
     trust_tier: TrustTier,
+    source: SubmissionChannel,
+    requested_trust_tier: TrustTier,
     deadline_s: float = 300.0,
 ) -> str:
     """SECURITY (single-flight): `scan_job.cache_key` UNIQUE - two submissions of
@@ -200,6 +231,39 @@ async def submit_scan(
     the first submitter's tier, and re-tiering it would mean claiming a decision
     that was never made. `views.project_scan.judged_at_tier` is what makes that
     visible externally rather than silently assumed.
+
+    SECURITY (2026-07-29, milestone F Task 12): `source` is REQUIRED with no
+    default, for the same reason `trust_tier` above is - a default is exactly
+    what lets a missed call site silently record a channel nobody verified,
+    and the point of this parameter is that the CALLER is the channel. It is
+    recorded onto the `scan_submitter` row rather than onto `scan_job`: the
+    dedup path appends a second submitter who may well have arrived through
+    the OTHER door, and a scan-level column could only keep one of the two.
+
+    SECURITY (2026-07-29, milestone F Task 14): `requested_trust_tier` is the
+    tier THIS caller asked for, recorded on THIS caller's `scan_submitter` row
+    on BOTH paths out of this function. `trust_tier` above is a different fact
+    with a different fate: it reaches `ScanJob.trust_tier` only when this call
+    actually creates the scan, and is deliberately dropped on the dedup path
+    (see the paragraph above - re-tiering an existing adjudication would claim
+    a decision nobody made). That asymmetry is exactly the hole: a later
+    submitter's request was recorded nowhere, so `GET /v1/scans/{scan_id}` had
+    one column to answer two questions and printed it twice under two labels.
+
+    Because `public` is the STRICTEST tier (`policies/gate/v1.yaml` blocks it
+    at HIGH, every other tier only at CRITICAL), the case that matters is a
+    caller asking for `public` and being handed a verdict adjudicated at
+    `internal` - a MORE PERMISSIVE ruleset than they asked for. Nothing here
+    changes the verdict; the point is that the divergence becomes visible
+    instead of indistinguishable from agreement.
+
+    Required with no default, same reasoning as the two parameters above. Both
+    current callers pass the same value they pass as `trust_tier`: the RESOLVED
+    tier this submission would have been judged at, never a raw caller-supplied
+    form field (see `gateway.router.create_scan`, where a resubmission's tier
+    comes from the registered skill and the form field is overridden on
+    purpose). Recording the raw field instead would flag that deliberate
+    override as a divergence and give an untrusted input a display surface.
     """
     c_hash = compute_content_hash(files)
     t_digest = compute_toolchain_digest(engine_metadatas, policy.version)
@@ -209,7 +273,18 @@ async def submit_scan(
         await session.execute(select(ScanJob).where(ScanJob.cache_key == ck))
     ).scalar_one_or_none()
     if existing is not None:
-        await _associate_submitter(session, scan_id=str(existing.scan_id), submitter=submitter)
+        # THE case Task 14 exists for: `trust_tier` is discarded here (the
+        # verdict is not re-adjudicated) but `requested_trust_tier` is not -
+        # this caller's own request is recorded on their own row even though
+        # the answer they are about to receive was reached at someone else's
+        # tier. Without this line the two are indistinguishable downstream.
+        await _associate_submitter(
+            session,
+            scan_id=str(existing.scan_id),
+            submitter=submitter,
+            source=source,
+            requested_trust_tier=requested_trust_tier,
+        )
         return str(existing.scan_id)
 
     scan_id = str(uuid.uuid4())
@@ -231,7 +306,13 @@ async def submit_scan(
         )
     )
     await session.flush()
-    await _associate_submitter(session, scan_id=scan_id, submitter=submitter)
+    await _associate_submitter(
+        session,
+        scan_id=scan_id,
+        submitter=submitter,
+        source=source,
+        requested_trust_tier=requested_trust_tier,
+    )
 
     await airlock.produce_scan_job(
         redis,
@@ -244,8 +325,17 @@ async def submit_scan(
     return scan_id
 
 
-async def _associate_submitter(session: AsyncSession, *, scan_id: str, submitter: str) -> None:
-    """Idempotently record that `submitter` submitted `scan_id` (C2).
+async def _associate_submitter(
+    session: AsyncSession,
+    *,
+    scan_id: str,
+    submitter: str,
+    source: SubmissionChannel,
+    requested_trust_tier: TrustTier,
+) -> None:
+    """Idempotently record that `submitter` submitted `scan_id` (C2), through
+    `source` (里程碑 F Task 12), asking for `requested_trust_tier`
+    (里程碑 F Task 14).
 
     Read-then-insert rather than `INSERT ... ON DUPLICATE KEY UPDATE`: the
     latter needs the UPDATE privilege even for a no-op update, and
@@ -256,6 +346,15 @@ async def _associate_submitter(session: AsyncSession, *, scan_id: str, submitter
     `reeval.controller.trigger_rescans`: a duplicate is the expected benign
     outcome, so it rolls back only this statement and not the caller's
     transaction.
+
+    `source` and `requested_trust_tier` are both written on the INSERT and
+    never on the early return: an existing (scan_id, submitter) row already
+    records the channel and the tier that pair's submission actually came in
+    with, and rewriting either would (a) need an UPDATE grant this table
+    deliberately does not have and (b) re-attribute a recorded fact. A
+    DIFFERENT submitter arriving through a different channel, or asking for a
+    different tier, gets its OWN row - which is why both channels and both
+    requests stay visible after dedup.
     """
     already = (
         await session.execute(
@@ -268,13 +367,93 @@ async def _associate_submitter(session: AsyncSession, *, scan_id: str, submitter
         return
     try:
         async with session.begin_nested():
-            session.add(ScanSubmitterRow(scan_id=scan_id, submitter=submitter))
+            session.add(
+                ScanSubmitterRow(
+                    scan_id=scan_id,
+                    submitter=submitter,
+                    source=source.value,
+                    requested_trust_tier=requested_trust_tier.value,
+                )
+            )
             await session.flush()
     except IntegrityError:
         # A concurrent submission of the same content by the same subject won
         # the race. The association exists either way, which is all that is
         # being asserted here.
         pass
+
+
+async def submitter_attribution(
+    session: AsyncSession, *, scan_ids: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    """Who submitted each of `scan_ids`, through which channel, asking for which
+    tier - keyed by scan_id (里程碑 F Task 16).
+
+    THE ONE IMPLEMENTATION of this response shape. `GET /v1/scans/{scan_id}`,
+    `GET /v1/scans` and `GET /v1/reviews` all serve the same concept, and three
+    hand-rolled `select()`s would drift: the detail endpoint carried full
+    attribution while both LISTS still showed the scalar `ScanJob.submitter` -
+    the FIRST submitter only - so a deduplicated scan displayed a stranger's
+    name on the list page and the right names one click away. One concept with
+    two shapes across two endpoints is a reliable source of consumer bugs, so
+    the shape is produced here and nowhere else.
+
+    ARCHITECTURE (scripts/check_import_boundaries.py): plain values cross the
+    module boundary, never an ORM row and never this module's session - the
+    same posture `is_scan_submitter` above documents. That is what lets
+    `gate.reviews_router` serve this shape without reaching into orchestration's
+    ORM.
+
+    Per scan_id: `submitters` (every rightful reader, sorted), `submitter_sources`
+    (per-name channel and requested tier), and `source` (the sorted set of
+    channels the scan actually arrived through).
+
+    `source` and `requested_trust_tier` are `null` when that row records nothing
+    - written before those columns existed - and are passed through verbatim. A
+    null channel contributes NOTHING to the aggregate `source` list rather than
+    a guessed "console": the honest rendering of "we do not know" is absence.
+
+    Always lists, even for a single submitter, and a scan with no association
+    rows is simply ABSENT from the result rather than present with empty lists -
+    callers decide what an unattributed scan should render as. A response whose
+    shape changes with the data is what consumers silently mis-parse.
+
+    BATCHED: one query for the whole page. The callers are list endpoints over
+    up to 200 rows, and a query per row is how a list becomes N+1.
+    """
+    if not scan_ids:
+        return {}
+    rows = sorted(
+        (
+            await session.execute(
+                select(
+                    ScanSubmitterRow.scan_id,
+                    ScanSubmitterRow.submitter,
+                    ScanSubmitterRow.source,
+                    ScanSubmitterRow.requested_trust_tier,
+                ).where(ScanSubmitterRow.scan_id.in_(list(scan_ids)))
+            )
+        ).all(),
+        key=lambda r: (r.scan_id, r.submitter),
+    )
+    attribution: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = attribution.setdefault(
+            row.scan_id, {"submitters": [], "submitter_sources": [], "source": []}
+        )
+        entry["submitters"].append(row.submitter)
+        entry["submitter_sources"].append(
+            {
+                "submitter": row.submitter,
+                "source": row.source,
+                "requested_trust_tier": row.requested_trust_tier,
+            }
+        )
+    for entry in attribution.values():
+        entry["source"] = sorted(
+            {e["source"] for e in entry["submitter_sources"] if e["source"] is not None}
+        )
+    return attribution
 
 
 async def is_scan_submitter(session: AsyncSession, *, scan_id: str, subject: str) -> bool:

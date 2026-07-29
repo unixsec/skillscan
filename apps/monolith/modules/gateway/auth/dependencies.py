@@ -18,7 +18,13 @@ from collections.abc import Awaitable, Callable
 import httpx
 import redis.asyncio as aioredis
 from common.config import SessionSettings
-from common.errors import AuthenticationError, AuthorizationError
+from common.errors import (
+    ERROR_CODE_HEADER,
+    ApiError,
+    AuthenticationError,
+    AuthorizationError,
+    CsrfValidationError,
+)
 from fastapi import Depends, HTTPException, Request
 from skillscan_core import TrustTier
 
@@ -83,11 +89,22 @@ def _extract_bearer_token(request: Request) -> str | None:
     return None
 
 
-def _as_http_exception(err: AuthenticationError | AuthorizationError) -> HTTPException:
+def _as_http_exception(err: ApiError) -> HTTPException:
     # SECURITY (FR-API-060): `err.detail` is the caller-safe message; the real
     # reason (`err.internal_detail`) is logged by the raising code, never
     # forwarded into the response.
-    return HTTPException(status_code=err.status_code, detail=err.detail)
+    #
+    # `err.code` rides along in the ERROR_CODE_HEADER response header. The code
+    # has existed on ApiError since the error contract was written and was
+    # being dropped exactly here, which is why the frontend had no choice but
+    # to discriminate 403s by comparing `detail` to a human-readable literal -
+    # see ERROR_CODE_HEADER's own docstring. FastAPI's default HTTPException
+    # handler copies `headers` onto the response, so this needs no app-level
+    # wiring and therefore cannot go missing in one app assembly and not
+    # another.
+    return HTTPException(
+        status_code=err.status_code, detail=err.detail, headers={ERROR_CODE_HEADER: err.code}
+    )
 
 
 async def _resolve_breakglass_session_context(
@@ -317,4 +334,9 @@ async def require_csrf(request: Request) -> None:
     try:
         enforce_csrf(request)
     except CsrfError as exc:
-        raise HTTPException(status_code=403, detail="CSRF validation failed") from exc
+        # CONTRACT: the frontend distinguishes this 403 (session can no longer
+        # write - bounce to /login) from every permission 403 (live session,
+        # render an inline refusal) by the `csrf_validation_failed` code in
+        # ERROR_CODE_HEADER, never by the `detail` text, which is free to be
+        # reworded or translated. See common.errors.CsrfValidationError.
+        raise _as_http_exception(CsrfValidationError(internal_detail=str(exc))) from exc

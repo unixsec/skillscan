@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -40,10 +41,10 @@ from monolith.modules.gate.models import PolicyProposalRow, VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.intel.models import ThreatIndicator
-from monolith.modules.inventory.models import SkillLifecycleEventRow
+from monolith.modules.inventory.models import BaselineRow, SkillLifecycleEventRow
 from monolith.modules.inventory.service import current_state, register_skill_version
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow
-from monolith.modules.orchestration.service import submit_scan
+from monolith.modules.orchestration.service import SubmissionChannel, submit_scan
 from monolith.modules.reporting.service import (
     InvalidCronError,
     cron_matches,
@@ -227,6 +228,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): worker_tick's collector now waits for the sandbox
         # engines too - simulate the engine-runner having already finished
@@ -308,6 +311,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -384,6 +389,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
 
         bandit_result = EngineResult(
@@ -558,6 +565,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -625,6 +634,8 @@ class TestWorkerEndToEnd:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # Ack away the original stream message, delete the artifact, backdate.
         stale = await airlock.claim_scan_jobs(
@@ -696,6 +707,7 @@ class TestLifecycleSync:
                 toolchain_digest=t_digest,
                 declared_perms=None,
                 operator="lifecycle-test",
+                actor_is_admin=False,
             )
             from monolith.modules.inventory.service import transition_skill
 
@@ -718,6 +730,8 @@ class TestLifecycleSync:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -802,6 +816,7 @@ class TestLifecycleSync:
                 toolchain_digest=t_digest,
                 declared_perms=None,
                 operator="drift-test",
+                actor_is_admin=False,
             )
             await transition_skill(
                 session,
@@ -823,6 +838,8 @@ class TestLifecycleSync:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -899,6 +916,7 @@ class TestLifecycleSync:
                 toolchain_digest=t_digest,
                 declared_perms=None,
                 operator="no-baseline-test",
+                actor_is_admin=False,
             )
             await transition_skill(
                 session,
@@ -920,6 +938,8 @@ class TestLifecycleSync:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=runtime.policy,
                 trust_tier=runtime.default_trust_tier,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=runtime.default_trust_tier,
             )
         # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' own docstring.
         _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
@@ -937,7 +957,145 @@ class TestLifecycleSync:
         assert state == "published"
 
     @pytest.mark.asyncio
-    async def test_block_verdict_never_publishes(
+    async def test_second_version_of_a_published_skill_stays_published(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+        unique_consumer: str,
+    ) -> None:
+        """The WHOLE versioning journey, end to end and twice round the
+        machine: publish v1, submit v2, scan it, publish v2 - and it must END
+        published, not quarantined.
+
+        This is the test milestone F Task 11 needed and did not have. Task 11
+        made `published -> submitted` legal and stopped there, so the journey
+        dead-ended one hop later instead of at the first: v2 published and was
+        then immediately auto-quarantined by `_quarantine_if_drifted`, because
+        a new version has a different content_hash than the baseline BY
+        DEFINITION and nothing re-established the baseline on publish (C3).
+        Asserting only "v2 reached published" would still pass with that bug
+        present for a fraction of a tick, so this walks to the end and then
+        keeps ticking.
+        """
+        await airlock.ensure_groups(redis_client)
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
+        )
+        skill_id = f"v2journey-{uuid.uuid4().hex[:12]}"
+        from skillscan_core import content_hash as compute_content_hash
+        from skillscan_core import toolchain_digest as compute_toolchain_digest
+
+        from monolith.modules.inventory.service import transition_skill
+
+        t_digest = compute_toolchain_digest((_ENGINE.metadata,), runtime.policy.version)
+
+        async def run_one_version(files: list[tuple[str, int, bytes]]) -> str:
+            """One full lap: register the version, enter `scanning`, run the
+            real pipeline, and poll until the worker publishes it. Mirrors
+            exactly what `gateway/router.py` does per submission - the same
+            OWNER both laps, so C1's ownership gate is exercised too rather
+            than sidestepped."""
+            c_hash = compute_content_hash(files)
+            async with inventory_sessionmaker() as session, session.begin():
+                await register_skill_version(
+                    session,
+                    skill_id=skill_id,
+                    source="test",
+                    trust_tier="internal",
+                    content_hash=c_hash,
+                    toolchain_digest=t_digest,
+                    declared_perms=None,
+                    operator="v2-journey-test",
+                    actor_is_admin=False,
+                )
+                await transition_skill(
+                    session,
+                    skill_id=skill_id,
+                    to_state="scanning",
+                    reason="test submission",
+                    actor="v2-journey-test",
+                    content_hash=c_hash,
+                )
+            async with orchestration_sessionmaker() as session, session.begin():
+                scan_id = await submit_scan(
+                    session,
+                    redis_client,
+                    blobstore,
+                    files=files,
+                    submitter="v2-journey-test",
+                    engine_metadatas=(_ENGINE.metadata,),
+                    policy=runtime.policy,
+                    trust_tier=runtime.default_trust_tier,
+                    source=SubmissionChannel.CONSOLE,
+                    requested_trust_tier=runtime.default_trust_tier,
+                )
+            # D2 (2026-07-27): see _seed_sandbox_waited_engine_blobs' docstring.
+            _seed_sandbox_waited_engine_blobs(blobstore, scan_id)
+            state: str | None = None
+            # A generous bound, not 20 - see the sibling loops above on why
+            # worker_tick's shared, backlog-sensitive claim budgets need it.
+            for _ in range(200):
+                await worker_tick(runtime, consumer=unique_consumer)
+                async with inventory_sessionmaker() as session:
+                    state = await current_state(session, skill_id=skill_id)
+                if state == "published":
+                    break
+            # `_quarantine_if_drifted` runs inside the SAME sync_lifecycle_tick
+            # as the publish it follows, so a regression shows up here as
+            # 'quarantined', never as a flaky "published for one tick".
+            assert state == "published", f"version did not publish (state={state})"
+            return c_hash
+
+        v1_hash = await run_one_version(_unique_files(f"{skill_id}-v1"))
+        async with inventory_sessionmaker() as session:
+            baseline = await session.get(BaselineRow, skill_id)
+        # Publishing through the pipeline is what ESTABLISHES the baseline -
+        # previously nothing did, outside the admin endpoint.
+        assert baseline is not None
+        assert baseline.content_hash == v1_hash
+
+        v2_hash = await run_one_version(_unique_files(f"{skill_id}-v2"))
+        assert v2_hash != v1_hash  # sanity: a v2 that hashed the same proves nothing
+
+        # Keep ticking past the publish: nothing may drag the skill back out
+        # of `published` afterwards.
+        for _ in range(5):
+            await worker_tick(runtime, consumer=unique_consumer)
+        async with inventory_sessionmaker() as session:
+            final_state = await current_state(session, skill_id=skill_id)
+            baseline = await session.get(BaselineRow, skill_id)
+            events = (
+                (
+                    await session.execute(
+                        select(SkillLifecycleEventRow)
+                        .where(SkillLifecycleEventRow.skill_id == skill_id)
+                        .order_by(SkillLifecycleEventRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert final_state == "published"
+        assert baseline is not None
+        assert baseline.content_hash == v2_hash
+        assert [e.to_state for e in events] == [
+            "submitted",
+            "scanning",
+            "published",
+            "submitted",
+            "scanning",
+            "published",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_block_verdict_moves_skill_to_blocked_state(
         self,
         orchestration_sessionmaker: SessionmakerFixture,
         gate_sessionmaker: SessionmakerFixture,
@@ -945,8 +1103,11 @@ class TestLifecycleSync:
         redis_client: aioredis.Redis,
         blobstore: LocalFilesystemBlobStore,
     ) -> None:
-        """BLOCK maps to NO lifecycle transition (the §16.2 machine has no
-        'blocked' state) - the skill must stay in scanning, never published."""
+        """BLOCK maps to the §16.2 machine's 'blocked' state - the skill must
+        move out of 'scanning' into 'blocked', and never publish. (Previously
+        BLOCK left the skill parked in 'scanning' forever, indistinguishable
+        from a skill still being scanned; this is the behaviour that changed.)
+        """
         skill_id = f"blocked-{uuid.uuid4().hex[:12]}"
         c_hash = uuid.uuid4().hex + uuid.uuid4().hex  # 64 hex chars, unique
         async with inventory_sessionmaker() as session, session.begin():
@@ -959,6 +1120,7 @@ class TestLifecycleSync:
                 toolchain_digest="t" * 64,
                 declared_perms=None,
                 operator="block-test",
+                actor_is_admin=False,
             )
             from monolith.modules.inventory.service import transition_skill
 
@@ -994,7 +1156,289 @@ class TestLifecycleSync:
         )
         await sync_lifecycle_tick(runtime)
         async with inventory_sessionmaker() as session:
+            assert await current_state(session, skill_id=skill_id) == "blocked"
+
+    @pytest.mark.asyncio
+    async def test_resubmission_under_a_new_toolchain_never_resolves_on_the_old_verdict(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+    ) -> None:
+        """SECURITY REGRESSION LOCK (2026-07-29, milestones E+F review finding
+        C1): a lifecycle event is resolved by the verdict of the scan IT NAMED,
+        never by the newest verdict that happens to share its content hash.
+
+        THE BUG THIS LOCKS OUT, in the order it happened. The skill publishes
+        at content hash H under toolchain T1. Detection content or policy then
+        changes (T2) and the owner resubmits the SAME bytes - which is exactly
+        the case a3f26e4 (finding I1) exists to serve, and `cache_key = f(H,
+        T2)` misses, so a genuinely new scan is enqueued. The lifecycle commits
+        published -> submitted -> scanning at once, and the worker tick (1s)
+        then found the T1 PASS as newest-for-H and republished within a second.
+        Seconds later the T2 scan issued its verdict - to a skill that had
+        already left `scanning`, so it was not in `pending` and was dropped
+        permanently. Nothing recovered it: `register_skill_version` deliberately
+        never advances `skill_version.toolchain_digest`, so every reeval rescan
+        hit the same dead end.
+
+        The three assertions below are the three halves of that (in order): the
+        stale verdict must NOT resolve the new event; the new scan's verdict
+        must; and the MIRROR case - a `blocked` skill resubmitted under a
+        RELAXED ruleset - must clear instead of being instantly re-blocked on
+        its own stale BLOCK, which is I1's stated purpose and did not work at
+        all before this.
+
+        Verdict rows are written directly rather than run through the pipeline
+        on purpose: the point under test is the RESOLUTION RULE, and seeding
+        the two verdicts explicitly is what makes "which of these two did the
+        worker pick?" a deterministic question rather than a race with the
+        engines. `test_second_version_of_a_published_skill_stays_published`
+        above already walks the real pipeline end to end.
+        """
+        from monolith.modules.inventory.service import transition_skill
+
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
+        )
+        skill_id = f"toolchain-{uuid.uuid4().hex[:12]}"
+        c_hash = uuid.uuid4().hex + uuid.uuid4().hex  # 64 hex chars, unique
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+
+        async def add_verdict(scan_id: str, verdict: str, issued_at: datetime.datetime) -> None:
+            async with gate_sessionmaker() as session, session.begin():
+                session.add(
+                    VerdictRow(
+                        scan_id=scan_id,
+                        content_hash=c_hash,
+                        verdict=verdict,
+                        score=90 if verdict == "PASS" else 20,
+                        policy_version="vt",
+                        jti=str(uuid.uuid4()),
+                        jws_signature="test",
+                        effective_severity=0 if verdict == "PASS" else 4,
+                        reasons=["test"],
+                        issued_at=issued_at,
+                    )
+                )
+
+        async def enter_scanning(scan_id: str, toolchain_digest: str) -> None:
+            """One submission, exactly as `gateway/router.py` writes it: the
+            version registration (which re-enters a settled skill at
+            `submitted`) plus the `-> scanning` event carrying THIS scan's id."""
+            async with inventory_sessionmaker() as session, session.begin():
+                await register_skill_version(
+                    session,
+                    skill_id=skill_id,
+                    source="test",
+                    trust_tier="internal",
+                    content_hash=c_hash,
+                    toolchain_digest=toolchain_digest,
+                    declared_perms=None,
+                    operator="toolchain-test",
+                    actor_is_admin=False,
+                )
+                await transition_skill(
+                    session,
+                    skill_id=skill_id,
+                    to_state="scanning",
+                    reason=f"scan {scan_id} submitted",
+                    actor="toolchain-test",
+                    content_hash=c_hash,
+                    scan_id=scan_id,
+                )
+
+        # 1. Published at H under toolchain T1, on T1's own PASS.
+        scan_t1 = str(uuid.uuid4())
+        await enter_scanning(scan_t1, "1" * 64)
+        await add_verdict(scan_t1, "PASS", now)
+        await sync_lifecycle_tick(runtime)
+        async with inventory_sessionmaker() as session:
+            assert await current_state(session, skill_id=skill_id) == "published"
+
+        # 2. Toolchain changes; the owner resubmits the SAME bytes. The new
+        #    scan has NOT been decided yet.
+        scan_t2 = str(uuid.uuid4())
+        await enter_scanning(scan_t2, "2" * 64)
+        await sync_lifecycle_tick(runtime)
+        async with inventory_sessionmaker() as session:
+            state = await current_state(session, skill_id=skill_id)
+        # THE REGRESSION: this was 'published' - republished within one tick on
+        # the T1 verdict, before the T2 scan had produced anything at all.
+        assert state == "scanning", (
+            "the skill left 'scanning' before its own scan was decided - it "
+            "resolved on a verdict belonging to another scan"
+        )
+
+        # 3. The T2 scan blocks. That verdict must REACH the lifecycle; before
+        #    the fix the skill was already published and it was dropped.
+        await add_verdict(scan_t2, "BLOCK", now + datetime.timedelta(seconds=30))
+        await sync_lifecycle_tick(runtime)
+        async with inventory_sessionmaker() as session:
+            assert await current_state(session, skill_id=skill_id) == "blocked"
+
+        # 4. THE MIRROR CASE. The ruleset is relaxed and the same bytes are
+        #    resubmitted from `blocked`. The stale BLOCK must not re-block it.
+        scan_t3 = str(uuid.uuid4())
+        await enter_scanning(scan_t3, "3" * 64)
+        await sync_lifecycle_tick(runtime)
+        async with inventory_sessionmaker() as session:
             assert await current_state(session, skill_id=skill_id) == "scanning"
+        await add_verdict(scan_t3, "PASS", now + datetime.timedelta(seconds=60))
+        await sync_lifecycle_tick(runtime)
+        async with inventory_sessionmaker() as session:
+            events = (
+                (
+                    await session.execute(
+                        select(SkillLifecycleEventRow)
+                        .where(SkillLifecycleEventRow.skill_id == skill_id)
+                        .order_by(SkillLifecycleEventRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert [e.to_state for e in events] == [
+            "submitted",
+            "scanning",
+            "published",
+            "submitted",
+            "scanning",
+            "blocked",
+            "submitted",
+            "scanning",
+            "published",
+        ]
+        # The link is recorded as a typed column, not only inside `reason` -
+        # and the worker carries it FORWARD onto the transition it writes, so
+        # "which verdict released this skill?" is answerable from the row.
+        by_state = {(e.to_state, e.scan_id) for e in events}
+        assert ("scanning", scan_t2) in by_state
+        assert ("blocked", scan_t2) in by_state
+        assert ("published", scan_t3) in by_state
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_for_a_skill_that_moved_on_is_reported_not_dropped(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+        blobstore: LocalFilesystemBlobStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """C1, second half: "a verdict that arrives for a skill that has already
+        moved on must not be silently dropped."
+
+        Resolving by scan_id removes the drop the finding is about, because a
+        `scanning` event now waits for its own scan and `scanning -> submitted`
+        is not a legal edge. What remains is out-of-band and real: an admin
+        retiring a skill while its scan is still running, which is what this
+        walks. (`reeval.controller.build_rescan_job` writes no lifecycle event
+        at all, so its verdicts are outside this report by construction - see
+        `_report_stranded_verdicts` on why that gap is named rather than
+        papered over.)
+
+        The behaviour is deliberately a REPORT, not an automatic transition:
+        `VALID_TRANSITIONS` refuses `published -> blocked` so that imposing a
+        block always goes through a fresh scan or an admin, and inventing an
+        edge here would route around exactly that gate.
+        """
+        runtime = _runtime(
+            redis_client=redis_client,
+            blobstore=blobstore,
+            orchestration_sessionmaker=orchestration_sessionmaker,
+            gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
+        )
+        skill_id = f"stranded-{uuid.uuid4().hex[:12]}"
+        c_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        scan_id = str(uuid.uuid4())
+        from monolith.modules.inventory.service import transition_skill
+
+        async with inventory_sessionmaker() as session, session.begin():
+            await register_skill_version(
+                session,
+                skill_id=skill_id,
+                source="test",
+                trust_tier="internal",
+                content_hash=c_hash,
+                toolchain_digest="t" * 64,
+                declared_perms=None,
+                operator="stranded-test",
+                actor_is_admin=False,
+            )
+            await transition_skill(
+                session,
+                skill_id=skill_id,
+                to_state="scanning",
+                reason=f"scan {scan_id} submitted",
+                actor="stranded-test",
+                content_hash=c_hash,
+                scan_id=scan_id,
+            )
+        # An admin retires it while the scan is still running (a legal edge:
+        # scanning -> retired). Nothing is waiting for that scan any more.
+        async with inventory_sessionmaker() as session, session.begin():
+            await transition_skill(
+                session,
+                skill_id=skill_id,
+                to_state="retired",
+                reason="admin retired mid-scan",
+                actor="admin",
+            )
+        # ...and only THEN does the scan produce its verdict.
+        async with gate_sessionmaker() as session, session.begin():
+            session.add(
+                VerdictRow(
+                    scan_id=scan_id,
+                    content_hash=c_hash,
+                    verdict="BLOCK",
+                    score=20,
+                    policy_version="vt",
+                    jti=str(uuid.uuid4()),
+                    jws_signature="test",
+                    effective_severity=4,
+                    reasons=["test"],
+                    issued_at=datetime.datetime.now(datetime.UTC).replace(tzinfo=None),
+                )
+            )
+        # NOT plain caplog: `common.log.get_logger` sets `propagate = False`, so
+        # these records never reach the root handler pytest captures on (the
+        # same gotcha test_marketplace_router.py documents). Attaching caplog's
+        # own handler to THIS logger keeps `caplog.records` usable.
+        worker_logger = logging.getLogger("skillscan.monolith.worker")
+        worker_logger.addHandler(caplog.handler)
+        try:
+            # Dedup is per-scan and long-lived; this scan_id is fresh, so the
+            # very next tick is the one that reports it.
+            await sync_lifecycle_tick(runtime)
+            reported = [r for r in caplog.records if scan_id in str(r.__dict__.get("context", ""))]
+            assert reported, (
+                f"a verdict for a skill that had moved on was dropped without a "
+                f"word: {[r.getMessage() for r in caplog.records]}"
+            )
+            assert reported[0].levelname == "WARNING"
+            assert str(reported[0].__dict__["context"]["verdict"]) == "BLOCK"
+            # The skill is NOT dragged back out of its terminal state.
+            async with inventory_sessionmaker() as session:
+                assert await current_state(session, skill_id=skill_id) == "retired"
+            # Deduped: a permanently stranded verdict costs one line a day, not
+            # one a second.
+            caplog.clear()
+            await sync_lifecycle_tick(runtime)
+            assert not any(scan_id in str(r.__dict__.get("context", "")) for r in caplog.records)
+        finally:
+            worker_logger.removeHandler(caplog.handler)
+            # Hygiene: this suite shares the local dev Redis, so a leftover
+            # dedup key would silently disarm the first assertion on a re-run.
+            await redis_client.delete(f"skillscan:lifecycle:stranded_verdict:{scan_id}")
 
 
 def _proposal_row(yaml_text: str) -> PolicyProposalRow:

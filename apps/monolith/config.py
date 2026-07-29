@@ -74,7 +74,19 @@ class Settings(BaseSettings):
     # every other endpoint field. See modules/integration_relay/siem.py for
     # the actual SIEM emitter this feeds.
     siem_endpoint: str = ""
-    marketplace_api: str = ""
+    # NOT a `marketplace_api` field here, deliberately: unlike `siem_endpoint`
+    # (which has no dedicated settings class of its own), the marketplace
+    # endpoint's home is `common.config.MarketplaceSettings` - one of the
+    # "elaborate, per-concern settings classes" this class's own docstring
+    # says never to duplicate. `main._build_marketplace()` reads
+    # `SKILLSCAN_MARKETPLACE_API_BASE_URL` and constructs `MarketplaceSettings`
+    # directly, which validates it via that class's own
+    # `require_internal_endpoint` call - the same validation this field would
+    # have applied, just at the read site instead of here. A `marketplace_api`
+    # field briefly existed on this class anyway, bound to a DIFFERENT env var
+    # (`SKILLSCAN_MARKETPLACE_API`, no trailing `_BASE_URL`) that nothing ever
+    # read or set - dead weight next to the real, already-validated path,
+    # removed rather than wired up, to avoid two spellings of one endpoint.
     introspection_cache_ttl_s: int = 30
     access_token_ttl_s: int = 600
     reconciliation_poll_enabled: bool = False
@@ -130,7 +142,6 @@ class Settings(BaseSettings):
             "idp_issuer",
             "vault_addr",
             "siem_endpoint",
-            "marketplace_api",
         ):
             value: str = getattr(self, field_name)
             if value:
@@ -207,7 +218,6 @@ def load_settings() -> Settings:
         idp_issuer=os.environ.get("SKILLSCAN_IDP_ISSUER", ""),
         vault_addr=os.environ.get("SKILLSCAN_VAULT_ADDR", ""),
         siem_endpoint=os.environ.get("SKILLSCAN_SIEM_ENDPOINT", ""),
-        marketplace_api=os.environ.get("SKILLSCAN_MARKETPLACE_API", ""),
         introspection_cache_ttl_s=int(os.environ.get("SKILLSCAN_INTROSPECTION_CACHE_TTL_S", "30")),
         access_token_ttl_s=int(os.environ.get("SKILLSCAN_ACCESS_TOKEN_TTL_S", "600")),
         reconciliation_poll_enabled=os.environ.get(

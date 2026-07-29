@@ -46,15 +46,18 @@ from engine_runner.normalizer import UnpackRejected, unpack_hardened
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 
 from monolith.modules.admin.engine_registry import filter_enabled_engines
+from monolith.modules.gate.policy import tier_direction
 from monolith.modules.gate.service import get_verdict_view
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_role
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.orchestration.service import (
+    SubmissionChannel,
     get_scan_result_view,
     get_scan_state_and_tier,
     is_scan_submitter,
     submit_scan,
+    submitter_attribution,
 )
 
 from . import views
@@ -246,6 +249,30 @@ async def submit_marketplace_scan(
             # after this session is gone. Never runtime.default_trust_tier,
             # and never anything the caller said.
             trust_tier=session.tier,
+            # 里程碑 F Task 12: this handler IS the marketplace channel, and
+            # this is the only moment that is knowable - `session.is_machine`
+            # does not outlive the request. Recorded on this caller's OWN
+            # `scan_submitter` row, so a package the console already scanned
+            # (dedup: the same bytes collapse onto the existing scan_job) ends
+            # up with BOTH channels on record rather than only the first one.
+            # Never inferred later from the service-account NAME - see
+            # `SubmissionChannel`'s docstring.
+            source=SubmissionChannel.MARKETPLACE,
+            # 里程碑 F Task 14: the tier THIS service account asked for, on its
+            # OWN `scan_submitter` row. Same value as `trust_tier` above - a
+            # marketplace caller cannot supply a tier at all (400 above), so
+            # its granted tier IS its request - but a different fate: this one
+            # is recorded even when dedup hands it a scan_job the console
+            # already created and a verdict reached at the console's tier.
+            #
+            # This is the dangerous direction in practice. An unconfigured
+            # service account gets PUBLIC, the STRICTEST tier
+            # (`policies/gate/v1.yaml` blocks it at HIGH), while the console
+            # commonly submits at `internal` (blocks only at CRITICAL). A
+            # marketplace poll of content the console scanned first therefore
+            # returns a verdict made under a more permissive ruleset than this
+            # caller asked for, and until this column that was invisible.
+            requested_trust_tier=session.tier,
             deadline_s=runtime.scan_deadline_s,
         )
     return {"scan_id": scan_id}
@@ -287,6 +314,31 @@ async def get_marketplace_scan(
         # "no such scan" - so the marketplace could not even diagnose it.
         if not await is_scan_submitter(db_session, scan_id=scan_id, subject=session.subject):
             raise HTTPException(status_code=404, detail="scan not found")
+        # 里程碑 F Task 18: the tier THIS service account asked for, off its OWN
+        # `scan_submitter` row - so the response can say whether the verdict it
+        # is handing back was adjudicated under the ruleset that was requested.
+        # Read AFTER the authorization check above, never as part of it: this
+        # is the same `submitter_attribution` producer the console's three
+        # endpoints use, and it is a RESPONSE shape. Authorization stays on
+        # `is_scan_submitter`, the accessor built for it, so that a later change
+        # to the attribution shape cannot become a change to who may read.
+        #
+        # SECURITY: the full submitter list this returns must NOT reach the
+        # marketplace - §6.2 gives a machine identity no business knowing which
+        # console user also submitted the same bytes. Only this caller's own
+        # entry is read here, and `views.project_scan`'s whitelist is what makes
+        # that structural rather than a promise: nothing that is not in
+        # EXTERNAL_TOP_LEVEL_FIELDS can leave, however this local dict grows.
+        attribution = (await submitter_attribution(db_session, scan_ids=[scan_id])).get(scan_id, {})
+        requested_tier = next(
+            (
+                entry["requested_trust_tier"]
+                for entry in attribution.get("submitter_sources", ())
+                if entry["submitter"] == session.subject
+                and entry["requested_trust_tier"] is not None
+            ),
+            None,
+        )
         result_row = await get_scan_result_view(db_session, scan_id=scan_id)
 
     # Separate session: gate's tables are behind gate's own least-privilege
@@ -301,6 +353,13 @@ async def get_marketplace_scan(
         verdict_row=verdict_row,
         result_row=result_row,
         judged_at_tier=judged_at_tier,
+        requested_tier=requested_tier,
+        # Computed here rather than in `views`, which is pure by contract: the
+        # answer depends on `GatePolicy.block_threshold`, since strictness lives
+        # in `tier_block_overrides` and not in the order of the tier names.
+        tier_direction=tier_direction(
+            runtime.policy, requested=requested_tier, judged=judged_at_tier
+        ),
     )
     await _record_fetch(
         runtime, scan_id=scan_id, service_account=session.subject, projected=projected

@@ -35,7 +35,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -47,6 +46,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from monolith.modules.gateway.auth import redis_session
+from monolith.modules.gateway.auth.middleware import session_ttl_from_env
 
 from .models import LocalAccountRow
 
@@ -251,7 +251,13 @@ _SESSION_KEY_PREFIX = "skillscan:admin:local:session:"
 # SECURITY: a normal human workday session (8h), unlike break-glass's
 # deliberately punishing 15min emergency window - this is meant to be the
 # standing day-to-day admin login path, not a limited emergency escape hatch.
-LOCAL_SESSION_TTL_S = int(os.environ.get("SKILLSCAN_LOCAL_SESSION_TTL_S", "28800"))
+# SECURITY: validated against the shared CSRF cookie's lifetime AT IMPORT (see
+# `session_ttl_from_env`) - a misconfiguration is refused loudly here rather
+# than shipping as "reads work, every write 403s after a while". The plain
+# `int(os.environ.get(...))` this replaces could not be caught by any test,
+# because the test that was supposed to enforce the ceiling read this very
+# attribute.
+LOCAL_SESSION_TTL_S = session_ttl_from_env("SKILLSCAN_LOCAL_SESSION_TTL_S", 28800)
 
 
 async def create_local_session(redis: aioredis.Redis, *, subject: str, role: str) -> str:

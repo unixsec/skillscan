@@ -5,9 +5,19 @@ export interface FilterField<T> {
   key: string
   label: string
   // Value extracted from a row for this field (stringified for comparison).
-  value: (row: T) => string
+  // Rows may carry SEVERAL values for one field - a scan legitimately has N
+  // submitters once identical content is deduplicated onto one scan_job - so
+  // this returns a list and a row matches when ANY of its values is the chosen
+  // one. Returning the first value only would hide a scan from the very person
+  // who submitted it whenever someone else got there first.
+  value: (row: T) => string | string[]
   // Optional human label for a distinct value (e.g. enum -> translated text).
   renderOption?: (value: string) => string
+}
+
+function valuesOf<T>(field: FilterField<T>, row: T): string[] {
+  const raw = field.value(row)
+  return Array.isArray(raw) ? raw : [raw]
 }
 
 interface FilterState {
@@ -28,8 +38,9 @@ export function useTableFilter<T>(rows: T[], fields: FilterField<T>[]) {
     for (const field of fields) {
       const seen = new Set<string>()
       for (const row of rows) {
-        const v = field.value(row)
-        if (v !== '' && v !== 'undefined' && v !== 'null') seen.add(v)
+        for (const v of valuesOf(field, row)) {
+          if (v !== '' && v !== 'undefined' && v !== 'null') seen.add(v)
+        }
       }
       byField[field.key] = [...seen].sort()
     }
@@ -41,7 +52,7 @@ export function useTableFilter<T>(rows: T[], fields: FilterField<T>[]) {
       rows.filter((row) =>
         fields.every((field) => {
           const chosen = selected[field.key]
-          return !chosen || field.value(row) === chosen
+          return !chosen || valuesOf(field, row).includes(chosen)
         }),
       ),
     [rows, fields, selected],

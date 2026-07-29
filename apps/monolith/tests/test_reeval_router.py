@@ -25,7 +25,7 @@ from monolith.modules.gateway.auth.middleware import CSRF_COOKIE_NAME, SESSION_C
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
 from monolith.modules.inventory.models import SkillVersionRow
-from monolith.modules.inventory.service import register_skill_version
+from monolith.modules.inventory.service import register_skill_version, transition_skill
 from monolith.modules.orchestration.models import ScanJob
 from monolith.modules.reeval.models import ReconciliationRow
 from monolith.tests.conftest import SessionmakerFixture
@@ -96,6 +96,7 @@ async def _seed_published_skill(
             toolchain_digest=toolchain_digest,
             declared_perms=None,
             operator="tester",
+            actor_is_admin=False,
         )
 
 
@@ -188,6 +189,7 @@ class TestTriggerReeval:
                 toolchain_digest="placeholder",
                 declared_perms=None,
                 operator="tester",
+                actor_is_admin=False,
             )
 
         _as(app, "admin-alice", frozenset({"admin"}))
@@ -204,6 +206,85 @@ class TestTriggerReeval:
         assert len(rows) == 1
         assert rows[0].state == "queued"
         assert rows[0].submitter == "admin-alice"
+
+    @pytest.mark.asyncio
+    async def test_only_the_current_version_is_queued_for_a_multi_version_skill(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        inventory_sessionmaker: SessionmakerFixture,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """I4 (2026-07-29, milestone F Task 11 follow-up): this route queued a
+        rescan for EVERY version a skill had ever had. Harmless while no skill
+        could have a second version (`"submitted"` appeared 0 times as a target
+        in `lifecycle.VALID_TRANSITIONS`); a real fan-out the moment Task 11
+        made a v2 possible. Reeval re-applies CURRENT detection to what is
+        live - resurrecting superseded packages costs real scan capacity and
+        puts verdicts on record for content nobody ships.
+        """
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        v1_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        v2_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        async with inventory_sessionmaker() as session, session.begin():
+            await register_skill_version(
+                session,
+                skill_id=skill_id,
+                source="test-suite",
+                trust_tier="public",
+                content_hash=v1_hash,
+                toolchain_digest="placeholder",
+                declared_perms=None,
+                operator="tester",
+                actor_is_admin=False,
+            )
+        # A real v2 needs a real lifecycle: v1 has to settle before the skill
+        # may re-enter at `submitted`. Driven through the production service
+        # functions, never by writing rows by hand.
+        for to_state in ("scanning", "published"):
+            async with inventory_sessionmaker() as session, session.begin():
+                await transition_skill(
+                    session,
+                    skill_id=skill_id,
+                    to_state=to_state,
+                    reason="test",
+                    actor="system",
+                    content_hash=v1_hash,
+                )
+        async with inventory_sessionmaker() as session, session.begin():
+            await register_skill_version(
+                session,
+                skill_id=skill_id,
+                source="test-suite",
+                trust_tier="public",
+                content_hash=v2_hash,
+                toolchain_digest="placeholder",
+                declared_perms=None,
+                operator="tester",
+                actor_is_admin=False,
+            )
+
+        _as(app, "admin-alice", frozenset({"admin"}))
+        response = await client.post(f"/v1/reeval/{skill_id}")
+        assert response.status_code == 200
+        assert response.json()["versions_queued"] == 1
+
+        async with orchestration_sessionmaker() as session:
+            queued_hashes = set(
+                (
+                    await session.execute(
+                        select(ScanJob.content_hash).where(
+                            ScanJob.content_hash.in_([v1_hash, v2_hash])
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        # The superseded v1 must not be rescanned at all - not merely counted
+        # once. Asserting only the count would pass if the WRONG version were
+        # the one queued.
+        assert queued_hashes == {v2_hash}
 
     @pytest.mark.asyncio
     async def test_unknown_skill_is_404(self, app: FastAPI, client: httpx.AsyncClient) -> None:

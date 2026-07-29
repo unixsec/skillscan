@@ -33,6 +33,7 @@ import pyotp
 import redis.asyncio as aioredis
 
 from monolith.modules.gateway.auth import redis_session
+from monolith.modules.gateway.auth.middleware import session_ttl_from_env
 
 # SECURITY: two separate Redis keys - "armed" carries a real TTL (the
 # activation's own time-limited window); "used" is atomically claimed
@@ -239,7 +240,9 @@ _SESSION_KEY_PREFIX = "skillscan:admin:breakglass:session:"
 # 900s (15 min) by default. Env-overridable ONLY so a local dev/demo launcher
 # can extend it (a 15-min window is punishing when you're iterating in the UI);
 # a real deployment leaves the short default in place.
-BREAKGLASS_SESSION_TTL_S = int(os.environ.get("SKILLSCAN_BREAKGLASS_SESSION_TTL_S", "900"))
+# SECURITY: validated against the shared CSRF cookie's lifetime AT IMPORT - see
+# `session_ttl_from_env` and `local_auth.LOCAL_SESSION_TTL_S`'s note.
+BREAKGLASS_SESSION_TTL_S = session_ttl_from_env("SKILLSCAN_BREAKGLASS_SESSION_TTL_S", 900)
 
 
 async def create_breakglass_session(redis: aioredis.Redis, *, subject: str) -> str:

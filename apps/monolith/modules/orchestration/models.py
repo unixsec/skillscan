@@ -101,6 +101,86 @@ class ScanSubmitterRow(Base):
 
     scan_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     submitter: Mapped[str] = mapped_column(String(255), primary_key=True)
+    # SECURITY (2026-07-29, milestone F Task 12): the CHANNEL this submitter's
+    # submission arrived through - `service.SubmissionChannel` ("console" or
+    # "marketplace"). Written at INSERT time by `_associate_submitter`, because
+    # that is the only moment the fact exists: the sole other carrier of the
+    # distinction is `SessionContext.is_machine`, a per-request auth fact that
+    # dies with the request. Task 2 had to report BLOCKED on surfacing it for
+    # exactly that reason.
+    #
+    # A write-time column, not a read-time derivation: inferring the channel
+    # from the submitter STRING would be a shape check standing in for a
+    # membership check (see `SubmissionChannel`'s docstring for the SUP-01
+    # precedent this project already paid for).
+    #
+    # PER SUBMITTER, deliberately not per scan. Single-flight dedup means one
+    # scan legitimately has N submitters, and the console and the marketplace
+    # scanning the same skill is this product's NORMAL case (see this table's
+    # own migration) - a scan-level single value would silently drop one of the
+    # two channels the moment both are involved.
+    #
+    # Nullable with no backfill, same posture as `ScanJob.trust_tier` and
+    # `ScanResultRow.findings_total` and for the same reason: rows written
+    # before this column genuinely have no recorded channel, nothing anywhere
+    # records it retroactively, and inventing one would fabricate provenance.
+    # NULL means "this row records no channel" and is surfaced verbatim, never
+    # defaulted to "console". Contrast the backfill in 3c7e1b40d95a, which was
+    # honest precisely because `scan_job.submitter` DID hold the value.
+    #
+    # NOT `skill_version.source` (a provenance label such as "web-upload") -
+    # different table, different question.
+    #
+    # Never rewritten: this table is granted INSERT+SELECT only (see the
+    # docstring above), and `_associate_submitter` returns early when the
+    # (scan_id, submitter) pair already exists, so the FIRST recorded channel
+    # for a given pair stands. That is the correct value - it is the channel
+    # that submission actually came through.
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # SECURITY (2026-07-29, milestone F Task 14): the trust tier THIS submitter
+    # asked their submission to be judged at - a `TrustTier` value.
+    #
+    # THE GAP THIS CLOSES. `ScanJob.trust_tier` is the FIRST submitter's tier
+    # and the tier the verdict was actually adjudicated at; the docstring above
+    # says why that must not be reattributed to a later arrival. But nothing
+    # recorded what the later arrival ASKED FOR, so the two facts were one
+    # column and the console showed the same value twice under two labels
+    # ("trust tier" / "judged at tier"), which is to say it disclosed nothing.
+    #
+    # The dangerous case is concrete: `policies/gate/v1.yaml` gives `public` a
+    # HIGH block override while `internal`/`partner` block only at CRITICAL, so
+    # `public` is the STRICTEST tier. A submitter asking for `public` whose
+    # byte-identical content was already scanned at `internal` is handed a
+    # verdict reached under a MORE PERMISSIVE ruleset than they asked for. A
+    # HIGH finding that would have blocked for them reads PASS, and before this
+    # column there was no way to tell - not in the response, not in the
+    # database. The reverse direction (asking `internal`, getting a `public`
+    # verdict) is the safe side but is disclosed too: over-blocking that nobody
+    # can explain is its own failure.
+    #
+    # PER SUBMITTER, like `source` above and for the identical reason: dedup
+    # means one scan legitimately has N submitters who may have asked for N
+    # different tiers, and a scan-level column could keep only one of them.
+    #
+    # Written at INSERT by `_associate_submitter` and never rewritten (this
+    # table is granted INSERT+SELECT only). `submit_scan` takes it as a
+    # REQUIRED keyword argument, so a missed writer is a type error rather than
+    # a silently unrecorded request - the same posture `trust_tier` and
+    # `source` already take, and for the same reason.
+    #
+    # NOT the same fact as `ScanJob.trust_tier`, even though both current
+    # writers happen to pass the same resolved tier: this one is recorded on
+    # EVERY path including dedup (where `ScanJob.trust_tier` is deliberately
+    # left alone), and it belongs to this submitter rather than to the scan.
+    #
+    # Nullable with NO backfill, same posture as `source` and
+    # `ScanJob.trust_tier`: rows written before this column record no request,
+    # nothing anywhere reconstructs one, and copying `ScanJob.trust_tier` into
+    # it would fabricate exactly the divergence this column exists to reveal -
+    # it would assert every past submitter asked for the tier they were judged
+    # at, which is the unverified assumption in the first place. NULL means
+    # "this row records no request" and is surfaced as unknown, never guessed.
+    requested_trust_tier: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class ScanResultRow(Base):

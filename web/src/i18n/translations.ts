@@ -37,9 +37,13 @@ const zh: Dict = {
   'nav.adminUsers': '管理 · 用户',
   'nav.adminIntel': '管理 · 情报',
   'nav.adminBreakglass': '管理 · 应急通道',
+  'nav.adminOwnership': '管理 · 归属',
 
   'common.loading': '加载中…',
   'common.error': '错误：{message}',
+  // 后台自动刷新失败，与 common.error 是两回事：页面上的数据仍然有效，只是可能不是最新的，
+  // 所以这里不会把已经渲染出来的内容替换掉（useApiData 的 pollError）。
+  'common.refreshFailed': '自动刷新失败（{message}），下方内容可能不是最新的，正在自动重试…',
   'common.noData': '暂无数据。',
   'common.action': '操作',
   'common.reason': '原因',
@@ -61,6 +65,10 @@ const zh: Dict = {
   'pager.previous': '上一页',
   'pager.next': '下一页',
   'pager.pageOf': '第 {page} / {pageCount} 页',
+  'pager.pageN': '第 {page} 页',
+  'pager.older': '更早',
+  'pager.newer': '更晚',
+  'pager.filterScopeHint': '筛选仅作用于当前页的 {count} 条记录，不会检索其他页。',
   'scanState.queued': '排队中',
   'scanState.running': '扫描中',
   'scanState.scored': '已评分',
@@ -70,6 +78,7 @@ const zh: Dict = {
   'lifecycle.scanning': '扫描中',
   'lifecycle.review_pending': '待复核',
   'lifecycle.published': '已发布',
+  'lifecycle.blocked': '已拦截',
   'lifecycle.quarantined': '已隔离',
   'lifecycle.retired': '已退役',
 
@@ -85,6 +94,10 @@ const zh: Dict = {
   'login.tabLocal': '账号密码',
   'login.username': '用户名',
   'login.password': '密码',
+
+  'notFound.title': '404 - 页面不存在',
+  'notFound.description': '你访问的地址不存在，或者已经被移动。',
+  'notFound.backHome': '返回概览页',
 
   'dashboard.title': '概览',
   'dashboard.signedInAs': '当前登录：{subject}。',
@@ -104,6 +117,10 @@ const zh: Dict = {
   'scans.skillIdLabel': 'Skill ID（选填）',
   'scans.skillIdPlaceholder': '填写后登记进清单并跟踪生命周期',
   'scans.trustTierLabel': '信任层级',
+  'scans.trustTierLockedHint':
+    '该 Skill ID 已登记，重新提交时按其记录的信任层级（{tier}）判定，此处的选择不会生效，因此已禁用。',
+  'scans.trustTierFirstOnlyHint':
+    '信任层级仅在该 Skill ID 首次登记时生效；若它已登记，判定使用 Skill 记录的层级。',
   'trustTier.internal': '内部',
   'trustTier.partner': '合作伙伴',
   'trustTier.public': '公开',
@@ -127,7 +144,30 @@ const zh: Dict = {
   'scanDetail.state': '状态',
   'scanDetail.verdict': '判定',
   'scanDetail.score': '安全评分',
-  'scanDetail.submitter': '提交者',
+  'scanDetail.isSafe': '是否安全',
+  'scanDetail.isSafeYes': '安全',
+  'scanDetail.isSafeNo': '不安全',
+  'scanDetail.submitters': '提交者：',
+  'scanDetail.dedupSubmittersHint': '（内容完全相同的多次提交会合并为同一次扫描）',
+  'submissionChannel.console': '控制台',
+  'submissionChannel.marketplace': '应用市场',
+  'scanDetail.submitterRequestedTier': '请求层级 {tier}',
+  'scanDetail.trustTier': '本次请求的信任层级：',
+  'scanDetail.judgedAtTier': '实际判定层级：',
+  'scanDetail.tierMismatch': '两者不一致：拦截阈值随信任层级变化，本次判定并非在你请求的层级上作出。',
+  'scanDetail.tierMismatchLooser':
+    '⚠ 本次判定所依据的层级比你请求的更宽松。内容完全相同的提交会合并为同一次扫描，判定不会重做，' +
+    '因此你拿到的是在更高拦截门槛下作出的结论——在你请求的层级上本应拦截的发现项，这里可能显示为通过。',
+  'scanDetail.tierMismatchStricter':
+    '本次判定所依据的层级比你请求的更严格。这是安全的一侧，但可能存在过度拦截：' +
+    '在你请求的层级上本可放行的发现项，这里可能被判为拦截。',
+  'scanDetail.tierMismatchEquivalent':
+    '两个层级名称不同，但当前门禁策略对它们使用相同的拦截阈值，因此本次判定结论不受影响。',
+  'scanDetail.signals': '扫描级信号',
+  'scanDetail.hardGateHits': '硬门禁命中（不可豁免）：',
+  'scanDetail.trifectaSignals': '致命三元组信号：',
+  'scanDetail.trifectaHint':
+    '三类信号（私密数据访问 / 不可信输入 / 对外传输）同时出现即构成致命三元组，严重级别强制升至“严重”。',
   'scanDetail.requiredEngineWarning': '警告：并非所有必需引擎都已成功完成本次扫描（结果可能不完整）',
   'scanDetail.neverScoredNotice':
     '本次扫描从未真正完成引擎评分——上方判定是引擎处理异常（如任务反复投递失败）触发的强制拦截（fail-closed），并非基于检测发现得出，因此没有按引擎/按类别的明细可展示。',
@@ -148,8 +188,13 @@ const zh: Dict = {
   'scanDetail.colRule': '规则',
   'scanDetail.colTitle': '标题',
   'scanDetail.colSeverity': '严重级别',
+  'scanDetail.colConfidence': '置信度',
   'scanDetail.colPath': '路径',
   'scanDetail.colEvidence': '证据（已脱敏）',
+
+  'trifecta.private_data_access': '私密数据访问',
+  'trifecta.untrusted_input': '不可信输入',
+  'trifecta.external_egress': '对外传输',
 
   'verdict.PASS': '通过',
   'verdict.BLOCK': '不通过',
@@ -208,16 +253,29 @@ const zh: Dict = {
   'reviews.confirmDescription': '扫描 {scanId}…，复核意见：{reason}',
   'reviews.noReason': '（未填写）',
   'reviews.pendingBadge': '待复核',
-  'reviews.metaLine': '扫描 {scanId}… · 提交者：{submitter} · 判定时间：{issuedAt}',
+  'reviews.metaLine': '提交者：{submitter} · 判定时间：{issuedAt}',
+  'reviews.viewEvidence': '查看扫描 {scanId}… 的完整证据',
   'reviews.autoReasonsHeading': '自动判定依据：',
   'reviews.unknownSubmitter': '未知',
-  'reviews.reasonSeverityAll': '全部发现综合严重级别：{level}',
-  'reviews.reasonSeverityNonLlm': '非大模型发现的严重级别：{level}',
-  'reviews.reasonHardGateHit': '命中不可豁免的硬门禁规则：{rules}',
-  'reviews.reasonFailClosed': '必需引擎缺失或执行失败，按兜底策略判定：{detail}',
-  'reviews.reasonDedupCollision': '存在去重冲突，已从原始扫描结果恢复被覆盖的信号',
-  'reviews.reasonFindingsCapped': '发现数量超过展示上限，强制转人工复核',
-  'reviews.reasonUnknown': '未识别的判定代码（原文）：{code}',
+  'reviews.supersededBadge': '已失效',
+  'reviews.supersededHint':
+    '该 Skill 的生命周期已离开此条复核对应的内容（提交了新版本，或被管理员下架/隔离）。现在通过或拒绝都不会生效，请等待当前版本的复核。',
+
+  // 判定原因（gate.py 的 reason code）——复核页与扫描详情页共用，见 i18n/reasons.ts。
+  'reason.severityAll': '全部发现综合严重级别：{level}',
+  'reason.severityNonLlm': '非大模型发现的严重级别：{level}',
+  'reason.hardGateHit': '命中不可豁免的硬门禁规则：{rules}',
+  'reason.failClosedRequiredEngine': '必需引擎缺失或执行失败，按兜底策略判定',
+  'reason.failClosedUnknownCause': '按兜底策略判定（未识别的原因代码：{cause}）',
+  // {detail} 是运行时生成的自由文本（引擎名、投递失败原因等），原样附在译文之后。
+  'reason.failClosedDetail': '{cause}：{detail}',
+  'reason.dedupCollision': '存在去重冲突，已从原始扫描结果恢复被覆盖的信号',
+  'reason.findingsCapped': '发现数量超过展示上限，强制转人工复核',
+  // {engines} 是运行时生成的引擎名逗号列表，原样附在译文之后。
+  'reason.sandboxWaitTimeout': '等待沙箱引擎超时，已强制出具判定：{engines}',
+  // {detail} 是「审核人：决定 - 理由」原始文本，人工输入，不做进一步解析，原样附在译文之后。
+  'reason.manualReview': '人工复核记录：{detail}',
+  'reason.unknown': '未识别的判定代码（原文）：{code}',
 
   'allowlist.title': '加白列表',
   'allowlist.description': '四眼原则由后端强制：审批人（即你）必须与申请人不同。',
@@ -256,10 +314,13 @@ const zh: Dict = {
 
   'inventory.title': '清单',
   'inventory.quarantineFailed': '隔离操作失败',
+  'inventory.restoreFailed': '恢复操作失败',
   'inventory.retireFailed': '退役操作失败',
   'inventory.quarantineSucceeded': '已隔离该 Skill。',
+  'inventory.restoreSucceeded': '已恢复该 Skill，现在可以提交新版本了。',
   'inventory.retireSucceeded': '已退役该 Skill。',
   'inventory.confirmQuarantineTitle': '确认隔离该 Skill？',
+  'inventory.confirmRestoreTitle': '确认恢复该 Skill？',
   'inventory.confirmRetireTitle': '确认退役该 Skill？',
   'inventory.confirmDescription': 'Skill {skillId}',
   'inventory.colSkillId': 'Skill ID',
@@ -271,12 +332,63 @@ const zh: Dict = {
   'inventory.statTrustTier': '信任级别',
   'inventory.statVersions': '版本数',
   'inventory.quarantine': '隔离',
+  'inventory.restore': '恢复',
   'inventory.retire': '退役',
+  'inventory.restoreHint': '仅对已隔离的 Skill 可用。隔离期间无法提交新版本，须先由 admin 恢复为已发布。',
   'inventory.versionsHeading': '版本历史',
   'inventory.colContentHash': '内容哈希',
   'inventory.colToolchainDigest': '工具链摘要',
   'inventory.colCreated': '创建时间',
   'inventory.baseline': '基线：{hash}，批准于 {when}',
+  'inventory.statOwner': '归属人',
+  'inventory.ownerNone': '无归属记录',
+  'inventory.ownerNoneHint':
+    '该 Skill 没有归属记录（登记时该字段尚不存在），因此失败关闭：只有 admin 能为它提交新版本。由 admin 指派归属人后即可恢复正常提交。',
+  'inventory.ownerHeading': '归属',
+  'inventory.ownerLabel': '归属人',
+  'inventory.ownerPlaceholder': '登录身份',
+  'inventory.ownerAssign': '指派归属人',
+  'inventory.ownerTransfer': '转移归属',
+  'inventory.ownerAssignHint': '该 Skill 当前无归属，指派归属人不会从任何人手中收回权限。',
+  'inventory.ownerTransferHint': '当前归属人为 {owner}。转移会收回其提交新版本的权限。',
+  'inventory.ownerExactHint':
+    '按登录身份逐字匹配。填错不会把权限交给别人：该 Skill 只会继续保持仅 admin 可提交的状态，可以重新指派。',
+  'inventory.ownerAssignSucceeded': '归属已更新。',
+  'inventory.ownerAssignFailed': '归属更新失败',
+  'inventory.confirmOwnerAssignTitle': '确认指派归属人？',
+  'inventory.confirmOwnerTransferTitle': '确认转移归属？',
+  'inventory.confirmOwnerAssignDescription': 'Skill {skillId} 的归属人将设为 {owner}。',
+  'inventory.confirmOwnerTransferDescription':
+    'Skill {skillId} 的归属将从 {from} 转移给 {to}，此后 {from} 无法再提交新版本。',
+
+  'ownership.title': '归属指派',
+  'ownership.description':
+    '列出所有没有归属记录的 Skill。无归属即失败关闭：只有 admin 能为它们提交新版本。',
+  'ownership.evidenceWarning':
+    '「创世提交者」只是参考证据：它记录的是当初谁提交了这个 Skill，不等于现在谁有权修改它。系统不会自动采用该值——请自行判断后填写归属人。',
+  'ownership.ownerLabel': '归属人',
+  'ownership.ownerPlaceholder': '登录身份',
+  'ownership.ownerExactHint':
+    '按登录身份逐字匹配。填错不会把权限交给别人：这些 Skill 只会继续保持仅 admin 可提交的状态，可以重新指派。',
+  'ownership.assignSelected': '指派选中的 {count} 项',
+  'ownership.assignSucceeded': '已指派 {count} 个 Skill 的归属人。',
+  'ownership.assignPartial': '成功 {assigned} 项，失败 {failed} 项。',
+  'ownership.assignFailed': '指派失败',
+  'ownership.tooManySelected': '一次最多指派 {max} 项，请减少选择。',
+  'ownership.failuresHeading': '未能指派的项',
+  'ownership.colSkillId': 'Skill ID',
+  'ownership.colError': '原因',
+  'ownership.colGenesisActor': '创世提交者',
+  'ownership.colSource': '来源',
+  'ownership.colTrustTier': '信任层级',
+  'ownership.colState': '状态',
+  'ownership.colCreated': '创建时间',
+  'ownership.noGenesisActor': '无记录',
+  'ownership.selectAll': '全选当前页',
+  'ownership.total': '共 {total} 个无归属 Skill',
+  'ownership.confirmTitle': '确认指派归属人？',
+  'ownership.confirmDescription':
+    '将把 {count} 个 Skill 的归属人设为 {owner}。这是一次权限变更，会写入审计链。',
 
   'reeval.title': '重评 / 漂移',
   'reeval.triggerFailed': '触发重评失败',
@@ -396,6 +508,10 @@ const zh: Dict = {
   'audit.colOperator': '操作人',
   'audit.colAction': '操作',
   'audit.colWhen': '发生时间',
+  'audit.seqRange': '第 {first} – {last} 条',
+  'audit.noEntriesOnPage': '本页无记录',
+  'audit.chainScope':
+    '链校验覆盖整个账本：无论当前查看哪一页，均从创世条目起逐条重算至最新一条，不以任何中间条目为可信起点。',
 
   'adminEngines.title': '管理 · 引擎',
   'adminEngines.toggleFailed': '状态切换失败',
@@ -437,6 +553,22 @@ const zh: Dict = {
   'adminPolicy.colHardGateChange': '涉及硬门禁',
   'adminPolicy.approve': '批准',
   'adminPolicy.reject': '拒绝',
+  'adminPolicy.template.version': '# 新策略版本号 - 必须与当前生效版本不同',
+  'adminPolicy.template.requiredEnginesComment1':
+    '# 必须始终跑完的引擎（INV-1：这些引擎缺失则本次扫描 required_ok=false）',
+  'adminPolicy.template.requiredEnginesComment2': '# 从当前生效策略预填，如需增删请谨慎',
+  'adminPolicy.template.hardGateRulesComment1':
+    '# 不可加白豁免的规则 ID（INV-3/INV-8：无论 allowlist scope 如何都强制拦截）',
+  'adminPolicy.template.hardGateRulesComment2': '# 留空表示没有强制硬门规则',
+  'adminPolicy.template.reviewConfidence': '# 复核阈值：置信度低于此值的发现不计入判定（0-1 之间）',
+  'adminPolicy.template.blockOnSeverity': '# 达到此严重级别 -> 直接 BLOCK',
+  'adminPolicy.template.reviewOnSeverity': '# 达到此严重级别 -> 转人工复核（REVIEW）',
+  'adminPolicy.template.tierBlockOverridesIntro':
+    '# 按信任级别收紧（只能收紧，不能放宽）block 阈值，可选，删除整段等于不覆盖',
+  'adminPolicy.template.tierBlockOverridesExample':
+    '# tier_block_overrides:\n#   - tier: public\n#     severity: HIGH',
+  'adminPolicy.template.allowlistableMaxSeverity': '# 加白列表能豁免的最高严重级别，超过此级别不可加白',
+  'adminPolicy.template.failClosedVerdict': '# 策略引擎自身出错时的兜底判定（永远选保守项，即 BLOCK）',
 
   'adminUsers.title': '管理 · 用户',
   'adminUsers.description': '两类账号来源：本地账号（管理员直接管理）与 IdP 组→角色映射（对接统一身份认证）。',
@@ -534,9 +666,12 @@ const en: Dict = {
   'nav.adminUsers': 'Admin · Users',
   'nav.adminIntel': 'Admin · Intel',
   'nav.adminBreakglass': 'Admin · BreakGlass',
+  'nav.adminOwnership': 'Admin · Ownership',
 
   'common.loading': 'Loading…',
   'common.error': 'Error: {message}',
+  'common.refreshFailed':
+    'Automatic refresh failed ({message}); what is shown below may be out of date. Retrying…',
   'common.noData': 'No data.',
   'common.action': 'Action',
   'common.reason': 'Reason',
@@ -558,6 +693,10 @@ const en: Dict = {
   'pager.previous': 'Previous',
   'pager.next': 'Next',
   'pager.pageOf': 'Page {page} of {pageCount}',
+  'pager.pageN': 'Page {page}',
+  'pager.older': 'Older',
+  'pager.newer': 'Newer',
+  'pager.filterScopeHint': 'Filters apply only to the {count} rows on this page - other pages are not searched.',
   'scanState.queued': 'Queued',
   'scanState.running': 'Running',
   'scanState.scored': 'Scored',
@@ -567,6 +706,7 @@ const en: Dict = {
   'lifecycle.scanning': 'Scanning',
   'lifecycle.review_pending': 'Review pending',
   'lifecycle.published': 'Published',
+  'lifecycle.blocked': 'Blocked',
   'lifecycle.quarantined': 'Quarantined',
   'lifecycle.retired': 'Retired',
 
@@ -582,6 +722,10 @@ const en: Dict = {
   'login.tabLocal': 'Account',
   'login.username': 'Username',
   'login.password': 'Password',
+
+  'notFound.title': '404 - Page not found',
+  'notFound.description': 'The address you requested does not exist, or has moved.',
+  'notFound.backHome': 'Back to dashboard',
 
   'dashboard.title': 'Dashboard',
   'dashboard.signedInAs': 'Signed in as {subject}.',
@@ -601,6 +745,10 @@ const en: Dict = {
   'scans.skillIdLabel': 'Skill ID (optional)',
   'scans.skillIdPlaceholder': 'registers into inventory + lifecycle tracking',
   'scans.trustTierLabel': 'Trust tier',
+  'scans.trustTierLockedHint':
+    'This skill ID is already registered, so a resubmission is judged at its recorded trust tier ({tier}). A choice here would be ignored, so it is disabled.',
+  'scans.trustTierFirstOnlyHint':
+    'Trust tier applies only when this skill ID is registered for the first time. If it is already registered, the verdict uses the tier recorded on the skill.',
   'trustTier.internal': 'Internal',
   'trustTier.partner': 'Partner',
   'trustTier.public': 'Public',
@@ -624,7 +772,30 @@ const en: Dict = {
   'scanDetail.state': 'state',
   'scanDetail.verdict': 'verdict',
   'scanDetail.score': 'security score',
-  'scanDetail.submitter': 'submitter',
+  'scanDetail.isSafe': 'safe to use?',
+  'scanDetail.isSafeYes': 'Safe',
+  'scanDetail.isSafeNo': 'Not safe',
+  'scanDetail.submitters': 'Submitters:',
+  'scanDetail.dedupSubmittersHint':
+    '(submissions of byte-identical content are merged into one scan)',
+  'submissionChannel.console': 'Console',
+  'submissionChannel.marketplace': 'Marketplace',
+  'scanDetail.submitterRequestedTier': 'requested {tier}',
+  'scanDetail.trustTier': 'Trust tier you requested:',
+  'scanDetail.judgedAtTier': 'Tier the verdict was reached at:',
+  'scanDetail.tierMismatch':
+    'These differ: the block threshold depends on the trust tier, so this verdict was not reached at the tier you requested.',
+  'scanDetail.tierMismatchLooser':
+    '⚠ This verdict was reached under a MORE PERMISSIVE tier than you requested. Submissions of byte-identical content are merged into one scan and the adjudication is not redone, so you are seeing a conclusion made at a higher block threshold - a finding that would have blocked at the tier you asked for can read as passing here.',
+  'scanDetail.tierMismatchStricter':
+    'This verdict was reached under a STRICTER tier than you requested. That is the safe direction, but it can over-block: a finding that would have been allowed at the tier you asked for may have been blocked here.',
+  'scanDetail.tierMismatchEquivalent':
+    'The two tier names differ, but the current gate policy applies the same block threshold to both, so this verdict is unaffected.',
+  'scanDetail.signals': 'Scan-level signals',
+  'scanDetail.hardGateHits': 'Hard-gate hits (unwaivable):',
+  'scanDetail.trifectaSignals': 'Fatal-trifecta signals:',
+  'scanDetail.trifectaHint':
+    'All three signals (private data access / untrusted input / external egress) occurring together form the fatal trifecta, which forces severity to Critical.',
   'scanDetail.requiredEngineWarning':
     'Warning: not every required engine completed for this scan (results may be incomplete)',
   'scanDetail.neverScoredNotice':
@@ -647,8 +818,13 @@ const en: Dict = {
   'scanDetail.colRule': 'Rule',
   'scanDetail.colTitle': 'Title',
   'scanDetail.colSeverity': 'Severity',
+  'scanDetail.colConfidence': 'Confidence',
   'scanDetail.colPath': 'Path',
   'scanDetail.colEvidence': 'Evidence (redacted)',
+
+  'trifecta.private_data_access': 'Private data access',
+  'trifecta.untrusted_input': 'Untrusted input',
+  'trifecta.external_egress': 'External egress',
 
   'verdict.PASS': 'PASS',
   'verdict.BLOCK': 'BLOCK',
@@ -703,16 +879,33 @@ const en: Dict = {
   'reviews.confirmDescription': 'Scan {scanId}…, reason: {reason}',
   'reviews.noReason': '(none entered)',
   'reviews.pendingBadge': 'Pending review',
-  'reviews.metaLine': 'Scan {scanId}… · Submitted by: {submitter} · Decided at: {issuedAt}',
+  'reviews.metaLine': 'Submitted by: {submitter} · Decided at: {issuedAt}',
+  'reviews.viewEvidence': 'View the full evidence for scan {scanId}…',
   'reviews.autoReasonsHeading': 'Automated basis:',
   'reviews.unknownSubmitter': 'unknown',
-  'reviews.reasonSeverityAll': 'Combined severity across all findings: {level}',
-  'reviews.reasonSeverityNonLlm': 'Severity excluding LLM-flagged findings: {level}',
-  'reviews.reasonHardGateHit': 'Hit an unwaivable hard-gate rule: {rules}',
-  'reviews.reasonFailClosed': 'A required engine was missing or failed - fail-closed verdict: {detail}',
-  'reviews.reasonDedupCollision': 'A dedup collision occurred - the overwritten signal was restored from the raw scan result',
-  'reviews.reasonFindingsCapped': 'Finding count exceeded the display cap - forced to human review',
-  'reviews.reasonUnknown': 'Unrecognized reason code (raw): {code}',
+  'reviews.supersededBadge': 'Superseded',
+  'reviews.supersededHint':
+    'This skill has moved past the content this entry covers (a newer version was submitted, or an admin retired/quarantined it). Approving or rejecting it now would have no effect - decide the current version instead.',
+
+  // Verdict reason codes (from gate.py) - shared by Reviews and Scan detail,
+  // see i18n/reasons.ts.
+  'reason.severityAll': 'Combined severity across all findings: {level}',
+  'reason.severityNonLlm': 'Severity excluding LLM-flagged findings: {level}',
+  'reason.hardGateHit': 'Hit an unwaivable hard-gate rule: {rules}',
+  'reason.failClosedRequiredEngine': 'A required engine was missing or failed - fail-closed verdict',
+  'reason.failClosedUnknownCause': 'Fail-closed verdict (unrecognized cause code: {cause})',
+  // {detail} is free-form runtime text (engine names, dispatch failure
+  // reasons) and is appended verbatim after the translated part.
+  'reason.failClosedDetail': '{cause}: {detail}',
+  'reason.dedupCollision': 'A dedup collision occurred - the overwritten signal was restored from the raw scan result',
+  'reason.findingsCapped': 'Finding count exceeded the display cap - forced to human review',
+  // {engines} is a runtime-generated comma-joined engine list, appended
+  // verbatim after the translated part.
+  'reason.sandboxWaitTimeout': 'Timed out waiting for sandbox engines - verdict was forced through: {engines}',
+  // {detail} is raw "<reviewer>: <decision> - <reason>" text a human typed,
+  // never parsed further, appended verbatim after the translated label.
+  'reason.manualReview': 'Manual review recorded: {detail}',
+  'reason.unknown': 'Unrecognized reason code (raw): {code}',
 
   'allowlist.title': 'Allowlist',
   'allowlist.description':
@@ -752,10 +945,13 @@ const en: Dict = {
 
   'inventory.title': 'Inventory',
   'inventory.quarantineFailed': 'quarantine failed',
+  'inventory.restoreFailed': 'restore failed',
   'inventory.retireFailed': 'retire failed',
   'inventory.quarantineSucceeded': 'Skill quarantined.',
+  'inventory.restoreSucceeded': 'Skill restored - a new version can be submitted again.',
   'inventory.retireSucceeded': 'Skill retired.',
   'inventory.confirmQuarantineTitle': 'Quarantine this skill?',
+  'inventory.confirmRestoreTitle': 'Restore this skill?',
   'inventory.confirmRetireTitle': 'Retire this skill?',
   'inventory.confirmDescription': 'Skill {skillId}',
   'inventory.colSkillId': 'Skill ID',
@@ -767,12 +963,65 @@ const en: Dict = {
   'inventory.statTrustTier': 'trust tier',
   'inventory.statVersions': 'versions',
   'inventory.quarantine': 'Quarantine',
+  'inventory.restore': 'Restore',
   'inventory.retire': 'Retire',
+  'inventory.restoreHint': 'Only for a quarantined skill. A quarantined skill cannot take a new version - an admin has to restore it to published first.',
   'inventory.versionsHeading': 'Versions',
   'inventory.colContentHash': 'Content hash',
   'inventory.colToolchainDigest': 'Toolchain digest',
   'inventory.colCreated': 'Created',
   'inventory.baseline': 'Baseline: {hash} approved {when}',
+  'inventory.statOwner': 'owner',
+  'inventory.ownerNone': 'no owner on record',
+  'inventory.ownerNoneHint':
+    'No owner is on record for this skill (it was registered before the column existed), so it fails closed: only an admin can submit a new version of it. An admin assigning an owner restores normal submission.',
+  'inventory.ownerHeading': 'Ownership',
+  'inventory.ownerLabel': 'Owner',
+  'inventory.ownerPlaceholder': 'login identity',
+  'inventory.ownerAssign': 'Assign owner',
+  'inventory.ownerTransfer': 'Transfer ownership',
+  'inventory.ownerAssignHint':
+    'This skill currently has no owner, so assigning one takes authority away from nobody.',
+  'inventory.ownerTransferHint':
+    'Currently owned by {owner}. A transfer revokes their authority to submit new versions.',
+  'inventory.ownerExactHint':
+    'Matched verbatim against the login identity. A typo grants nobody anything - the skill simply stays admin-only and can be assigned again.',
+  'inventory.ownerAssignSucceeded': 'Ownership updated.',
+  'inventory.ownerAssignFailed': 'ownership update failed',
+  'inventory.confirmOwnerAssignTitle': 'Assign this owner?',
+  'inventory.confirmOwnerTransferTitle': 'Transfer ownership?',
+  'inventory.confirmOwnerAssignDescription': 'Skill {skillId} will be owned by {owner}.',
+  'inventory.confirmOwnerTransferDescription':
+    'Skill {skillId} moves from {from} to {to}. {from} will no longer be able to submit new versions of it.',
+
+  'ownership.title': 'Ownership assignment',
+  'ownership.description':
+    'Every skill with no owner on record. Unowned fails closed: only an admin can submit a new version of one.',
+  'ownership.evidenceWarning':
+    'The genesis submitter is advisory evidence only - it records who first submitted a skill, not who may modify it now. Nothing applies it automatically; decide, then type the owner yourself.',
+  'ownership.ownerLabel': 'Owner',
+  'ownership.ownerPlaceholder': 'login identity',
+  'ownership.ownerExactHint':
+    'Matched verbatim against the login identity. A typo grants nobody anything - these skills simply stay admin-only and can be assigned again.',
+  'ownership.assignSelected': 'Assign {count} selected',
+  'ownership.assignSucceeded': 'Assigned an owner to {count} skills.',
+  'ownership.assignPartial': '{assigned} assigned, {failed} failed.',
+  'ownership.assignFailed': 'assignment failed',
+  'ownership.tooManySelected': 'At most {max} skills per request - reduce the selection.',
+  'ownership.failuresHeading': 'Not assigned',
+  'ownership.colSkillId': 'Skill ID',
+  'ownership.colError': 'Reason',
+  'ownership.colGenesisActor': 'Genesis submitter',
+  'ownership.colSource': 'Source',
+  'ownership.colTrustTier': 'Trust tier',
+  'ownership.colState': 'State',
+  'ownership.colCreated': 'Created',
+  'ownership.noGenesisActor': 'not recorded',
+  'ownership.selectAll': 'Select all on this page',
+  'ownership.total': '{total} unowned skills in total',
+  'ownership.confirmTitle': 'Assign this owner?',
+  'ownership.confirmDescription':
+    'Sets the owner of {count} skills to {owner}. This is a privilege change and is written to the audit chain.',
 
   'reeval.title': 'Reeval / Drift',
   'reeval.triggerFailed': 'trigger failed',
@@ -894,6 +1143,10 @@ const en: Dict = {
   'audit.colOperator': 'Operator',
   'audit.colAction': 'Action',
   'audit.colWhen': 'When',
+  'audit.seqRange': 'Entries {first} – {last}',
+  'audit.noEntriesOnPage': 'No entries on this page',
+  'audit.chainScope':
+    'The chain check covers the whole ledger: whichever page you are viewing, it recomputes every entry from the genesis entry to the newest one and trusts no intermediate entry as a starting point.',
 
   'adminEngines.title': 'Admin · Engines',
   'adminEngines.toggleFailed': 'toggle failed',
@@ -935,6 +1188,25 @@ const en: Dict = {
   'adminPolicy.colHardGateChange': 'Hard-gate change',
   'adminPolicy.approve': 'Approve',
   'adminPolicy.reject': 'Reject',
+  'adminPolicy.template.version': '# New policy version - must differ from the currently active version',
+  'adminPolicy.template.requiredEnginesComment1':
+    '# Engines that must always run (INV-1: required_ok=false for this scan if any are missing)',
+  'adminPolicy.template.requiredEnginesComment2': '# Pre-filled from the currently active policy - edit with care',
+  'adminPolicy.template.hardGateRulesComment1':
+    '# Rule IDs that can never be allowlisted (INV-3/INV-8: blocked regardless of allowlist scope)',
+  'adminPolicy.template.hardGateRulesComment2': '# Empty means no rule is hard-gated',
+  'adminPolicy.template.reviewConfidence':
+    '# Review threshold: findings below this confidence do not count toward the verdict (0-1)',
+  'adminPolicy.template.blockOnSeverity': '# At or above this severity -> BLOCK outright',
+  'adminPolicy.template.reviewOnSeverity': '# At or above this severity -> send to human REVIEW',
+  'adminPolicy.template.tierBlockOverridesIntro':
+    '# Tighten (never loosen) the block threshold by trust tier - optional, delete the whole block to leave unset',
+  'adminPolicy.template.tierBlockOverridesExample':
+    '# tier_block_overrides:\n#   - tier: public\n#     severity: HIGH',
+  'adminPolicy.template.allowlistableMaxSeverity':
+    '# Highest severity that can be allowlisted - above this, no exemption is possible',
+  'adminPolicy.template.failClosedVerdict':
+    '# Fallback verdict if the policy engine itself errors (always the conservative choice, BLOCK)',
 
   'adminUsers.title': 'Admin · Users',
   'adminUsers.description':
@@ -1005,3 +1277,23 @@ const en: Dict = {
 }
 
 export const TRANSLATIONS: Record<Locale, Dict> = { zh, en }
+
+function interpolate(template: string, params?: Record<string, string | number>): string {
+  if (!params) return template
+  return template.replace(/\{(\w+)\}/g, (match, key: string) =>
+    key in params ? String(params[key]) : match,
+  )
+}
+
+// The translator itself, free of React - I18nProvider wraps this, and pure
+// tests use it directly so they exercise the SAME lookup the app does rather
+// than a re-implementation that can drift.
+//
+// A missing key resolves to the key string itself, never to '': callers such
+// as i18n/reasons.ts rely on that identity to detect "no translation exists"
+// and fall back to the raw wire value.
+export function makeTranslate(locale: Locale) {
+  const dict = TRANSLATIONS[locale]
+  return (key: string, params?: Record<string, string | number>): string =>
+    interpolate(dict[key] ?? key, params)
+}

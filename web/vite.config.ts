@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
 // Dev-server proxy to the BFF backend - same-origin from the browser's point
@@ -13,5 +13,9 @@ export default defineConfig({
       '/healthz': 'http://localhost:8000',
       '/readyz': 'http://localhost:8000',
     },
+  },
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
   },
 })

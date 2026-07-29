@@ -11,19 +11,27 @@ NOTE: this local dev MySQL instance is a long-lived, shared, ever-accumulating
 fixture across many test runs (audit_entry is append-only by design, and
 audit_intent rows are never deleted). Every test below uses a per-invocation
 unique `action` string (uuid-suffixed) so its own count-based assertions are
-never polluted by rows any other run left behind.
+never polluted by rows any other run left behind. `verify_chain` is a
+whole-ledger claim with no cursor to scope it (see its docstring, and
+`test_tamper_before_a_page_cursor_is_still_detected` below), so any test that
+asserts on it first resets the ledger to its genesis anchor - other test files
+seed non-chaining dummy audit_entry rows into this same table, and a
+genesis-rooted scan correctly rejects those.
+
+The privileged out-of-band writes those two things need (reset, tamper) live in
+`monolith.tests._audit_admin` - see that module for why they must not become a
+grant in db/setup_grants.py.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-import os
 import uuid
 
 import pytest
-from common.db import make_engine
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 
 from monolith.modules.audit.models import AuditEntry, AuditIntent
 from monolith.modules.audit.service import (
@@ -34,38 +42,13 @@ from monolith.modules.audit.service import (
     verify_chain,
 )
 from monolith.modules.gate.models import AuditIntentInsertOnly
-from monolith.tests.conftest import SessionmakerFixture
-
-# SECURITY (threat model): audit_entry is append-only to EVERY application user -
-# svc_audit has INSERT+SELECT and deliberately no UPDATE/DELETE (INV-12 immutability).
-# A couple of the whole-chain tests below legitimately need writes that NO app path
-# is ever permitted to make: (1) resetting the shared, ever-accumulating ledger back
-# to its genesis anchor so a `verify_chain(since_seq=0)` assertion is deterministic
-# even though other test files seed non-chaining dummy audit_entry rows into the same
-# table, and (2) simulating an attacker/DBA who bypasses the grants to mutate a row -
-# exactly the out-of-band tampering the hash chain exists to DETECT. Doing either via
-# svc_audit would be denied by MySQL (correctly) - so these use a privileged admin
-# connection, which also keeps the test honest about what the chain actually defends
-# against (a compromise the least-privilege grants can't themselves prevent).
-_ADMIN_DB_URL = os.environ.get(
-    "SKILLSCAN_TEST_ADMIN_DB_URL", "mysql+aiomysql://root@localhost/skillscan"
+from monolith.tests._audit_admin import (
+    admin_exec,
+    reset_chain_to_genesis,
+    restore_genesis_row,
+    wipe_entire_ledger,
 )
-
-
-async def _admin_exec(sql: str, params: dict[str, object] | None = None) -> None:
-    engine = make_engine(_ADMIN_DB_URL)
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text(sql), params or {})
-    finally:
-        await engine.dispose()
-
-
-async def _reset_chain_to_genesis() -> None:
-    """Delete every non-genesis row so a since_seq=0 whole-chain assertion is not
-    polluted by dummy/non-chaining audit_entry rows other test files seed into this
-    shared, append-only ledger (see module note - this is an out-of-band admin write)."""
-    await _admin_exec("DELETE FROM audit_entry WHERE seq > 1")
+from monolith.tests.conftest import SessionmakerFixture
 
 
 def _unique_action(label: str) -> str:
@@ -84,13 +67,19 @@ async def _seed_intents(gate_sessionmaker: SessionmakerFixture, *, action: str, 
             )
 
 
-async def _current_tail_seq(audit_sessionmaker: SessionmakerFixture) -> int:
-    """A checkpoint for `verify_chain(session, since_seq=...)` - see module note."""
+async def _chained_seqs(audit_sessionmaker: SessionmakerFixture, *, action: str) -> list[int]:
     async with audit_sessionmaker() as session:
-        tail = (
-            await session.execute(select(AuditEntry).order_by(AuditEntry.seq.desc()).limit(1))
-        ).scalar_one_or_none()
-        return tail.seq if tail is not None else 0
+        return list(
+            (
+                await session.execute(
+                    select(AuditEntry.seq)
+                    .where(AuditEntry.action == action)
+                    .order_by(AuditEntry.seq.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
 
 
 class TestCanonicalJsonAndHash:
@@ -142,7 +131,23 @@ class TestAppendAndDrain:
         action = _unique_action("test_drain_batch")
         await _seed_intents(gate_sessionmaker, action=action, count=5)
 
-        chained = await drain_pending_intents(audit_sessionmaker, batch_size=100)
+        # Drain to EXHAUSTION, not to a fixed batch size. `audit_intent` is
+        # shared across every test file, and a single `batch_size=100` call is
+        # only enough if fewer than ~95 foreign pending rows happen to be
+        # queued ahead of these 5 - `drain_pending_intents` walks the backlog
+        # oldest-first, so a large enough backlog fills the batch entirely with
+        # other files' rows and chains none of this test's. Measured on the VM
+        # 2026-07-29: `test_inventory_service.py` alone leaves 120 unchained
+        # intents behind, and re-running this file after it failed with
+        # `assert 5 == 0`. It passes inside a full-suite run purely because
+        # `test_audit_*` sorts before `test_inventory_*`, which makes it an
+        # ordering accident rather than isolation.
+        chained: list[object] = []
+        while True:
+            batch = await drain_pending_intents(audit_sessionmaker, batch_size=100)
+            if not batch:
+                break
+            chained.extend(batch)
         assert len(chained) >= 5  # other tests may have left unrelated pending rows too
 
         async with audit_sessionmaker() as session:
@@ -159,44 +164,44 @@ class TestAppendAndDrain:
     async def test_verify_chain_is_true_after_draining(
         self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
     ) -> None:
+        # Own the ledger state: other test files seed non-chaining dummy rows into
+        # this shared table and verify_chain is a whole-ledger claim, so reset to the
+        # genesis anchor first, then build a real chain to verify.
+        await reset_chain_to_genesis()
         action = _unique_action("test_verify_chain")
-        checkpoint = await _current_tail_seq(audit_sessionmaker)
         await _seed_intents(gate_sessionmaker, action=action, count=3)
         await drain_pending_intents(audit_sessionmaker, batch_size=100)
 
         async with audit_sessionmaker() as session:
-            assert await verify_chain(session, since_seq=checkpoint) is True
+            assert await verify_chain(session) is True
 
     @pytest.mark.asyncio
     async def test_full_chain_from_genesis_verifies(
         self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
     ) -> None:
-        """Regression (found on first VM deploy): verify_chain(since_seq=0) -
-        the exact call GET /v1/audit makes - must return True on a real
-        migrated chain. The genesis row's entry_hash is a fixed bootstrap value
-        (initial migration) that is NOT derived via compute_entry_hash, so the
-        verifier must trust it as the root anchor rather than recomputing it;
-        before the fix, every deployment reported chain_valid=False. No prior
-        test exercised since_seq=0 (all used checkpointed since_seq>0), which
-        is why this shipped undetected."""
-        # Own the ledger state: other test files seed non-chaining dummy rows into
-        # this shared table, and a since_seq=0 scan legitimately fails on those - so
-        # reset to the genesis anchor first, then build a real chain to verify.
-        await _reset_chain_to_genesis()
+        """Regression (found on first VM deploy): verify_chain() - the exact
+        call GET /v1/audit makes - must return True on a real migrated chain.
+        The genesis row's entry_hash is a fixed bootstrap value (initial
+        migration) that is NOT derived via compute_entry_hash, so the verifier
+        must trust it as the root anchor rather than recomputing it; before the
+        fix, every deployment reported chain_valid=False. No test exercised the
+        genesis-rooted scan at all (they all used a checkpointed `since_seq>0`
+        scan, which skipped genesis), which is why this shipped undetected."""
+        await reset_chain_to_genesis()
         action = _unique_action("test_full_chain")
         await _seed_intents(gate_sessionmaker, action=action, count=3)
         await drain_pending_intents(audit_sessionmaker, batch_size=100)
         async with audit_sessionmaker() as session:
-            assert await verify_chain(session, since_seq=0) is True
+            assert await verify_chain(session) is True
 
     @pytest.mark.asyncio
     async def test_full_chain_detects_non_genesis_tamper(
         self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
     ) -> None:
         """The genesis-as-anchor fix must NOT weaken tamper detection for real
-        entries: a mutated payload on any non-genesis row still fails a full
-        since_seq=0 scan (its recomputed hash no longer matches)."""
-        await _reset_chain_to_genesis()
+        entries: a mutated payload on any non-genesis row still fails the scan
+        (its recomputed hash no longer matches)."""
+        await reset_chain_to_genesis()
         action = _unique_action("test_tamper")
         await _seed_intents(gate_sessionmaker, action=action, count=3)
         await drain_pending_intents(audit_sessionmaker, batch_size=100)
@@ -210,18 +215,130 @@ class TestAppendAndDrain:
             # SECURITY (threat model): tamper via an out-of-band admin write, NOT an
             # app user - svc_audit has no UPDATE on audit_entry by design (the hash
             # chain exists precisely to detect writes that bypass those grants).
-            await _admin_exec(
+            await admin_exec(
                 "UPDATE audit_entry SET payload = :p WHERE seq = :s",
                 {"p": json.dumps({**(original_payload or {}), "tampered": True}), "s": tail_seq},
             )
             async with audit_sessionmaker() as session:
-                assert await verify_chain(session, since_seq=0) is False
+                assert await verify_chain(session) is False
         finally:
             # Restore the row so the shared chain stays valid for later tests.
-            await _admin_exec(
+            await admin_exec(
                 "UPDATE audit_entry SET payload = :p WHERE seq = :s",
                 {"p": json.dumps(original_payload), "s": tail_seq},
             )
+
+    @pytest.mark.asyncio
+    async def test_tamper_before_a_page_cursor_is_still_detected(
+        self, audit_sessionmaker: SessionmakerFixture, gate_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """SECURITY (milestone F Task 17) - the regression test for the anchor bug.
+
+        `verify_chain` used to take a `since_seq` cursor and, when given one,
+        anchor on the entry AT the cursor: it trusted that entry's stored hash
+        and never read a single entry before it. `GET /v1/audit?since_seq=N`
+        passed the page cursor straight through, so rewriting an entry OLDER
+        than the page under view produced `chain_valid: true` - the console
+        told an auditor the log was intact while looking away from exactly the
+        rows an attacker would rewrite. Measured before the fix: True.
+
+        This asserts the whole-ledger claim directly. Delete the "always scan
+        from genesis" behaviour (e.g. reintroduce a cursor and skip ahead to
+        it) and this test fails, because the mutated row is not just outside
+        the page - it is outside the window the old code would have read.
+        """
+        await reset_chain_to_genesis()
+        action = _unique_action("test_pre_cursor_tamper")
+        await _seed_intents(gate_sessionmaker, action=action, count=6)
+        await drain_pending_intents(audit_sessionmaker, batch_size=100)
+        seqs = await _chained_seqs(audit_sessionmaker, action=action)
+        assert len(seqs) == 6
+        victim_seq, cursor_seq = seqs[0], seqs[-1]
+        # The point of the test: the row we mutate is strictly older than the
+        # cursor a paging client would have supplied.
+        assert victim_seq < cursor_seq
+
+        async with audit_sessionmaker() as session:
+            original_payload = (
+                await session.execute(
+                    select(AuditEntry.payload).where(AuditEntry.seq == victim_seq)
+                )
+            ).scalar_one()
+            # Positive control: the ledger really is intact right now, so a False
+            # below can only have come from the tamper and not from ambient
+            # pollution of this shared dev ledger.
+            assert await verify_chain(session) is True
+        try:
+            await admin_exec(
+                "UPDATE audit_entry SET payload = :p WHERE seq = :s",
+                {
+                    "p": json.dumps({**(original_payload or {}), "tampered": True}),
+                    "s": victim_seq,
+                },
+            )
+            async with audit_sessionmaker() as session:
+                assert await verify_chain(session) is False
+        finally:
+            await admin_exec(
+                "UPDATE audit_entry SET payload = :p WHERE seq = :s",
+                {"p": json.dumps(original_payload), "s": victim_seq},
+            )
+
+    def test_verify_chain_takes_no_cursor_argument(self) -> None:
+        """A cheaper, weaker answer must not be one keyword argument away. If a
+        `since_seq`-style parameter is ever reintroduced, callers will pass their
+        page cursor into it again (that is exactly how the bug above happened) -
+        so the absence of the parameter is itself part of the fix and is asserted."""
+        params = list(inspect.signature(verify_chain).parameters)
+        assert params == ["session"]
+
+    @pytest.mark.asyncio
+    async def test_a_wiped_ledger_does_not_verify_as_intact(
+        self, audit_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """SECURITY REGRESSION LOCK (2026-07-29, milestones E+F review): an
+        EMPTY `audit_entry` is a deleted ledger, and must fail verification.
+
+        `verify_chain` opened with `if not rows: return True  # an empty ledger
+        has nothing to have been tampered with`. That reasoning holds only for
+        a table that was never created. In any migrated deployment the genesis
+        row is INSERTed by the initial schema migration itself
+        (1d6112d0e997_initial_core_schema.py), so the ledger is non-empty from
+        the moment the schema exists - and an empty one therefore means the
+        whole thing was DELETED. That is the most complete form of the
+        tampering Task 17 hardened every other path in this function against,
+        and it was the one input that reported `chain_valid: true`.
+
+        Measured before the fix: `DELETE FROM audit_entry` -> True; delete
+        all-but-genesis -> True (correct, that is a legitimately intact
+        one-row ledger, and it is the positive control below); delete genesis
+        alone -> False (already correct - the lowest surviving row does not
+        carry the `prev_hash == GENESIS_HASH` marker).
+
+        The wipe is an out-of-band admin write (see `_audit_admin`): no
+        application user may DELETE from this table, which is exactly why the
+        hash chain has to be the thing that notices.
+        """
+        # Positive control: a ledger holding only its genesis anchor IS intact,
+        # so the False below can only come from the wipe itself.
+        await reset_chain_to_genesis()
+        async with audit_sessionmaker() as session:
+            assert await verify_chain(session) is True
+
+        try:
+            await wipe_entire_ledger()
+            async with audit_sessionmaker() as session:
+                assert await verify_chain(session) is False, (
+                    "an erased audit ledger verified as intact - the console "
+                    "would print 'chain intact' over a deleted audit trail"
+                )
+        finally:
+            # Non-negotiable: this dev ledger is shared with every other test
+            # and with the local dev backend, and `append_one_intent` reads its
+            # tail. Leaving it empty would break both.
+            await restore_genesis_row()
+        async with audit_sessionmaker() as session:
+            assert await verify_chain(session) is True
 
 
 class TestConcurrentDrainProducesAConsistentChain:
@@ -235,9 +352,9 @@ class TestConcurrentDrainProducesAConsistentChain:
         drainers racing for the same pending intents must still produce
         exactly one audit_entry per audit_intent and a fully verifiable chain.
         """
+        await reset_chain_to_genesis()  # verify_chain below is a whole-ledger claim
         action = _unique_action("test_concurrent_drain")
         n_intents = 20
-        checkpoint = await _current_tail_seq(audit_sessionmaker)
         await _seed_intents(gate_sessionmaker, action=action, count=n_intents)
 
         # 6 concurrent "replicas" all draining from the same shared pending pool.
@@ -248,7 +365,7 @@ class TestConcurrentDrainProducesAConsistentChain:
         assert total_chained >= n_intents  # SKIP LOCKED: no double-claims, none dropped
 
         async with audit_sessionmaker() as session:
-            assert await verify_chain(session, since_seq=checkpoint) is True
+            assert await verify_chain(session) is True
 
             entry_count_for_action = (
                 await session.execute(

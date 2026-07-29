@@ -83,3 +83,10 @@ class SkillVersionReadOnly(Base):
     content_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
     skill_id: Mapped[str] = mapped_column(String(128), nullable=False)
     toolchain_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 2026-07-29 (milestone F Task 11 follow-up I4): mapped so
+    # `list_published_toolchain_statuses` can pick a skill's CURRENT version
+    # instead of fanning out over every version it has ever had. Already a
+    # column on the table (inventory.models.SkillVersionRow writes it at
+    # registration) and already covered by svc_reeval's SELECT grant on
+    # `skill_version` - no schema change, no grant change.
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=False), nullable=False)

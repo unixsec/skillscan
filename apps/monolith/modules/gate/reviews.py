@@ -2,10 +2,12 @@
 `POST /v1/reviews/{scan_id}`: "SoD 强制 approver≠submitter").
 
 This is a composition-root-level orchestrator (like `reeval.service`'s
-reconciliation functions) that legitimately holds TWO modules' sessions at
+reconciliation functions) that legitimately holds THREE modules' sessions at
 once: `orchestration_session` (read-only, to learn who submitted the scan -
-gate has no grant on `scan_job`) and `gate_session` (to read/update the
-verdict itself). SECURITY: `scan_id` is the PRIMARY KEY on `verdict`, so a
+gate has no grant on `scan_job`), `gate_session` (to read/update the verdict
+itself) and `inventory_session` (read-only, to learn whether the skill has
+already moved past the content this review covers - see
+`SupersededReviewError`). SECURITY: `scan_id` is the PRIMARY KEY on `verdict`, so a
 reviewed scan's row is UPDATED in place (there is no way to keep both the
 original automated REVIEW verdict AND a final one as separate rows under the
 current schema) - the original decision's reasons are preserved inside the
@@ -23,7 +25,10 @@ from skillscan_core import CategoryWeights, Verdict
 from skillscan_core.scoring import security_score
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from monolith.modules.inventory.lifecycle import pending_review_is_superseded
+from monolith.modules.inventory.service import lifecycle_position_for_content
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow
+from monolith.modules.orchestration.service import is_scan_submitter
 
 from .models import AuditIntentInsertOnly, GateOutboxRow, VerdictRow
 from .service import SignerPort
@@ -56,6 +61,23 @@ class NotPendingReviewError(ReviewDecisionError):
     (409), not a missing-resource 404."""
 
 
+class SupersededReviewError(ReviewDecisionError):
+    """The verdict is still REVIEW, but the SKILL has moved past the content
+    it covers - a newer version was submitted, or an admin retired/quarantined
+    it (409, same "conflict with current state" family as
+    `NotPendingReviewError`).
+
+    SECURITY/UX (2026-07-29, milestone F Task 11 follow-up I3): without this,
+    the decision was accepted, the verdict row was rewritten and signed, and
+    then `worker.sync_lifecycle_tick` silently discarded it - it only
+    transitions skills whose latest state is `scanning` or `review_pending`.
+    The approver's sign-off vanished with no feedback, and the audit trail
+    recorded a `review_decided` intent that never moved anything. Refusing is
+    the honest answer: the queue entry is stale, and the current version has
+    its own review to come.
+    """
+
+
 _DECISION_TO_VERDICT = {"approve": "PASS", "reject": "BLOCK"}
 
 
@@ -67,6 +89,7 @@ async def submit_review_decision(
     *,
     orchestration_session: AsyncSession,
     gate_session: AsyncSession,
+    inventory_session: AsyncSession | None,
     scan_id: str,
     decision: str,
     reviewer: str,
@@ -75,15 +98,54 @@ async def submit_review_decision(
 ) -> VerdictRow:
     """SECURITY: caller must run `gate_session` inside `async with
     gate_session.begin():` - the verdict update/outbox/audit rows commit
-    atomically (INV-12), same as `gate.service.decide_and_record`."""
+    atomically (INV-12), same as `gate.service.decide_and_record`.
+
+    `inventory_session` is a REQUIRED keyword with no default (same posture as
+    `inventory.service.register_skill_version`'s `actor_is_admin`): a new call
+    site that has not thought about supersession is then a type error, not a
+    silently accepted decision that the worker will throw away. `None` means
+    this deployment has no inventory module wired at all - the same condition
+    `reviews_router` already tests before enriching the queue - in which case
+    no lifecycle exists to supersede anything and every REVIEW is decidable.
+    """
     if decision not in _DECISION_TO_VERDICT:
         raise InvalidDecisionError(f"decision must be one of {sorted(_DECISION_TO_VERDICT)}")
 
     job = await orchestration_session.get(ScanJob, scan_id)
     if job is None:
         raise ReviewNotFoundError(f"scan {scan_id!r} not found")
-    if reviewer == job.submitter:
-        # SECURITY (SoD, coding spec §9): the whole point of this endpoint.
+    # SECURITY (SoD, coding spec §9): the whole point of this endpoint.
+    #
+    # 2026-07-29 (milestone F Task 18): the check used to be `reviewer ==
+    # job.submitter` ALONE, and `ScanJob.submitter` is the FIRST submitter
+    # only. `submit_scan` is single-flight on `cache_key`, so a second person
+    # submitting byte-identical content is handed the first person's scan_job
+    # and recorded in `scan_submitter` - a legitimate co-submitter whose name
+    # the scalar column never mentions. Every other object-level authorization
+    # in this system was converted to that association table by milestone B'
+    # review C2 (see `ScanSubmitterRow`'s docstring); the review path was
+    # missed, so Bob could approve content Bob himself submitted whenever
+    # Alice happened to submit it first.
+    #
+    # `is_scan_submitter` rather than `submitter_attribution`: this is an
+    # authorization decision, and that is the accessor C2 built for
+    # authorization decisions (`gateway.router.get_scan`, `.get_scan_sarif`,
+    # `marketplace_api.router.get_marketplace_scan`) - not a fourth query
+    # shape. `submitter_attribution` is the one producer of a RESPONSE shape
+    # for three endpoints; deciding authorization by testing membership in a
+    # display projection would make any later change to that projection
+    # (redaction, truncation) a silent change to who may approve.
+    #
+    # BOTH conditions, not a replacement - and the union is the safe direction
+    # here specifically because SoD is a DENY rule: widening the set of people
+    # refused can only refuse more. For anything `submit_scan` created the
+    # scalar is already a member of the table, so the two agree; they diverge
+    # only for a scan_job written by some OTHER producer that never appends an
+    # association row - `reeval.controller.build_rescan_job` does exactly that
+    # today. Dropping the scalar would silently disarm SoD on every such scan.
+    if reviewer == job.submitter or await is_scan_submitter(
+        orchestration_session, scan_id=scan_id, subject=reviewer
+    ):
         raise SodViolationError("reviewer must differ from the scan's submitter (SoD)")
 
     verdict_row = await gate_session.get(VerdictRow, scan_id)
@@ -93,6 +155,23 @@ async def submit_review_decision(
         raise NotPendingReviewError(
             f"scan {scan_id!r} is not pending review (current verdict: {verdict_row.verdict!r})"
         )
+
+    if inventory_session is not None:
+        # I3: checked BEFORE anything is signed or written. A superseded entry
+        # must not leave a rewritten verdict, an outbox event or a
+        # `review_decided` audit intent behind - those would all record a
+        # decision that never took effect.
+        position = await lifecycle_position_for_content(
+            inventory_session, content_hash=verdict_row.content_hash
+        )
+        if pending_review_is_superseded(position, review_content_hash=verdict_row.content_hash):
+            # The message names the skill's own current state and nothing
+            # else - same FR-API-060 posture as the sibling errors above.
+            state = position.state if position is not None else "unknown"
+            raise SupersededReviewError(
+                f"scan {scan_id!r} reviews content this skill has already moved past "
+                f"(skill is now {state!r}) - decide the current version's review instead"
+            )
 
     new_verdict = _DECISION_TO_VERDICT[decision]
     new_reasons = [*verdict_row.reasons, f"manual review by {reviewer}: {decision} - {reason}"]

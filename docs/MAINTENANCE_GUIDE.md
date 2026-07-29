@@ -13,9 +13,14 @@
   `uv run python3 scripts/dev/run_local.py`。
 - **改代码后跑质量三件套：** `uv run mypy`（171 文件）、`uv run ruff check .`、
   `uv run ruff format .`。
-- **审计链维护：** `apps/monolith/modules/audit/service.py` 的 `verify_chain(session,
-  *, since_seq=0)` 重新计算每条记录哈希核对链一致性；默认 `since_seq=0` 会重算整条链
-  （开发/测试期可以，生产环境应传入上次已验证过的 `seq` 做增量校验）。
+- **审计链维护：** `apps/monolith/modules/audit/service.py` 的 `verify_chain(session)`
+  从创世条目起重算每条记录哈希、核对整条链，**不接受任何游标参数**（里程碑 F Task 17）。
+  它曾经有 `since_seq`：传入时锚定在游标那条记录上（信任它自己存的哈希），游标之前的记录
+  一条都不读，返回的布尔值却与整链校验的返回值毫无区别——`GET /v1/audit?since_seq=N`
+  就这样把"第 N 页内部自洽"当成"审计日志完整"报给了控制台。实测（本机纯 CPU）重算 3000 条
+  记录的哈希约 8 ms，而整链扫描本来就是该端点默认调用一直在付的代价，所以取消游标没有引入
+  新开销。将来账本真的大到扛不住时，正确解法是**带签名、定期重验的检查点**，而不是让调用方
+  自带一个不可信的游标。
 - **Break-glass 运维：** 激活默认限时 900 秒、单次可用；TOTP 校验容忍 ±30 秒时钟漂移
   （`valid_window=1`）；每次激活/登录均写审计+触发 SecOps 告警。
 - **后台 worker（2026-07-06 晚补齐，关键）：** `apps/monolith/worker.py` 的常驻循环由
@@ -30,6 +35,14 @@
 - **报表运维：** `POST /v1/reports/schedule` 的 cron 由 worker 每分钟评估执行（Redis SET NX
   按"计划×分钟"去重，多副本安全）；投递目标为 SIEM 事件（未配置 SIEM 时记日志，邮件投递
   需要本代码库从未具备的 SMTP 基础设施——诚实跳过并记日志，不假装送达）。
+- **市场对接部署后必须重跑 `db/setup_grants.py`（里程碑 B'，关键）：** `marketplace_api`
+  的取用审计写入用的是独立数据库账号 `svc_marketplace`（`policies/grants/manifest.yaml`），
+  这个账号不会随镜像/代码部署自动创建。**危险之处在于故障是完全无声的**：进程照常启动
+  （数据库引擎惰性连接，启动阶段不会探测这个账号是否存在），`POST/GET /v1/market/scans`
+  照常返回正确结果（审计写入失败不允许阻塞轮询响应，见 §7 设计），唯一的外部表现是
+  `marketplace_fetch_log` 表永远空着——看起来像"系统健康、只是还没人轮询过"。部署本里程碑
+  后，第一次真实轮询发生后应主动 grep 应用日志中的 `marketplace_fetch_audit_write_failed`；
+  出现即说明 `svc_marketplace` 授权缺失或过期，重跑 `db/setup_grants.py` 补上。
 - **策略生效语义（2026-07-06 晚新增）：** 管理员批准提案 → `promote_approved_policy` 当场
   应用并把该行标为 `applied`（ENUM 新值，迁移 `e4b8c31a90d2`）；worker 每 tick 重读最新
   `applied` 行使之跨重启/跨副本收敛。**历史上只停留在 `approved` 的行永远不会自动生效**
@@ -87,19 +100,33 @@ reeval 触发的重扫真正执行（worker 的队列补投递把 DB-only scan_j
 5. **BLOCK 判定没有对应的生命周期状态**——§16.2 状态机没有 `blocked` 态，被 BLOCK 的
    skill 停留在 `scanning`（其签名 BLOCK verdict 在扫描页可见，市场发布永远不会发生）；
    如需显式状态需要扩状态机+迁移，属规格层决策，不在代码层擅自发明。
-6. **~~worker 的引擎执行仍是进程内 floor 引擎~~（2026-07-28 已关闭）**——sandbox 层引擎
-   （bandit / yara / skillspector / osv-scanner）现在真正参与裁决：裁决前会等待它们的结果，
-   最长 300 秒，另加 30 秒 sweep 宽限（让引擎自己的 TIMEOUT 结果有机会先落盘——"我超时了"
-   比"它没来"对运维更有信息量）。超时后以已到结果裁决，并在 `reasons` 里记录哪些引擎
-   没赶上。等待是 advisory 的——sandbox 引擎缺席只降级为"未赶上"，不触发 fail-closed
-   BLOCK，避免单个引擎故障造成批量误判。
-   **等待时长从"开始等待"起算，而非从提交起算**（`scan_job.sandbox_wait_started_at`，
-   迁移 `b7c41f9d2e08`）：否则 worker 停机后积压的扫描会在 floor 结果刚落盘的同一个
-   tick 里因"提交时间已很旧"被强制裁决，整个 sandbox 层被跳过——方向是把本应 REVIEW
-   的包判成 PASS，比误报危险得多。
+6. **~~worker 的引擎执行仍是进程内 floor 引擎~~（2026-07-28 已关闭，里程碑 D）**——sandbox
+   层引擎（bandit / yara / skillspector / osv-scanner）现在真正参与裁决：裁决前会等待
+   它们的结果，最长 300 秒（另加 30 秒 sweep 宽限），超时后以已到结果裁决并在 `reasons`
+   里记录哪些引擎没赶上。等待是 advisory 的——sandbox 引擎缺席只降级为"未赶上"，不触发
+   fail-closed BLOCK，避免单个引擎故障造成批量误判。等待时长从"开始等待"起算而非从提交
+   起算（`scan_job.sandbox_wait_started_at`，迁移 `b7c41f9d2e08`），否则 worker 停机后
+   积压的扫描会在 floor 结果刚落盘的同一个 tick 里被强制裁决、跳过整个 sandbox 层。
    真实提交验证：同一份判定里同时含 floor 层与 bandit/skillspector 的 finding。
-   **注意由此产生的体验落差**：扫描从毫秒级变为分钟级，而扫描详情页目前无自动轮询
-   也无刷新按钮，提交后需手动刷新才能看到最终判定。
+   **注意由此产生的体验落差**：扫描从毫秒级变为分钟级，而扫描详情页目前无自动轮询也无
+   刷新按钮，提交后需手动刷新才能看到最终判定（属里程碑 F 的前端闭环范围）。
+7. **市场对接（里程碑 B'）刻意只做拉取，主动推送与 ORPHAN 对账均未实现**——两者都不是
+   遗漏，而是这次范围的明确边界：
+   - **主动推送（push）**：现有 `gate_outbox` + `HttpMarketplaceAdapter.write_verdict`
+     代码保留但默认关闭（`reconciliation_push_enabled=False`）。它调用的 URL 形状是适配器
+     自己假设的，对方接口从未被确认过，修好了也没有办法验证是否真的对得上——用户
+     2026-07-28 已明确本轮只做 pull。
+   - **ORPHAN 对账**：ORPHAN 的定义是"市场已上架但我方从未出过判定"，检测它必须能读取
+     对方已上架的清单（`list_published()`）。pull-only 模型下我方没有可调的对方接口，
+     这个检测**结构上不可实现**——接上去只会得到一个永远返回空、看起来在工作但什么也
+     检测不到的调度器。§6.8（取用审计表 `marketplace_fetch_log`）是这个空缺在 pull 模型
+     下唯一可实现的对偶：能查"已出判定但从未被取走"，是最接近 ORPHAN 的信号，且完全来自
+     我方数据，不依赖对方接口。
+8. **控制台 `POST /v1/scans` 仍接受调用方表单提交的 `trust_tier`**——本里程碑（B'）只把
+   `/v1/market/scans` 改成了服务端按身份决定 tier（见 `USAGE_GUIDE.md` §6.3），控制台路径
+   未改动。这被认为风险模型不同（控制台面向已认证的内部人员，市场路径面向不受控的外部
+   提交内容），因此不在本里程碑范围内，但仍是一个真实差距：一个内部提交者理论上仍可以
+   声明 `trust_tier=internal` 把本该 BLOCK 的 HIGH 级 finding 降级为 REVIEW。
 
 ## 4. 故障排查
 
@@ -109,16 +136,39 @@ reeval 触发的重扫真正执行（worker 的队列补投递把 DB-only scan_j
 |---|---|---|
 | `ModuleNotFoundError: No module named 'skillscan_core'` | `uv sync` 先于源码文件创建执行 | `uv sync --reinstall-package skillscan` |
 | `address already in use`（`scripts/one_click_dev.sh` 启动失败） | 端口 8000 被前一次未清理的进程占用 | `lsof -i :8000` 找到 PID 后 `kill` |
-| 前端 CSRF 相关 403 | 状态变更请求未携带 `x-csrf-token` 头 | 检查 `require_csrf` 覆盖的 3 种会话 cookie（普通/break-glass/SAML）是否都已识别，见 §5 |
+| 前端 CSRF 相关 403 | 状态变更请求未携带 `x-csrf-token` 头 | 检查 `require_csrf` 覆盖的 4 种会话 cookie（普通/break-glass/SAML/local）是否都已识别，见 §4.2 |
+| 页面能正常浏览，但所有保存/提交操作都返回 403 | 会话 cookie 仍在，但共享的 `csrf_token` cookie 已过期（读请求不校验 CSRF，写请求校验） | 已修复：`CSRF_COOKIE_MAX_AGE_S` 使 CSRF cookie 长于任何会话 TTL，见 §4.2 |
 | break-glass 登录反复 401 | TOTP 码在到达服务端前已过期（30 秒窗口） | 已修复为 `valid_window=1`（±30秒容忍）；仍失败则确认时钟同步 |
+| 市场轮询正常返回结果，但 `marketplace_fetch_log` 表始终为空 | `svc_marketplace` 数据库账号未建立/授权过期，审计写入按设计静默失败且不影响响应（见 §1） | grep 日志中的 `marketplace_fetch_audit_write_failed` 确认；重跑 `db/setup_grants.py` |
 
-### 4.2 CSRF cookie 枚举陷阱（重要的通用教训）
+### 4.2 CSRF cookie 陷阱（重要的通用教训）
 
-**教训：** 当"这是不是 cookie 认证请求"的判断靠枚举具体 cookie 名称实现时，每新增一种
-会话类型都有可能被遗漏，导致该类型的写请求静默豁免 CSRF。这在本项目发生过两次：
-break-glass（更早修复）、以及本次为 SAML 新增会话类型时**主动**同步更新了
-`require_csrf`（`apps/monolith/modules/gateway/auth/dependencies.py`），避免第三次重犯
-同一类问题。**任何未来新增的会话/cookie 类型，必须同步检查 `require_csrf` 是否已识别。**
+本项目**现有 4 种**会话 cookie，全部在 `middleware.py` 的 `SESSION_COOKIE_NAMES` 注册表中：
+`skillscan_session`（OIDC）、`skillscan_breakglass_session`、`skillscan_saml_session`、
+`skillscan_local_session`（2026-07-13 新增）。而 CSRF cookie 只有 `csrf_token` **一个名字**，
+被所有 4 条登录路径共用。这一"1 对 4"的不对称，已经用两种不同的方式咬过这个项目：
+
+**（一）名字枚举导致的静默豁免（fail-OPEN）。** 当"这是不是 cookie 认证请求"的判断靠枚举
+具体 cookie 名称实现时，每新增一种会话类型都可能被遗漏，导致该类型的写请求完全豁免 CSRF。
+break-glass 就这样漏过一次（只有真实浏览器测试才发现）。现已结构性修复：`require_csrf`
+（`apps/monolith/modules/gateway/auth/dependencies.py`）改为查 `SESSION_COOKIE_NAMES` 单一
+注册表，不再手抄名单；`test_dependencies.py::TestCsrfCoversEverySessionCookie` 会自动发现
+模块里声明的所有会话 cookie 常量，与注册表比对，漏掉一个就红。
+
+**（二）共享 cookie 名 + 各自的 TTL 导致的静默锁写（2026-07-29 修复）。** 每条登录路径原本
+用**自己会话的 TTL** 去写这个共享的 `csrf_token`：一次 900 秒的 break-glass 登录，会把一个
+8 小时 local/SAML/OIDC 会话的 CSRF cookie 覆盖成 15 分钟。15 分钟后，那个仍然有效的 8 小时
+会话**读请求一切正常**（CSRF 只校验状态变更方法）、**所有写请求 403**——用户看到的是"页面
+能看但什么都保存不了"，且没有任何提示指向真实原因。修法：CSRF cookie 的生命周期与"是哪条
+登录写的它"彻底解耦——`CSRF_COOKIE_MAX_AGE_S`（7 天，远长于最长的会话 TTL），且
+`set_csrf_cookie()` **不再接受 max_age 参数**，因此"某条登录路径漏改"是 mypy 能查出来的事实，
+而不是需要有人记得的事情。双重提交令牌不是凭据（它必须能被同源 JS 读到），延长它不降低任何
+安全性；`test_middleware.py::TestCsrfCookieOutlivesEverySessionType` 会自动发现所有会话 TTL
+常量并断言它们都短于 CSRF cookie。
+
+**通用教训：单一硬编码的 cookie 名，默认了"所有会话类型是同一种东西"。** 任何未来新增的
+会话/cookie 类型，必须同步检查：(1) 是否已进入 `SESSION_COOKIE_NAMES`；(2) 它的 TTL 是否仍
+短于 `CSRF_COOKIE_MAX_AGE_S`（若通过环境变量把会话 TTL 调到 7 天以上，(二) 会复现）。
 
 ### 4.3 MySQL 并发已知注意事项（M3 已修复，供未来修改审计链代码时参考）
 

@@ -10,6 +10,9 @@ export interface Session {
 export interface ScanSummary {
   scan_id: string
   state: string
+  // The FIRST submitter only (`ScanJob.submitter`). Kept for compatibility -
+  // `submitters` below is the authoritative list. Prefer `submitterNames()`
+  // over reading either directly.
   submitter: string
   content_hash: string
   verdict: string | null
@@ -17,6 +20,30 @@ export interface ScanSummary {
   is_safe: boolean | null
   skill_id: string | null
   skill_name: string | null
+  // 里程碑 F Task 16: the same attribution shape `ScanDetail` carries, on the
+  // LIST too. Until this task the list had only the scalar above, so a
+  // deduplicated scan showed a stranger's name in the table and the right names
+  // one click away in the drawer. Optional in the TYPE only, so a response from
+  // a backend that predates the change still parses; the current backend always
+  // sends all three.
+  submitters?: string[]
+  source?: string[]
+  submitter_sources?: SubmitterSource[]
+}
+
+// Every rightful submitter of a scan, best available source first. The two
+// fallbacks are for a backend that predates 里程碑 F Task 16 and are never used
+// to invent data - an empty result means nothing was recorded, which callers
+// render as absence rather than as a guess.
+//
+// Shared by the scan list and the review queue precisely because one concept
+// with two renderings is the bug this task exists to remove.
+export function submitterNames(scan: {
+  submitter?: string | null
+  submitters?: string[]
+}): string[] {
+  if (scan.submitters?.length) return scan.submitters
+  return scan.submitter ? [scan.submitter] : []
 }
 
 export interface ScanDetail {
@@ -32,7 +59,55 @@ export interface ScanDetail {
   required_ok: boolean | null
   hard_gate_hits: string[]
   reasons: string[]
-  sarif_ref: string | null
+  // 里程碑 F Task 14: two DIFFERENT facts, no longer one column read twice.
+  // `trust_tier` is the tier THIS caller asked for (their own scan_submitter
+  // row); `judged_at_tier` is the tier the verdict was actually adjudicated at
+  // (`ScanJob.trust_tier`). They diverge when single-flight dedup hands a later
+  // submitter someone else's verdict, which is never re-adjudicated.
+  //
+  // When this caller has no recorded request - a reviewer reading someone
+  // else's scan, or a row written before the backend column existed - the
+  // backend returns the judged tier for both, so they compare equal and nothing
+  // is flagged. Per-name truth, including "no request recorded", is in
+  // `submitter_sources`.
+  trust_tier: string | null
+  judged_at_tier: string | null
+  // Which way a divergence cuts, computed server-side from the gate policy's
+  // real block thresholds - never from the declaration order of the tier names,
+  // which is not what determines strictness.
+  //
+  // 'looser' is the case that matters: the verdict was reached under a MORE
+  // PERMISSIVE ruleset than this caller asked for, so a finding that should have
+  // blocked for them can read PASS. 'stricter' is the safe side (possible
+  // over-blocking). 'equivalent' means the names differ but the policy treats
+  // them identically. `null` means no comparison was possible.
+  tier_direction: 'looser' | 'stricter' | 'equivalent' | null
+  // Always a list, even for exactly one submitter - never a bare string.
+  submitters: string[]
+  // 里程碑 F Task 12: the channels this scan arrived through ("console" /
+  // "marketplace"), sorted and deduplicated.
+  //
+  // A LIST, not a single value: one scan legitimately has several submitters
+  // (submissions of identical content collapse onto one scan_job), so the
+  // console and the marketplace submitting the same skill is the normal case -
+  // a scalar would silently drop one of the two channels exactly then.
+  // Empty means no submitter row on this scan records a channel (rows written
+  // before the backend column existed); it is never filled in with a guess.
+  source: string[]
+  // Which submitter arrived through which channel - the per-name attribution
+  // behind `source`. `source: null` on an entry means that row records no
+  // channel; it is passed through verbatim rather than defaulted.
+  submitter_sources: SubmitterSource[]
+}
+
+export interface SubmitterSource {
+  submitter: string
+  source: string | null
+  // 里程碑 F Task 14: the trust tier this particular submitter asked for. `null`
+  // means their row records no request (written before the backend column
+  // existed) and is rendered as unknown - never filled in from the scan's judged
+  // tier, which would assert the agreement the field exists to stop assuming.
+  requested_trust_tier: string | null
 }
 
 export interface Finding {
@@ -58,7 +133,21 @@ export interface ReviewScan {
   reasons: string[]
   issued_at: string
   skill_id: string | null
+  // The FIRST submitter only. See `ScanSummary.submitter`; use
+  // `submitterNames()` rather than reading this directly.
   submitter: string | null
+  // I3: the skill has already moved past the content this entry covers (a
+  // newer version was submitted, or an admin retired/quarantined it), so a
+  // decision on it would be discarded by the lifecycle worker. Server-side
+  // fact, not a frontend inference - the API refuses the decision too.
+  superseded: boolean
+  // 里程碑 F Task 16: identical attribution shape to `ScanSummary` and
+  // `ScanDetail`. It matters more here than on the scan list: SoD forbids
+  // approving a scan you submitted, and a queue showing one name out of several
+  // could offer an approver a decision the API will refuse.
+  submitters?: string[]
+  source?: string[]
+  submitter_sources?: SubmitterSource[]
 }
 
 export interface AllowlistEntry {
@@ -93,11 +182,44 @@ export interface InventorySkill {
   source: string
   trust_tier: string
   state: string | null
+  // 里程碑 F Task 15: who may submit a new version of this skill. `null` means
+  // no owner is on record, which FAILS CLOSED - only an admin can submit it -
+  // and is the state every skill registered before the column existed is in.
+  // Never guessed at from the genesis actor; see UnownedSkill below.
+  owner: string | null
 }
 
 export interface InventoryDetail extends InventorySkill {
   versions: { content_hash: string; toolchain_digest: string; created_at: string }[]
   baseline: { content_hash: string; approved_at: string } | null
+}
+
+export interface UnownedSkill {
+  skill_id: string
+  source: string
+  trust_tier: string
+  state: string | null
+  // ADVISORY ONLY: the identity recorded on this skill's genesis lifecycle
+  // event, i.e. who first submitted it. Shown so an admin can decide an
+  // assignment with the evidence in front of them - never auto-applied, by
+  // this console or by anything else. "Who submitted this once" and "who may
+  // modify it now" are different questions. `null` = no genesis event on
+  // record, reported as unknown rather than filled in.
+  genesis_actor: string | null
+  created_at: string
+}
+
+export interface UnownedSkillPage {
+  // Every unowned skill, not just this page - an admin needs the size of the
+  // job before starting it.
+  total: number
+  skills: UnownedSkill[]
+}
+
+export interface OwnerAssignmentResult {
+  owner: string
+  assigned: string[]
+  failed: { skill_id: string; error: string }[]
 }
 
 export interface ReevalSkill {

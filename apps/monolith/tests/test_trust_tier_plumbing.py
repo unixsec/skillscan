@@ -47,6 +47,7 @@ from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.orchestration.models import ScanJob
 from monolith.modules.orchestration.service import (
+    SubmissionChannel,
     _try_score_and_decide,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
@@ -124,6 +125,8 @@ async def _run_pipeline_once(
             engine_metadatas=(_ENGINE.metadata,),
             policy=policy,
             trust_tier=trust_tier,
+            source=SubmissionChannel.CONSOLE,
+            requested_trust_tier=trust_tier,
         )
 
     for _ in range(20):

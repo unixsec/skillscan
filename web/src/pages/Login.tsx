@@ -1,8 +1,28 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { useSession } from '../auth/SessionContext'
 import { useI18n } from '../i18n/I18nContext'
+
+// Where to land after a successful sign-in. `next` is set by client.ts when a
+// request 401s, so an expired session returns the user to the page they were
+// actually on instead of dumping them on the dashboard.
+//
+// SECURITY: `next` is attacker-controllable - it arrives in a URL anyone can
+// send. Only a same-origin absolute path is honoured; anything starting with a
+// scheme, `//` or `/\` would be an open redirect that turns this login page
+// into a credible phishing hop.
+export function safeNextPath(raw: string | null): string {
+  if (!raw) return '/'
+  // `/\evil.com` and `//evil.com` are both off-site in a browser.
+  if (raw[0] !== '/' || raw[1] === '/' || raw[1] === '\\') return '/'
+  return raw
+}
+
+function useNextPath(): string {
+  const [searchParams] = useSearchParams()
+  return safeNextPath(searchParams.get('next'))
+}
 
 // NOTE: normal SSO (OIDC/SAML) has no login-callback endpoint wired yet in
 // this backend (see docs/stories/BACKLOG.md's M8 status note). Two working
@@ -19,6 +39,7 @@ function BreakglassForm() {
   const { refresh } = useSession()
   const { t } = useI18n()
   const navigate = useNavigate()
+  const next = useNextPath()
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
@@ -27,7 +48,7 @@ function BreakglassForm() {
     try {
       await api.post('/v1/admin/breakglass/login', { credential, totp_code: totpCode })
       refresh()
-      navigate('/')
+      navigate(next)
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : t('login.failed'))
     } finally {
@@ -86,6 +107,7 @@ function LocalAccountForm() {
   const { refresh } = useSession()
   const { t } = useI18n()
   const navigate = useNavigate()
+  const next = useNextPath()
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
@@ -94,7 +116,7 @@ function LocalAccountForm() {
     try {
       await api.post('/v1/admin/local/login', { username, password })
       refresh()
-      navigate('/')
+      navigate(next)
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : t('login.failed'))
     } finally {

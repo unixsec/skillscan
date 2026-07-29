@@ -17,7 +17,7 @@ import uuid
 import pytest
 from skillscan_core import TrustTier
 from skillscan_core import cache_key as core_cache_key
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -52,6 +52,21 @@ class _SkillVersionRow(_InventoryBase):
     content_hash: Mapped[str] = mapped_column(primary_key=True)
     skill_id: Mapped[str] = mapped_column()
     toolchain_digest: Mapped[str] = mapped_column()
+    # I4: the seeds that do not care about version ordering leave this unset and
+    # let the column's own DEFAULT CURRENT_TIMESTAMP(6) fill it in; the
+    # multi-version test sets it explicitly, because "which version is current"
+    # is the whole thing it asserts.
+    #
+    # `server_default` is REQUIRED, not decoration, and `Mapped[... | None]`
+    # alone is wrong (measured against real MySQL 2026-07-29, milestone F VM
+    # pass - it failed with `(1048, "Column 'created_at' cannot be null")`).
+    # A nullable-typed column with no default is still part of the INSERT
+    # column list, and SQLAlchemy sends an explicit NULL for it; a column
+    # DEFAULT only applies when the column is OMITTED from the INSERT, and
+    # `server_default` is what tells SQLAlchemy it may omit it. The DDL here is
+    # never emitted (alembic owns this table), so this declares the default the
+    # migration already created rather than defining a new one.
+    created_at: Mapped[datetime.datetime | None] = mapped_column(server_default=func.now())
 
 
 def _status(
@@ -172,6 +187,54 @@ class TestListPublishedToolchainStatuses:
         assert matching[0].trust_tier is TrustTier.PUBLIC
         assert matching[0].content_hash == content_hash
         assert matching[0].recorded_toolchain_digest == "digest-v1"
+
+    @pytest.mark.asyncio
+    async def test_only_the_current_version_of_a_multi_version_skill_is_listed(
+        self,
+        inventory_sessionmaker: SessionmakerFixture,
+        reeval_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """I4 (2026-07-29, milestone F Task 11 follow-up): the join used to
+        emit one row per skill_VERSION, which was harmless only while a skill
+        could not HAVE a second version - `"submitted"` appeared 0 times as a
+        target in `lifecycle.VALID_TRANSITIONS`. Task 11 removed that lockout
+        and this started fanning out over every version ever submitted:
+        `POST /v1/reeval/{skill_id}` queued a rescan of every historical
+        package, and `GET /v1/reeval` reported a staleness row for each.
+        Re-evaluation re-applies CURRENT detection to what is live.
+        """
+        skill_id = f"skill-{uuid.uuid4().hex[:12]}"
+        old_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        new_hash = uuid.uuid4().hex + uuid.uuid4().hex
+        older = datetime.datetime(2026, 7, 1, 9, 0, 0)
+        newer = datetime.datetime(2026, 7, 29, 9, 0, 0)
+        async with inventory_sessionmaker() as session, session.begin():
+            session.add(_SkillRow(skill_id=skill_id, source="test", trust_tier="public"))
+            # Inserted newest-FIRST so a pass that merely takes whatever the
+            # driver yields last cannot accidentally look correct.
+            session.add(
+                _SkillVersionRow(
+                    content_hash=new_hash,
+                    skill_id=skill_id,
+                    toolchain_digest="digest-v2",
+                    created_at=newer,
+                )
+            )
+            session.add(
+                _SkillVersionRow(
+                    content_hash=old_hash,
+                    skill_id=skill_id,
+                    toolchain_digest="digest-v1",
+                    created_at=older,
+                )
+            )
+
+        async with reeval_sessionmaker() as session:
+            statuses = await list_published_toolchain_statuses(session)
+        matching = [s for s in statuses if s.skill_id == skill_id]
+        assert len(matching) == 1
+        assert matching[0].content_hash == new_hash
+        assert matching[0].recorded_toolchain_digest == "digest-v2"
 
     @pytest.mark.asyncio
     async def test_reeval_session_cannot_write_to_skill_table(

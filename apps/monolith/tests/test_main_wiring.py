@@ -132,6 +132,31 @@ class TestVaultAddrInternalValidation:
             create_app(auth_runtime=_fake_auth_runtime())
 
 
+# SECURITY regression (whole-branch review, 2026-07-29): `_build_marketplace()`
+# reads `SKILLSCAN_MARKETPLACE_API_BASE_URL` via a raw `os.environ.get(...)` -
+# the same shape as the `SKILLSCAN_VAULT_ADDR` bug `TestVaultAddrInternalValidation`
+# above regression-tests. Unlike that bug, this read is NOT a bypass: the value
+# flows straight into `MarketplaceSettings(api_base_url=...)`, whose own
+# `require_internal_endpoint` model_validator fires regardless of source - but
+# nothing proved that before this test (`monolith.config.Settings` also carried
+# a same-shaped but DEAD `marketplace_api` field, bound to a different env var
+# name that nothing set, until this review removed it). This locks in that the
+# already-existing validation actually fires at startup.
+class TestMarketplaceApiInternalValidation:
+    def test_non_internal_marketplace_api_base_url_fails_closed_at_startup(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("SKILLSCAN_BLOBSTORE_ROOT", str(tmp_path / "blobstore"))
+        # 8.8.8.8 (Google public DNS) - unambiguously public, no DNS lookup
+        # needed (already a literal IP), so this is deterministic regardless
+        # of test-environment network/DNS availability.
+        monkeypatch.setenv("SKILLSCAN_MARKETPLACE_API_BASE_URL", "https://8.8.8.8/")
+        monkeypatch.setenv("SKILLSCAN_MARKETPLACE_POLL_TOKEN", "poll-token-unused")
+        monkeypatch.setenv("SKILLSCAN_MARKETPLACE_WRITE_TOKEN", "write-token-unused")
+        with pytest.raises(ValueError, match="internal/private"):
+            create_app(auth_runtime=_fake_auth_runtime())
+
+
 class TestDynamicSandboxUnimplementedWarning:
     def test_enabling_dynamic_sandbox_warns_rather_than_silently_doing_nothing(
         self,

@@ -14,6 +14,7 @@ import {
   Users,
   Radar,
   KeyRound,
+  UserCog,
 } from 'lucide-react'
 
 export type NavGroup = 'operations' | 'governance' | 'admin'
@@ -66,5 +67,12 @@ export const NAV_ITEMS: NavItem[] = [
   { to: '/admin/policy', labelKey: 'nav.adminPolicy', icon: FileCog, group: 'admin', roles: ['admin'] },
   { to: '/admin/users', labelKey: 'nav.adminUsers', icon: Users, group: 'admin', roles: ['admin'] },
   { to: '/admin/intel', labelKey: 'nav.adminIntel', icon: Radar, group: 'admin', roles: ['admin'] },
+  {
+    to: '/admin/ownership',
+    labelKey: 'nav.adminOwnership',
+    icon: UserCog,
+    group: 'admin',
+    roles: ['admin'],
+  },
   { to: '/admin/breakglass', labelKey: 'nav.adminBreakglass', icon: KeyRound, group: 'admin', roles: ['admin'] },
 ]

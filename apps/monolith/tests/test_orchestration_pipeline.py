@@ -42,6 +42,7 @@ from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.orchestration import service as orchestration_service
 from monolith.modules.orchestration.models import ScanJob
 from monolith.modules.orchestration.service import (
+    SubmissionChannel,
     _try_score_and_decide,
     run_mock_engine_worker_tick,
     run_result_collector_tick,
@@ -185,6 +186,8 @@ async def _run_pipeline_once(
             engine_metadatas=(_ENGINE.metadata,),
             policy=policy,
             trust_tier=TrustTier.INTERNAL,
+            source=SubmissionChannel.CONSOLE,
+            requested_trust_tier=TrustTier.INTERNAL,
         )
 
     for _ in range(20):
@@ -297,6 +300,8 @@ class TestSingleFlightDedup:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
         async with orchestration_sessionmaker() as session, session.begin():
             scan_id_2 = await submit_scan(
@@ -308,6 +313,8 @@ class TestSingleFlightDedup:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         assert scan_id_1 == scan_id_2
@@ -376,6 +383,8 @@ class TestSkillNameParsing:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         async with orchestration_sessionmaker() as session:
@@ -404,6 +413,8 @@ class TestSkillNameParsing:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         async with orchestration_sessionmaker() as session:
@@ -445,6 +456,8 @@ class TestSkillNameParsing:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         async with orchestration_sessionmaker() as session:
@@ -480,6 +493,8 @@ class TestPoisonPill:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         # Force delivery_count past the threshold by repeatedly claiming (via
@@ -569,6 +584,8 @@ class TestPoisonPill:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
         # Delete the artifact the submission just wrote, so the worker's
         # blobstore.get raises BlobNotFoundError on its very first attempt.
@@ -669,6 +686,8 @@ class TestBlobstoreOffloadedToThread:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         calls = self._spy_to_thread(monkeypatch)
@@ -708,6 +727,8 @@ class TestBlobstoreOffloadedToThread:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
         # Get the mock engine to actually write the findings blob first (a
         # real precondition for _try_score_and_decide's `blobstore.exists`
@@ -783,6 +804,8 @@ class TestResultCollectorExceptionIsolation:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy_good,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
         async with orchestration_sessionmaker() as session, session.begin():
             scan_id_bad = await submit_scan(
@@ -794,6 +817,8 @@ class TestResultCollectorExceptionIsolation:
                 engine_metadatas=(_ENGINE.metadata,),
                 policy=policy_bad,
                 trust_tier=TrustTier.INTERNAL,
+                source=SubmissionChannel.CONSOLE,
+                requested_trust_tier=TrustTier.INTERNAL,
             )
 
         # Get both scans' findings reported so a single run_result_collector_tick

@@ -14,42 +14,45 @@ import type { ActivePolicy, PolicyStatus } from '../../api/types'
 // from the currently active policy so a proposal starts from real values,
 // not a generic example; the four fields the summary API doesn't expose
 // (tier_block_overrides etc.) get documented, sensible starting defaults.
-function policyTemplate(active: ActivePolicy): string {
+//
+// The explanatory comment lines come from `t()` (adminPolicy.template.*) so
+// an English-locale admin edits an English-commented form instead of a
+// Chinese one regardless of what language they picked - only the YAML field
+// names/values, which the real parser cares about, stay literal.
+function policyTemplate(active: ActivePolicy, t: (key: string) => string): string {
   const engines = active.required_engines.map((e) => `  - ${e}`).join('\n')
   const hardGates = active.hard_gate_rules.length
     ? active.hard_gate_rules.map((r) => `  - ${r}`).join('\n')
     : '  # - pii.us_ssn'
-  return `# 新策略版本号 - 必须与当前生效版本不同
+  return `${t('adminPolicy.template.version')}
 version: "${active.version}-draft"
 
-# 必须始终跑完的引擎（INV-1：这些引擎缺失则本次扫描 required_ok=false）
-# 从当前生效策略预填，如需增删请谨慎
+${t('adminPolicy.template.requiredEnginesComment1')}
+${t('adminPolicy.template.requiredEnginesComment2')}
 required_engines:
 ${engines}
 
-# 不可加白豁免的规则 ID（INV-3/INV-8：无论 allowlist scope 如何都强制拦截）
-# 留空表示没有强制硬门规则
+${t('adminPolicy.template.hardGateRulesComment1')}
+${t('adminPolicy.template.hardGateRulesComment2')}
 hard_gate_rules:
 ${hardGates}
 
-# 复核阈值：置信度低于此值的发现不计入判定（0-1 之间）
+${t('adminPolicy.template.reviewConfidence')}
 review_confidence: ${active.review_confidence}
 
-# 达到此严重级别 -> 直接 BLOCK
+${t('adminPolicy.template.blockOnSeverity')}
 block_on_severity: ${active.block_on_severity}
 
-# 达到此严重级别 -> 转人工复核（REVIEW）
+${t('adminPolicy.template.reviewOnSeverity')}
 review_on_severity: ${active.review_on_severity}
 
-# 按信任级别收紧（只能收紧，不能放宽）block 阈值，可选，删除整段等于不覆盖
-# tier_block_overrides:
-#   - tier: public
-#     severity: HIGH
+${t('adminPolicy.template.tierBlockOverridesIntro')}
+${t('adminPolicy.template.tierBlockOverridesExample')}
 
-# 加白列表能豁免的最高严重级别，超过此级别不可加白
+${t('adminPolicy.template.allowlistableMaxSeverity')}
 allowlistable_max_severity: HIGH
 
-# 策略引擎自身出错时的兜底判定（永远选保守项，即 BLOCK）
+${t('adminPolicy.template.failClosedVerdict')}
 fail_closed_verdict: BLOCK
 `
 }
@@ -115,7 +118,7 @@ export function AdminPolicyPage() {
               <div>
                 <button
                   type="button"
-                  onClick={() => setYaml(policyTemplate(data.active_policy))}
+                  onClick={() => setYaml(policyTemplate(data.active_policy, t))}
                   style={{ width: 'fit-content' }}
                 >
                   {t('adminPolicy.insertTemplate')}

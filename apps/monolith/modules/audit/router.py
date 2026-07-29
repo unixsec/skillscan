@@ -73,7 +73,14 @@ async def get_audit_log(
                 select(AuditEntry).order_by(AuditEntry.seq.desc()).limit(bounded_limit)
             )
             entries = list(reversed(result.scalars().all()))
-        chain_valid = await verify_chain(db_session, since_seq=since_seq)
+        # SECURITY (milestone F Task 17): `since_seq` pages the READ; it must
+        # never narrow the VERIFICATION. It used to be passed straight through
+        # to verify_chain(), which anchored the scan on the entry at the cursor
+        # - so a request for a page near the tail reported "chain intact" while
+        # never looking at (let alone re-hashing) any entry before the cursor,
+        # which is precisely where a rewrite would be hidden. `chain_valid` is
+        # a whole-ledger claim on every response, whatever page was asked for.
+        chain_valid = await verify_chain(db_session)
     return {
         "chain_valid": chain_valid,
         "entries": [

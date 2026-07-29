@@ -142,16 +142,40 @@ class IssuedVerdict:
     Whatever orchestrates a reconciliation pass must call
     `list_issued_verdicts` using a session opened with GATE's own credentials,
     then hand these plain values (not ORM rows, not the session) across the
-    module boundary into `reeval.reconciliation.reconcile`."""
+    module boundary into `reeval.reconciliation.reconcile`.
+
+    SECURITY (2026-07-29, milestone F Task 11 follow-up I4): `issued_at`
+    carries because `verdict`'s primary key is `scan_id`, NOT `content_hash` -
+    one package can and does accumulate several verdicts (a reeval-triggered
+    rescan under a new toolchain_digest is a second scan_job over the same
+    bytes). `reconcile` needs to know which of them is CURRENT; without this
+    field it could only take whichever row the driver happened to yield last,
+    and a stale BLOCK beating a current PASS produces a spurious MISMATCH and,
+    on the poll path, an automatic quarantine of a legitimately published
+    skill. Required, no default: a call site that cannot say when a verdict
+    was issued cannot participate in that ordering, and a default would let it
+    silently pretend otherwise."""
 
     content_hash: str
     verdict: str
+    issued_at: datetime.datetime
 
 
 async def list_issued_verdicts(session: AsyncSession) -> Sequence[IssuedVerdict]:
-    result = await session.execute(select(VerdictRow.content_hash, VerdictRow.verdict))
+    """Every issued verdict, newest first. NOT one row per content_hash -
+    the full ledger is what reconciliation's ORPHAN detection is defined
+    against, and collapsing it here would hide the duplicates rather than
+    order them. `reconcile` picks the current verdict per hash from this; the
+    ordering is here so the rows arrive in the order that choice is about,
+    rather than in whatever order the driver happens to yield."""
+    result = await session.execute(
+        select(VerdictRow.content_hash, VerdictRow.verdict, VerdictRow.issued_at).order_by(
+            VerdictRow.issued_at.desc()
+        )
+    )
     return tuple(
-        IssuedVerdict(content_hash=row.content_hash, verdict=row.verdict) for row in result
+        IssuedVerdict(content_hash=row.content_hash, verdict=row.verdict, issued_at=row.issued_at)
+        for row in result
     )
 
 

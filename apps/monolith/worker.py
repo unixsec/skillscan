@@ -33,16 +33,18 @@ One `worker_tick()` drives, in order:
                          on and why aig-mcp-scan is excluded
 5. lifecycle sync      - verdicts drive the §16.2 skill state machine
                          (scanning→published on PASS, scanning→review_pending
-                         on REVIEW; review-approved skills →published) - a
-                         PASS that would publish is first checked against
-                         orchestration.drift.check_drift(); if the skill
-                         already has an approved baseline (inventory.service.
-                         set_baseline, a separate admin action) and this
-                         content_hash doesn't match it, the transition goes
-                         to quarantined instead (coding spec SUPPLY-06:
-                         "content_hash 对比 baseline, 不一致 → 隔离",
-                         FR-REV-020) - closes "drift.py exists, is tested,
-                         has no live caller"
+                         on REVIEW; review-approved skills →published). A
+                         publish here carries a fresh signed verdict for that
+                         exact content_hash, so it ADVANCES the SUPPLY-06
+                         drift baseline onto that content (inventory.service.
+                         advance_baseline_on_publish, same transaction) -
+                         shipping a v2 through the pipeline is the intended
+                         path, not drift. The publish is then still checked
+                         against orchestration.drift.check_drift(), which now
+                         only fires for a baseline an admin pinned out of band
+                         to content this skill never published; that goes to
+                         quarantined (coding spec SUPPLY-06: "content_hash 对
+                         比 baseline, 不一致 → 隔离", FR-REV-020)
 6. audit chain drain   - audit.service.drain_pending_intents
 7. outbox drain        - integration_relay.service.drain_pending_outbox
                          (marketplace writeback + SIEM, both optional)
@@ -63,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from collections.abc import Sequence
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -72,7 +75,8 @@ from common.blobstore import artifact_key
 from common.log import get_logger
 from engine_runner.sandbox_engines import SANDBOX_ENGINE_NAMES
 from skillscan_core import GatePolicy
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from monolith.modules.admin.engine_registry import list_disabled_engines
 from monolith.modules.audit.service import drain_pending_intents
@@ -84,7 +88,7 @@ from monolith.modules.integration_relay.service import drain_pending_outbox
 from monolith.modules.intel.matcher import IntelMatcher, load_known_iocs
 from monolith.modules.inventory.lifecycle import InvalidTransitionError
 from monolith.modules.inventory.models import SkillLifecycleEventRow
-from monolith.modules.inventory.service import transition_skill
+from monolith.modules.inventory.service import advance_baseline_on_publish, transition_skill
 from monolith.modules.orchestration.drift import check_drift
 from monolith.modules.orchestration.floor import floor_engines
 from monolith.modules.orchestration.models import ScanJob
@@ -331,11 +335,21 @@ async def sweep_queued_jobs_to_airlock(
     return swept
 
 
-# verdict string -> target lifecycle state, per coding spec §16.2. BLOCK has
-# deliberately NO entry: the state machine defines no 'blocked' state - a
-# blocked skill stays where it is with its (visible, signed) BLOCK verdict;
-# publish simply never happens.
-_VERDICT_TARGET_STATE = {"PASS": "published", "REVIEW": "review_pending"}
+# verdict string -> target lifecycle state, per coding spec §16.2.
+# BLOCK used to have deliberately NO entry here, on the theory that "the
+# verdict itself is visible and signed" was enough. In practice this left a
+# blocked skill permanently indistinguishable from one still scanning on the
+# inventory page - visible verdict is not the same thing as a readable state.
+_VERDICT_TARGET_STATE = {"PASS": "published", "REVIEW": "review_pending", "BLOCK": "blocked"}
+# The states in which a skill is waiting for a verdict to move it. Exactly the
+# two `sync_lifecycle_tick` acts on, and the same pair `inventory.lifecycle`
+# names in REVIEW_ACTIONABLE_STATE's comment - one spelling, so the tick's
+# pending filter and its stranded-verdict check can never disagree about which
+# states "waiting" means.
+_WAITING_STATES = ("scanning", "review_pending")
+# Redis key prefix for stranded-verdict report dedup (C1) - see
+# `_report_stranded_verdicts`.
+_STRANDED_VERDICT_PREFIX = "skillscan:lifecycle:stranded_verdict:"
 
 
 async def _quarantine_if_drifted(runtime: ScanRuntime, *, skill_id: str, content_hash: str) -> None:
@@ -345,10 +359,26 @@ async def _quarantine_if_drifted(runtime: ScanRuntime, *, skill_id: str, content
     not a legal edge) - so this runs as a follow-up AFTER a skill has just
     published, matching the spec's own "published→quarantined" wording,
     rather than trying to redirect the publish transition itself. A skill
-    with no baseline set yet (the common case - baselines are a separate,
-    deliberate admin action via `inventory.service.set_baseline`) is never
-    drift, by `is_drift`'s own definition - nothing happens for the vast
-    majority of publishes."""
+    with no baseline set yet is never drift, by `is_drift`'s own definition -
+    nothing happens for the vast majority of publishes.
+
+    WHAT THIS STILL CATCHES, after C3 (2026-07-29). Its caller now runs
+    `inventory.service.advance_baseline_on_publish` first, so a publish that
+    is the next link in the skill's own published chain has already moved the
+    baseline onto this content and finds no drift here. What remains, and it
+    is the only case that was ever a real signal: a baseline an ADMIN pinned
+    out of band (`POST /v1/inventory/{skill_id}/baseline`) to content this
+    skill has never published. That pin is a human statement of "the approved
+    content is X"; a pipeline publish of anything else contradicts it, is
+    refused adoption, and lands here - quarantined, for a human to settle.
+
+    WHAT IT NEVER CAUGHT, and must not be mistaken for: content swapped in
+    the marketplace WITHOUT passing through us. That produces no lifecycle
+    event at all, so this function - reachable only from a `-> published`
+    transition we ourselves made - could never observe it. The control for
+    that is `reeval.service.run_poll_reconciliation`, which enumerates the
+    marketplace's published set independently and auto-quarantines an ORPHAN/
+    MISMATCH without consulting `baseline` at all."""
     if runtime.orchestration_session_factory is None or runtime.inventory_session_factory is None:
         return
     async with runtime.orchestration_session_factory() as drift_session:
@@ -386,10 +416,64 @@ async def sync_lifecycle_tick(runtime: ScanRuntime) -> int:
     """Drives the §16.2 skill lifecycle from issued verdicts.
 
     For every skill whose LATEST lifecycle state is 'scanning' or
-    'review_pending', looks up the newest verdict for that event's
-    content_hash (via gate's own session - svc_inventory has no verdict
-    grant, deliberately) and applies the mapped transition. Idempotent:
-    already-transitioned skills no longer match the state filter."""
+    'review_pending', looks up THAT EVENT'S OWN verdict (via gate's own
+    session - svc_inventory has no verdict grant, deliberately) and applies
+    the mapped transition. Idempotent: already-transitioned skills no longer
+    match the state filter.
+
+    SECURITY (2026-07-29, milestones E+F review finding C1) - "that event's
+    own verdict" is the fix. This used to take the NEWEST verdict for the
+    event's `content_hash`, with nothing tying it to the scan the event named
+    (the scan_id lived only in the free-text `reason`) and no check that it
+    even post-dated the event. Since a3f26e4 (finding I1) made a resubmission
+    of UNCHANGED bytes write real lifecycle events, that was live:
+
+      publish at hash H under toolchain T1 -> detection content or policy
+      changes (T2) -> the owner resubmits the same bytes, which is exactly the
+      case I1 exists to serve -> cache_key = f(H, T2) misses so a real new scan
+      is enqueued -> the lifecycle commits published -> submitted -> scanning
+      -> this tick fires within ~1s (`run_worker_loop(interval_s=1.0)`), finds
+      the T1 PASS as newest-for-H and publishes -> seconds later the T2 scan
+      issues BLOCK, to a skill that has already left `scanning` and is no
+      longer in `pending`. Dropped, permanently.
+
+    The mirror case is worse: a `blocked` skill resubmitted under a RELAXED
+    ruleset was instantly re-blocked on its own stale BLOCK, so I1's stated
+    purpose could not work at all. And nothing recovered either -
+    `register_skill_version` deliberately never advances
+    `skill_version.toolchain_digest`, so `reeval` keeps re-queueing rescans
+    whose verdicts hit the same dead end.
+
+    RESOLUTION ORDER, per pending event:
+
+      1. `event.scan_id` (`SkillLifecycleEventRow.scan_id`, added by
+         7f2ad4c9e1b3) -> a point lookup of `verdict` by its PRIMARY KEY. The
+         one verdict this event is waiting for; "newest for this content hash"
+         - a set that legitimately holds several rows once the same bytes are
+         scanned under several toolchains - is not consulted at all.
+      2. NULL scan_id -> LEGACY ROWS ONLY (written before that column existed;
+         the admin routes never leave a skill in a waiting state). Falls back
+         to the newest verdict for the content hash whose `issued_at` is not
+         BEFORE the event - the time-based shape the reviewer offered as the
+         other option, kept here strictly as a fallback so a migrated
+         deployment's in-flight scans still settle instead of sticking in
+         `scanning` forever. It is a heuristic across two modules' clocks
+         (inventory writes `occurred_at`, gate writes `issued_at`), which is
+         why it is not the primary path.
+
+    A VERDICT THE LIFECYCLE CANNOT ACT ON IS NEVER SILENTLY DROPPED. Resolving
+    by scan_id removes the drop this finding is about - the event waits for its
+    own scan, and `scanning -> submitted` is not a legal edge, so nothing can
+    move the skill on underneath an in-flight scan. What remains is an admin
+    moving a skill out of a waiting state (retire/quarantine) while its scan is
+    still running: legal, deliberate, and the verdict that lands afterwards has
+    nowhere to go. `_report_stranded_verdicts` below finds exactly those and
+    logs them at WARNING with the scan_id, deduped in Redis so a permanently
+    stranded verdict costs one line a day rather than one a second.
+    Deliberately a report and not an automatic transition: the state machine
+    refuses `published -> blocked` on purpose (lifting or imposing a block goes
+    through a fresh scan or an admin), so the honest answer is to surface it
+    for a human, not to invent an edge for the worker."""
     if runtime.inventory_session_factory is None:
         return 0
 
@@ -410,38 +494,80 @@ async def sync_lifecycle_tick(runtime: ScanRuntime) -> int:
     pending = {
         skill_id: event
         for skill_id, event in latest_by_skill.items()
-        if event.to_state in ("scanning", "review_pending") and event.content_hash
+        if event.to_state in _WAITING_STATES and event.content_hash
     }
     if not pending:
+        # C1: NOT a bare `return 0`. A stranded verdict is by definition one
+        # whose skill is no longer waiting for anything, so "nothing is
+        # pending" is the very state in which it has to still be reported -
+        # returning early here would have made the report unreachable in
+        # exactly the case it exists for.
+        await _report_stranded_verdicts(runtime, events=events, pending=pending)
         return 0
 
-    hashes = {str(e.content_hash) for e in pending.values()}
-    async with runtime.gate_session_factory() as gate_session:
-        verdict_rows = (
-            (
-                await gate_session.execute(
-                    select(VerdictRow)
-                    .where(VerdictRow.content_hash.in_(hashes))
-                    .order_by(VerdictRow.issued_at.desc())
+    # C1: the scans the pending events actually name, and - only for legacy
+    # rows that carry no scan_id - their content hashes. Both sets are read in
+    # ONE gate query; `scan_id` is `verdict`'s primary key, so the first half is
+    # a point lookup per event rather than a scan of every verdict ever issued
+    # for that content.
+    awaited_scan_ids = {str(e.scan_id) for e in pending.values() if e.scan_id}
+    legacy_hashes = {str(e.content_hash) for e in pending.values() if not e.scan_id}
+    verdict_by_scan: dict[str, str] = {}
+    legacy_candidates: list[VerdictRow] = []
+    # Built as a list rather than a fixed two-armed OR: with no legacy rows in
+    # play - the steady state once a deployment has been migrated for a while -
+    # the content_hash arm is not in the query at all, instead of being present
+    # as an `IN ('')` that can never match but still has to be planned.
+    verdict_filters = []
+    if awaited_scan_ids:
+        verdict_filters.append(VerdictRow.scan_id.in_(awaited_scan_ids))
+    if legacy_hashes:
+        verdict_filters.append(VerdictRow.content_hash.in_(legacy_hashes))
+    if verdict_filters:
+        async with runtime.gate_session_factory() as gate_session:
+            verdict_rows = (
+                (
+                    await gate_session.execute(
+                        select(VerdictRow)
+                        .where(or_(*verdict_filters))
+                        .order_by(VerdictRow.issued_at.desc())
+                    )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
-    latest_verdict: dict[str, str] = {}
-    for v in verdict_rows:  # newest first per content_hash
-        latest_verdict.setdefault(str(v.content_hash), str(v.verdict))
+        for v in verdict_rows:
+            if str(v.scan_id) in awaited_scan_ids:
+                verdict_by_scan[str(v.scan_id)] = str(v.verdict)
+            if str(v.content_hash) in legacy_hashes:
+                legacy_candidates.append(v)  # already ordered newest-first
 
     transitioned = 0
     for skill_id, event in pending.items():
-        verdict = latest_verdict.get(str(event.content_hash))
+        verdict = _resolve_event_verdict(event, verdict_by_scan, legacy_candidates)
         if verdict is None:
             continue  # not decided yet
         target = _VERDICT_TARGET_STATE.get(verdict)
         if target is None or target == event.to_state:
-            continue  # BLOCK (no state change), or already there
+            continue  # unmapped verdict, or already there
         try:
             async with runtime.inventory_session_factory() as inv_session, inv_session.begin():
+                if target == "published":
+                    # C3 (2026-07-29): THIS publish is the approval - the
+                    # content just got its own fresh, signed verdict - so it
+                    # becomes the drift baseline, in the same transaction as
+                    # the transition and BEFORE it (the helper reads the
+                    # skill's prior published event; see its docstring for
+                    # both requirements, and for the one case it declines).
+                    # Without this, `_quarantine_if_drifted` below quarantined
+                    # every v2 of a baselined skill, since a new version has a
+                    # different content_hash by definition.
+                    await advance_baseline_on_publish(
+                        inv_session,
+                        skill_id=skill_id,
+                        content_hash=str(event.content_hash),
+                        actor=_WORKER_OPERATOR,
+                    )
                 await transition_skill(
                     inv_session,
                     skill_id=skill_id,
@@ -449,6 +575,18 @@ async def sync_lifecycle_tick(runtime: ScanRuntime) -> int:
                     reason=f"verdict {verdict}",
                     actor=_WORKER_OPERATOR,
                     content_hash=str(event.content_hash),
+                    # C1: carry the link FORWARD, do not drop it here. The
+                    # `scanning -> review_pending` hop is written by this very
+                    # loop, and the `review_pending -> published` hop that
+                    # follows a human approval has to resolve the SAME scan's
+                    # verdict (the review decision rewrites that row in place,
+                    # keyed by scan_id). Dropping it would put every reviewed
+                    # skill back on the newest-for-content-hash path this whole
+                    # fix exists to remove. It is also what makes
+                    # `_report_stranded_verdicts` able to tell "this scan's
+                    # verdict was acted on" from "the skill moved on without
+                    # it".
+                    scan_id=str(event.scan_id) if event.scan_id else None,
                 )
             transitioned += 1
             if target == "published":
@@ -463,7 +601,133 @@ async def sync_lifecycle_tick(runtime: ScanRuntime) -> int:
                 "lifecycle transition skipped",
                 extra={"context": {"skill_id": skill_id, "target": target, "error": str(exc)}},
             )
+
+    await _report_stranded_verdicts(runtime, events=events, pending=pending)
     return transitioned
+
+
+def _resolve_event_verdict(
+    event: SkillLifecycleEventRow,
+    verdict_by_scan: dict[str, str],
+    legacy_candidates: list[VerdictRow],
+) -> str | None:
+    """The verdict THIS lifecycle event is waiting for, or None if it has not
+    been decided yet. See `sync_lifecycle_tick`'s docstring for the resolution
+    order and for the finding (C1) that made an explicit link necessary."""
+    if event.scan_id:
+        return verdict_by_scan.get(str(event.scan_id))
+    # LEGACY ROWS ONLY - see `sync_lifecycle_tick`. `legacy_candidates` is
+    # ordered newest-first, so the first match is the newest verdict for this
+    # content that is not OLDER than the event. The `>=` is what keeps a
+    # pre-existing verdict for the same bytes (the exact stale-verdict shape
+    # C1 is about) from resolving a freshly re-entered scan.
+    for v in legacy_candidates:
+        if str(v.content_hash) == str(event.content_hash) and v.issued_at >= event.occurred_at:
+            return str(v.verdict)
+    return None
+
+
+async def _report_stranded_verdicts(
+    runtime: ScanRuntime,
+    *,
+    events: Sequence[SkillLifecycleEventRow],
+    pending: dict[str, SkillLifecycleEventRow],
+) -> None:
+    """Reports verdicts that were issued for a scan the lifecycle named and
+    then never acted on, because the skill had already moved on.
+
+    SECURITY/OBSERVABILITY (2026-07-29, milestones E+F review finding C1): "a
+    verdict that arrives for a skill that has already moved on must not be
+    silently dropped." Resolving by scan_id removes the drop the finding is
+    about - a `scanning` event now waits for its OWN scan, and `scanning ->
+    submitted` is not a legal edge, so no resubmission can move the skill out
+    from under an in-flight verdict. What remains is an admin retiring - or
+    quarantining a `review_pending` skill - while its scan is still running:
+    legal, deliberate, and the verdict that lands afterwards has nowhere to go.
+
+    ITS SCOPE, STATED PLAINLY: this reports scans the LIFECYCLE NAMED and did
+    not act on. `reeval.controller.build_rescan_job` INSERTs a `scan_job`
+    directly and writes no lifecycle event at all, so its verdicts carry no
+    `scan_id` any event ever referenced and are OUTSIDE this report - they have
+    never driven a transition and still do not. That is a real remaining gap
+    and it is deliberately not papered over here: closing it means giving
+    reeval rescans a lifecycle identity, which is a design change to `reeval`,
+    not a filter in this function.
+
+    WHAT IT DOES, AND WHY NOT MORE: it logs, at WARNING, with the scan_id, the
+    skill, the verdict and where the skill actually stands. It does NOT
+    transition anything. `lifecycle.VALID_TRANSITIONS` refuses `published ->
+    blocked` on purpose (a block is imposed by a fresh scan, or an admin
+    quarantines), and inventing an edge here so the worker could apply a late
+    BLOCK would route around the human gate those refusals exist to force. The
+    honest behaviour is to make the drop LOUD and let an operator decide.
+
+    HOW "acted on" is decided, without a second table: every transition this
+    worker writes OFF a waiting state carries the same `scan_id` forward, so a
+    scan whose verdict reached the lifecycle always appears on some event with
+    `from_state` in ('scanning', 'review_pending'). Anything in a waiting
+    event's `scan_id` but never in an exiting event's - and not still legitim-
+    ately awaited by the current `pending` set - is stranded.
+
+    Redis SET NX dedup (24h) keeps a permanently stranded verdict to one line a
+    day instead of one a second, and is multi-replica safe - the same idiom
+    `run_due_report_schedules` uses. A Redis failure degrades to logging
+    nothing extra; it must never break the lifecycle tick.
+    """
+    awaited = {str(e.scan_id) for e in pending.values() if e.scan_id}
+    entered_waiting = {
+        str(e.scan_id) for e in events if e.scan_id and e.to_state in _WAITING_STATES
+    }
+    left_waiting = {str(e.scan_id) for e in events if e.scan_id and e.from_state in _WAITING_STATES}
+    candidates = entered_waiting - left_waiting - awaited
+    if not candidates:
+        return
+    try:
+        async with runtime.gate_session_factory() as gate_session:
+            stranded = (
+                (
+                    await gate_session.execute(
+                        select(VerdictRow).where(VerdictRow.scan_id.in_(candidates))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except SQLAlchemyError:
+        _logger.exception("stranded-verdict check failed to read verdicts")
+        return
+    if not stranded:
+        return
+    latest_state = {
+        str(e.skill_id): str(e.to_state)
+        for e in reversed(list(events))  # events arrive newest-first
+    }
+    by_scan = {str(e.scan_id): e for e in events if e.scan_id}
+    for v in stranded:
+        event = by_scan.get(str(v.scan_id))
+        skill_id = str(event.skill_id) if event is not None else None
+        try:
+            fresh = await runtime.redis.set(
+                f"{_STRANDED_VERDICT_PREFIX}{v.scan_id}", "1", nx=True, ex=86400
+            )
+        except (aioredis.RedisError, OSError):
+            _logger.exception("stranded-verdict dedup failed - reporting anyway")
+            fresh = True
+        if not fresh:
+            continue
+        _logger.warning(
+            "verdict issued for a skill that had already left the waiting state - "
+            "no lifecycle transition was applied",
+            extra={
+                "context": {
+                    "scan_id": str(v.scan_id),
+                    "skill_id": skill_id,
+                    "verdict": str(v.verdict),
+                    "content_hash": str(v.content_hash),
+                    "skill_state": latest_state.get(skill_id or "", "unknown"),
+                }
+            },
+        )
 
 
 async def run_due_report_schedules(

@@ -17,6 +17,7 @@ from monolith.modules.gate.policy import (
     GatePolicyLoadError,
     load_gate_policy,
     parse_gate_policy,
+    tier_direction,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -160,3 +161,73 @@ class TestParseGatePolicy:
         assert policy.review_on_severity is Severity.MEDIUM
         assert policy.allowlistable_max_severity is Severity.MEDIUM
         assert policy.fail_closed_verdict is Verdict.BLOCK
+
+
+class TestTierDirection:
+    """里程碑 F Task 18: `tier_direction` moved out of `gateway.router` (where
+    Task 14 wrote it as a private helper) into `gate.policy`, so BOTH surfaces
+    that disclose a requested/judged divergence - the console's
+    `GET /v1/scans/{scan_id}` and the marketplace's `GET /v1/market/scans/
+    {scan_id}` - compute it from one implementation instead of two.
+
+    Every case below runs against the REAL `policies/gate/v1.yaml`, not a
+    synthetic policy: the whole point of the function is that strictness lives
+    in `tier_block_overrides` and not in `TrustTier`'s declaration order, so a
+    fixture that invented its own overrides could agree with a wrong
+    implementation.
+    """
+
+    def test_public_judged_at_internal_is_looser(self) -> None:
+        # THE case, and the marketplace's ordinary one: `public` blocks at HIGH,
+        # `internal` only at CRITICAL, so a verdict reached at `internal` came
+        # from a MORE PERMISSIVE ruleset than a `public` caller asked for.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert tier_direction(policy, requested="public", judged="internal") == "looser"
+
+    def test_internal_judged_at_public_is_stricter(self) -> None:
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert tier_direction(policy, requested="internal", judged="public") == "stricter"
+
+    def test_two_names_the_policy_treats_alike_are_equivalent(self) -> None:
+        # `partner` and `internal` both fall through to `block_on_severity`
+        # (CRITICAL) in the real file - different names, identical threshold,
+        # so nothing about the verdict changes and saying "looser" would be a
+        # false alarm driven by the enum's order.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert tier_direction(policy, requested="partner", judged="internal") == "equivalent"
+
+    def test_the_same_tier_reports_nothing(self) -> None:
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert tier_direction(policy, requested="public", judged="public") is None
+
+    def test_an_unrecorded_tier_on_either_side_reports_nothing(self) -> None:
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert tier_direction(policy, requested=None, judged="internal") is None
+        assert tier_direction(policy, requested="public", judged=None) is None
+        assert tier_direction(policy, requested=None, judged=None) is None
+
+    def test_a_stored_value_that_is_not_a_trust_tier_reports_nothing(self) -> None:
+        # Neither column is constrained to the enum by the database. "Cannot
+        # say" beats picking a direction out of a corrupt row.
+        policy = load_gate_policy(_REAL_POLICY_PATH)
+        assert tier_direction(policy, requested="not-a-tier", judged="internal") is None
+        assert tier_direction(policy, requested="public", judged="") is None
+
+    def test_direction_follows_the_policy_and_not_the_enum_order(self) -> None:
+        """The guard the docstring promises, asserted rather than described.
+
+        `TrustTier`'s declaration order runs loose-to-strict today, so an
+        implementation that compared enum positions would agree with the real
+        policy on every case above and this file would not notice. Here the
+        override is INVERTED - `internal` blocks at HIGH, `public` falls
+        through to CRITICAL - so the enum-order answer and the policy answer
+        are opposites, and only the policy-derived one passes.
+        """
+        policy = parse_gate_policy(
+            _minimal_raw(
+                block_on_severity="CRITICAL",
+                tier_block_overrides=[{"tier": "internal", "severity": "HIGH"}],
+            )
+        )
+        assert tier_direction(policy, requested="internal", judged="public") == "looser"
+        assert tier_direction(policy, requested="public", judged="internal") == "stricter"

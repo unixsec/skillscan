@@ -10,9 +10,12 @@ from typing import Any
 
 import httpx
 from common.config import SessionSettings
+from common.errors import ERROR_CODE_HEADER
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
+from starlette.responses import Response as StarletteResponse
 
+from monolith.modules.admin.breakglass import BREAKGLASS_SESSION_TTL_S
 from monolith.modules.gateway.auth.dependencies import (
     AuthRuntime,
     require_csrf,
@@ -24,10 +27,15 @@ from monolith.modules.gateway.auth.middleware import (
     CSRF_COOKIE_NAME,
     CSRF_HEADER_NAME,
     SESSION_COOKIE_NAME,
+    set_csrf_cookie,
+    set_session_cookie,
 )
 from monolith.modules.gateway.auth.session import IntrospectionCache, SessionContext
 
 GROUP_ROLE_MAP = {"skillscan-approvers": "approver"}
+# The TTL every non-break-glass login uses (login_router's OIDC/SAML paths and
+# local_auth.LOCAL_SESSION_TTL_S all default to a workday).
+_EIGHT_HOURS_S = 28800
 
 
 def _build_app(handler: Callable[[httpx.Request], httpx.Response]) -> FastAPI:
@@ -321,3 +329,157 @@ class TestCsrfCoversEverySessionCookie:
                 f"a request bearing {cookie_name!r} was NOT subjected to CSRF - "
                 f"this cookie is exempt (fail-open)"
             )
+
+
+class TestBreakGlassLoginDoesNotStrandAnExistingSession:
+    """SECURITY REGRESSION (2026-07-29), reproduced before it was fixed.
+
+    `csrf_token` is a single shared cookie name across all four login paths.
+    While each login stamped it with its own session's TTL, a 900s break-glass
+    login overwrote the CSRF cookie of an 8h OIDC/SAML/local session with a
+    15-minute one. After those 15 minutes the surviving 8h session's GETs still
+    worked (CSRF only guards state-changing methods) and every write returned
+    403 - a console the user can browse but cannot save anything in, with
+    nothing pointing at the cause.
+
+    This drives a REAL cookie jar (`http.cookiejar` via httpx, the same
+    Set-Cookie parsing and Max-Age expiry a browser applies) over the two
+    Set-Cookie sets the two logins emit, then makes the request the user would
+    make afterwards. Before the fix the CSRF cookie is simply gone from the jar
+    and the write is a 403.
+
+    The break-glass/OIDC pair is the combination exercised end-to-end here
+    because the OIDC session cookie is the one this standalone app can resolve
+    (the Redis-backed types need infrastructure). The OTHER pairs are covered
+    structurally rather than combinatorially: `set_csrf_cookie` no longer takes
+    a TTL argument at all, so a login path that missed the fix would not
+    type-check, and test_middleware.py's TestCsrfCookieOutlivesEverySessionType
+    asserts the one lifetime covers every declared session TTL.
+    """
+
+    @staticmethod
+    def _login_set_cookie_headers(
+        *, session_cookie_name: str, session_ttl_s: int, csrf_value: str
+    ) -> list[str]:
+        """The Set-Cookie headers a login handler emits: its session cookie
+        with its own TTL, plus the shared CSRF cookie."""
+        response = StarletteResponse()
+        set_session_cookie(
+            response,
+            name=session_cookie_name,
+            value=f"{session_cookie_name}-token",
+            max_age_s=session_ttl_s,
+        )
+        set_csrf_cookie(response, csrf_value)
+        return [v.decode() for k, v in response.raw_headers if k == b"set-cookie"]
+
+    def test_writes_still_work_after_the_break_glass_session_expires(self) -> None:
+        jar = httpx.Cookies()
+        origin = httpx.Request("POST", "https://console.example/login")
+        for headers in (
+            # 1. the ordinary 8h login
+            self._login_set_cookie_headers(
+                session_cookie_name=SESSION_COOKIE_NAME,
+                session_ttl_s=_EIGHT_HOURS_S,
+                csrf_value="csrf-from-the-8h-login",
+            ),
+            # 2. a 900s break-glass login in the same browser, overwriting the
+            #    shared csrf_token cookie
+            self._login_set_cookie_headers(
+                session_cookie_name=BREAKGLASS_SESSION_COOKIE_NAME,
+                session_ttl_s=BREAKGLASS_SESSION_TTL_S,
+                csrf_value="csrf-from-the-break-glass-login",
+            ),
+        ):
+            jar.extract_cookies(
+                httpx.Response(200, headers=[("set-cookie", h) for h in headers], request=origin)
+            )
+
+        # Fifteen minutes later, as the browser would have it: real
+        # http.cookiejar expiry, not a reimplementation of it.
+        later = int(time.time()) + BREAKGLASS_SESSION_TTL_S + 1
+        surviving = {
+            c.name: c.value for c in jar.jar if c.value is not None and not c.is_expired(later)
+        }
+        assert BREAKGLASS_SESSION_COOKIE_NAME not in surviving  # the emergency session is over
+        assert SESSION_COOKIE_NAME in surviving  # the 8h one is not
+        assert CSRF_COOKIE_NAME in surviving, (
+            "the break-glass login's short TTL expired the shared csrf_token cookie out "
+            "from under a session that is still live - its writes will 403 while its "
+            "reads keep working"
+        )
+
+        client = TestClient(_build_app(_active_submitter))
+        for name, value in surviving.items():
+            client.cookies.set(name, value)
+
+        # Reads never broke - that asymmetry is what made this so hard to see.
+        assert client.get("/submit-only").status_code == 200
+        # The write is the point.
+        write = client.post("/mutate", headers={CSRF_HEADER_NAME: surviving[CSRF_COOKIE_NAME]})
+        assert write.status_code == 200, (
+            "a live 8h session cannot write after an unrelated break-glass session expired"
+        )
+
+
+class TestMachineReadableErrorCode:
+    """CONTRACT LOCK: every auth error answers with a stable machine-readable
+    code in ERROR_CODE_HEADER, so a program never has to branch on the
+    human-readable `detail`.
+
+    web/src/api/client.ts must tell an expired-session 403 (bounce the user to
+    /login) apart from a permission 403 (a live session being refused - logging
+    that user out over a role problem would be a bug). Before this, the only
+    signal was the exact `detail` literal "CSRF validation failed": any
+    rewording, translation or punctuation change on this side would have taken
+    that branch dark with nothing turning red. These tests are the backend half
+    of the pin; `web/src/api/client.test.ts` holds the frontend half, and the
+    two literals must stay identical.
+    """
+
+    def test_csrf_failure_carries_the_csrf_validation_failed_code(self) -> None:
+        client = TestClient(_build_app(_active_submitter))
+        client.cookies.set(SESSION_COOKIE_NAME, "a-valid-opaque-token")
+        response = client.post("/mutate")
+        assert response.status_code == 403
+        # The literal, spelled out rather than imported from common.errors:
+        # importing the constant would let a rename pass silently on both
+        # sides at once, which is the whole failure mode being pinned. This
+        # string is duplicated on purpose in web/src/api/client.ts.
+        assert response.headers[ERROR_CODE_HEADER] == "csrf_validation_failed"
+
+    def test_the_human_detail_is_still_present_and_still_human(self) -> None:
+        # The code is ADDED alongside the human message, not a replacement for
+        # it - an operator reading a log or a curl output still gets a sentence.
+        client = TestClient(_build_app(_active_submitter))
+        client.cookies.set(SESSION_COOKIE_NAME, "a-valid-opaque-token")
+        response = client.post("/mutate")
+        assert response.json()["detail"] == "CSRF validation failed"
+
+    def test_a_permission_403_carries_a_DIFFERENT_code(self) -> None:
+        # The discrimination that matters: a role refusal is a 403 too, and the
+        # frontend must not read it as "your session died". Different code, so
+        # matching the code can never conflate them.
+        client = TestClient(_build_app(_active_submitter))
+        client.cookies.set(SESSION_COOKIE_NAME, "a-valid-opaque-token")
+        response = client.get("/approver-only")
+        assert response.status_code == 403
+        assert response.headers[ERROR_CODE_HEADER] == "forbidden"
+        assert response.headers[ERROR_CODE_HEADER] != "csrf_validation_failed"
+
+    def test_a_machine_identity_refusal_carries_the_permission_code_too(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"active": True, "client_id": "ci-runner", "exp": time.time() + 60}
+            )
+
+        client = TestClient(_build_app(handler))
+        response = client.get("/console-only", headers={"Authorization": "Bearer m2m-token"})
+        assert response.status_code == 403
+        assert response.headers[ERROR_CODE_HEADER] == "forbidden"
+
+    def test_authentication_failure_carries_the_authentication_required_code(self) -> None:
+        client = TestClient(_build_app(_active_submitter))
+        response = client.get("/submit-only")
+        assert response.status_code == 401
+        assert response.headers[ERROR_CODE_HEADER] == "authentication_required"

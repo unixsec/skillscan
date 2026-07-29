@@ -22,6 +22,7 @@ svc_reeval has no grant on `verdict`), then calls `reconcile()` here.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import hmac
 from collections.abc import Sequence
@@ -61,16 +62,56 @@ class ReconciliationOutcome:
     source: ReconciliationSource
 
 
+def _currency(verdict: IssuedVerdict) -> tuple[datetime.datetime, bool]:
+    """Sort key for "which of these verdicts is the one in force".
+
+    Newest `issued_at` wins. On an EXACT tie the non-PASS verdict wins, and
+    that asymmetry is deliberate. `verdict.issued_at` is `DATETIME(6)` (see
+    the initial-schema migration), so a tie is unlikely rather than
+    impossible - but "unlikely" is not a defined behaviour, and leaving one
+    undefined inside a control that can auto-quarantine a published skill is
+    the kind of gap this codebase keeps finding the hard way. So it is defined
+    fail-closed: when we cannot tell which verdict is current, reconciliation
+    must not resolve the ambiguity in the publisher's favour. The stricter
+    reading yields a MISMATCH a human then looks at; the lenient one yields a
+    silent MATCH that closes the case on a package we are not sure about.
+    """
+    return (verdict.issued_at, verdict.verdict != _PASS_VERDICT)
+
+
 def reconcile(
     published: Sequence[MarketplacePublishedEntry],
     issued_verdicts: Sequence[IssuedVerdict],
     *,
     source: ReconciliationSource,
 ) -> tuple[ReconciliationOutcome, ...]:
-    verdict_by_hash = {v.content_hash: v.verdict for v in issued_verdicts}
+    """SECURITY (2026-07-29, milestone F Task 11 follow-up I4): the
+    content_hash -> verdict collapse below is ORDERED, not last-one-wins.
+
+    `verdict`'s primary key is `scan_id`, not `content_hash`, so a package
+    routinely has more than one verdict on record - a reeval-triggered rescan
+    under a new toolchain_digest is a second scan_job over the same bytes.
+    This used to be a plain dict comprehension over the incoming sequence, so
+    whichever row the driver yielded last silently won. A stale BLOCK beating
+    a current PASS produces a spurious MISMATCH, and on the poll path
+    `reeval.quarantine` auto-quarantines a MISMATCH by default - i.e. a
+    legitimately published, currently-passing skill taken down over a verdict
+    that was already superseded.
+
+    Fixed HERE rather than only in the SQL: `list_issued_verdicts` orders its
+    rows, but this function is a public pure entry point that anything can
+    hand a sequence to, and the ordering is what the comparison actually
+    depends on. It should not be reachable through a caller that forgot to
+    sort."""
+    verdict_by_hash: dict[str, IssuedVerdict] = {}
+    for issued in issued_verdicts:
+        incumbent = verdict_by_hash.get(issued.content_hash)
+        if incumbent is None or _currency(issued) > _currency(incumbent):
+            verdict_by_hash[issued.content_hash] = issued
     outcomes: list[ReconciliationOutcome] = []
     for entry in published:
-        verdict = verdict_by_hash.get(entry.content_hash)
+        current = verdict_by_hash.get(entry.content_hash)
+        verdict = current.verdict if current is not None else None
         if verdict is None:
             result = ReconciliationResult.ORPHAN
         elif verdict != _PASS_VERDICT:

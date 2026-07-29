@@ -63,6 +63,18 @@ EXTERNAL_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         "requires_review",
         "poll_after_ms",
         "judged_at_tier",
+        # 里程碑 F Task 18. Added deliberately, as this whitelist requires:
+        # `judged_at_tier` alone said which tier the verdict was reached at and
+        # left the caller to assume it was their own. It usually is not - a
+        # marketplace service account defaults to PUBLIC, the STRICTEST tier
+        # (policies/gate/v1.yaml blocks it at HIGH, every other tier only at
+        # CRITICAL), so a submission deduplicated onto an earlier console
+        # submission at `internal` gets a verdict adjudicated under a MORE
+        # PERMISSIVE ruleset than it asked for. Neither field is internal
+        # adjudication detail: both are facts about this caller's own request
+        # and the answer it is being handed.
+        "requested_tier",
+        "tier_direction",
         "summary",
         "findings",
     }
@@ -128,6 +140,8 @@ def project_scan(
     verdict_row: dict[str, Any] | None,
     result_row: dict[str, Any] | None,
     judged_at_tier: str | None = None,
+    requested_tier: str | None = None,
+    tier_direction: str | None = None,
 ) -> dict[str, Any]:
     """Build the marketplace-facing view of one scan.
 
@@ -148,6 +162,28 @@ def project_scan(
     substituted with a guess: the deployment default that such a scan actually
     fell back to is runtime configuration this pure function has no access to,
     and inventing the likely value would misreport the basis of a decision.
+
+    `requested_tier` / `tier_direction` (Task 18) complete that disclosure.
+    `judged_at_tier` on its own reports a tier and leaves the caller to assume
+    it was the one they asked for; these two say whether it was, and which way
+    a divergence cuts ("looser" | "stricter" | "equivalent", from
+    `gate.policy.tier_direction` - the router computes it, because the answer
+    depends on `GatePolicy.block_threshold` and this function stays pure).
+
+    "looser" is the dangerous one and, on THIS surface, the common one: an
+    unconfigured service account holds PUBLIC, the STRICTEST tier, while the
+    console commonly submits at `internal`, so a marketplace poll of content
+    the console scanned first is reading a verdict decided under a more
+    permissive threshold than it asked for. Until Task 18 that was reported as
+    nothing at all.
+
+    `requested_tier` is None when this caller has no recorded request -
+    a `scan_submitter` row written before that column existed. Deliberately NOT
+    defaulted to `judged_at_tier` the way the CONSOLE's equivalent field is:
+    there the fallback preserves the prior meaning of a pre-existing field,
+    whereas here the field is new and has no meaning to preserve, so null keeps
+    its plain sense of "not recorded" rather than silently asserting agreement.
+    `tier_direction` is then null too, since there is nothing to compare.
     """
     status = project_status(internal_state)
     raw_findings: list[dict[str, Any]] = list((result_row or {}).get("findings") or [])
@@ -165,6 +201,8 @@ def project_scan(
         "requires_review": (verdict_row or {}).get("verdict") == "REVIEW",
         "poll_after_ms": POLL_AFTER_MS[status],
         "judged_at_tier": judged_at_tier,
+        "requested_tier": requested_tier,
+        "tier_direction": tier_direction,
         "summary": _summarize(
             raw_findings,
             truncated=bool((result_row or {}).get("findings_capped", False)),

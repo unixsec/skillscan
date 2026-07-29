@@ -196,6 +196,45 @@ class TestScanProjection:
         )
         assert out["judged_at_tier"] is None
 
+    def test_a_looser_judgment_than_requested_is_disclosed(self) -> None:
+        # SECURITY (Task 18) - the case this pair of fields exists for, and the
+        # commonest one on this surface. A marketplace service account defaults
+        # to PUBLIC, the STRICTEST tier (policies/gate/v1.yaml blocks it at
+        # HIGH); its submission deduplicates onto a console submission judged at
+        # `internal` (blocks only at CRITICAL); so the verdict it is handed was
+        # reached under a MORE PERMISSIVE ruleset than it asked for, and a
+        # finding that should have blocked for it can read PASS.
+        out = views.project_scan(
+            scan_id="s1",
+            internal_state="decided",
+            verdict_row=_VERDICT_ROW,
+            result_row=_RESULT_ROW,
+            judged_at_tier="internal",
+            requested_tier="public",
+            tier_direction="looser",
+        )
+        assert out["judged_at_tier"] == "internal"
+        assert out["requested_tier"] == "public"
+        assert out["tier_direction"] == "looser"
+
+    def test_an_unrecorded_request_is_null_and_not_the_judged_tier(self) -> None:
+        # A `scan_submitter` row written before `requested_trust_tier` existed
+        # records no request. Defaulting to `judged_at_tier` (which is what the
+        # CONSOLE's equivalent field does, to preserve a pre-existing field's
+        # meaning) would assert agreement nobody recorded - and agreement is
+        # exactly the claim these fields exist to stop making silently. This
+        # field is new here, so it has no prior meaning to preserve.
+        out = views.project_scan(
+            scan_id="s1",
+            internal_state="decided",
+            verdict_row=_VERDICT_ROW,
+            result_row=_RESULT_ROW,
+            judged_at_tier="internal",
+        )
+        assert out["judged_at_tier"] == "internal"
+        assert out["requested_tier"] is None
+        assert out["tier_direction"] is None
+
     def test_summary_counts_by_severity(self) -> None:
         result = {
             "findings_capped": False,
@@ -320,6 +359,14 @@ _SPEC_TOP_LEVEL_FIELDS = frozenset(
         "requires_review",
         "poll_after_ms",
         "judged_at_tier",
+        # 里程碑 F Task 18: added to the contract deliberately, by hand, on both
+        # sides. `judged_at_tier` alone reported a tier and let the caller
+        # assume it was the one they asked for - which on this surface it
+        # usually is not (a service account defaults to PUBLIC, the strictest
+        # tier; the console commonly submits at `internal`, and dedup hands the
+        # marketplace that verdict).
+        "requested_tier",
+        "tier_direction",
         "summary",
         "findings",
     }

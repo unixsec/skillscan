@@ -198,58 +198,88 @@ async def drain_pending_intents(
     return chained
 
 
-async def verify_chain(session: AsyncSession, *, since_seq: int = 0) -> bool:
-    """Recomputes entry_hash for every row from `since_seq` onward and checks
-    it against the stored value and the next entry's prev_hash - a full (or,
-    with `since_seq > 0`, incremental) tamper-detection scan.
+async def verify_chain(session: AsyncSession) -> bool:
+    """Recomputes entry_hash for EVERY row from the genesis entry to the tail
+    and checks it against the stored value and the next entry's prev_hash.
+    `True` has exactly one meaning: the whole ledger is intact.
 
-    When `since_seq > 0`, the entry AT `since_seq` is trusted as the starting
-    anchor (its own recorded entry_hash, not recomputed against genesis) -
-    this lets an operator (or `GET /v1/audit`'s chain-verification status,
-    coding spec §9) re-verify only the chain's recent tail from a previously
-    trusted checkpoint, without rescanning the entire history on every call.
+    SECURITY (milestone F Task 17): this deliberately takes no `since_seq` /
+    cursor argument, and callers cannot ask for a cheaper answer. It used to
+    accept one, and `since_seq > 0` ANCHORED the scan on the entry at the
+    cursor - that entry's stored entry_hash was trusted as the starting point
+    and every entry before it was never read at all. So a rewrite of an earlier
+    entry (or of the anchor entry's own payload, which was never recomputed)
+    was invisible to that scan, while the bool it returned was indistinguish-
+    able from a whole-ledger result. `GET /v1/audit?since_seq=N` fed that bool
+    straight to the console as "chain intact". A tamper-evidence primitive with
+    a weaker mode one keyword argument away WILL be called in the weaker mode,
+    and the weaker answer WILL be read as the strong one - this repo has
+    already shipped one audit-verification defect of exactly that shape (the
+    genesis hash was never verified, so `chain_valid` was permanently False and
+    nobody noticed until the first VM deploy, because the return value was
+    consumed as a conclusion and never asserted against a known-tampered
+    chain). The fix is to delete the weaker mode, not to document it.
+
+    COST: O(ledger), unconditionally. This is not new spend - it is exactly
+    what the endpoint's default (unparameterized) call already did on every
+    audit page load, so the whole-ledger scan was already the steady-state
+    cost and only the *paged* calls were getting the cheap, misleading answer.
+    Measured: re-hashing 3000 representative entries (the VM ledger's size)
+    takes ~8 ms of CPU; the row fetch dominates, and only projected columns are
+    read, not whole ORM entities. If the ledger ever grows to where this hurts,
+    the answer is a *signed, periodically re-verified checkpoint* that makes an
+    incremental scan trustworthy - not an unsigned caller-supplied cursor.
     """
-    entries = (
-        (
-            await session.execute(
-                select(AuditEntry).where(AuditEntry.seq >= since_seq).order_by(AuditEntry.seq.asc())
-            )
+    # Project only the columns the verification needs: no ORM identity-map
+    # bookkeeping for a scan that touches every row and keeps none of them.
+    rows = (
+        await session.execute(
+            select(
+                AuditEntry.prev_hash,
+                AuditEntry.entry_hash,
+                AuditEntry.operator,
+                AuditEntry.action,
+                AuditEntry.payload,
+            ).order_by(AuditEntry.seq.asc())
         )
-        .scalars()
-        .all()
-    )
-    if not entries:
-        return since_seq == 0  # an empty chain is trivially valid only from genesis
+    ).all()
+    if not rows:
+        # SECURITY (2026-07-29, milestones E+F review): FALSE, not True. This
+        # used to read "an empty ledger has nothing to have been tampered
+        # with", which is true of a table that was never created and false of
+        # every deployment this code actually runs in: the genesis row is
+        # INSERTed by the initial schema migration itself
+        # (1d6112d0e997_initial_core_schema.py), so `audit_entry` is non-empty
+        # from the moment the schema exists. An empty ledger therefore does not
+        # mean "nothing happened yet" - it means THE LEDGER WAS DELETED, which
+        # is the most complete form of the tampering every other path in this
+        # function exists to detect. `DELETE FROM audit_entry` reported
+        # `chain_valid: true` and the console printed "chain intact" over an
+        # erased audit trail.
+        #
+        # Failing closed also costs nothing real: the only way to reach this
+        # branch legitimately would be a database whose migrations have not
+        # run, where every other audit operation is broken anyway.
+        return False
 
-    if since_seq > 0:
-        if entries[0].seq != since_seq:
-            return False  # the anchor checkpoint itself doesn't exist
-        expected_prev = entries[0].entry_hash
-        remaining = entries[1:]
-    else:
-        # SECURITY: the genesis row (seq=1) is the chain's ROOT OF TRUST, so it
-        # is the anchor for a full scan the same way a checkpoint is for an
-        # incremental one - verify it carries the structural genesis marker
-        # (prev_hash == GENESIS_HASH) but TRUST its stored entry_hash rather
-        # than recomputing it. The genesis entry_hash is a fixed bootstrap value
-        # set by the initial schema migration and is deliberately NOT derived
-        # via compute_entry_hash (nothing precedes genesis to derive it from),
-        # so recomputing it here would always mismatch and make every real
-        # chain report tampered - which it did for GET /v1/audit until this fix
-        # (no test exercised since_seq=0, only checkpointed since_seq>0 scans).
-        # Every NON-genesis entry is still fully hash-verified below.
-        if entries[0].prev_hash != GENESIS_HASH:
-            return False
-        expected_prev = entries[0].entry_hash
-        remaining = entries[1:]
+    # SECURITY: the genesis row (seq=1) is the chain's ROOT OF TRUST and the
+    # only entry whose stored hash is trusted rather than recomputed - verify it
+    # carries the structural genesis marker (prev_hash == GENESIS_HASH), which
+    # also catches a genesis row that was deleted outright (the lowest surviving
+    # row would not carry the marker). The genesis entry_hash is a fixed
+    # bootstrap value set by the initial schema migration and is deliberately
+    # NOT derived via compute_entry_hash (nothing precedes genesis to derive it
+    # from), so recomputing it here would always mismatch and make every real
+    # chain report tampered - which it did for GET /v1/audit until that was
+    # fixed. Every NON-genesis entry is fully hash-verified below.
+    genesis_prev_hash, expected_prev, _, _, _ = rows[0]
+    if genesis_prev_hash != GENESIS_HASH:
+        return False
 
-    for entry in remaining:
-        if entry.prev_hash != expected_prev:
+    for prev_hash, entry_hash, operator, action, payload in rows[1:]:
+        if prev_hash != expected_prev:
             return False
-        recomputed = compute_entry_hash(
-            entry.prev_hash, entry.operator, entry.action, entry.payload
-        )
-        if recomputed != entry.entry_hash:
+        if compute_entry_hash(prev_hash, operator, action, payload) != entry_hash:
             return False
-        expected_prev = entry.entry_hash
+        expected_prev = entry_hash
     return True

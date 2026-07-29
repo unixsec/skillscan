@@ -7,7 +7,11 @@ SECURITY: every route requires authentication via M2's `require_human_role()`
 (fail-closed 401/403, enforced server-side - never trust a client-supplied
 role). Object-level authorization (a submitter may only read their OWN scans;
 approver/auditor/admin may read any) is enforced here in the handler, never
-left to the frontend (FR-API defense against IDOR). Every state-changing
+left to the frontend (FR-API defense against IDOR). The WRITE side of that
+same rule is `POST /v1/scans`'s skill-ownership check: `skill_id` is a
+caller-supplied form field, so a submission naming an already-registered skill
+must belong to that skill's owner (or an admin) or it is refused 403 - see
+`inventory.ownership.authorize_skill_write`. Every state-changing
 route also depends on `require_csrf` (coding spec §16.1 INV-16) - a no-op for
 bearer-token (M2M/API) callers, enforced for cookie-authenticated (BFF)
 callers.
@@ -38,13 +42,27 @@ from sqlalchemy import select
 
 from monolith.modules.admin.engine_registry import filter_enabled_engines
 from monolith.modules.gate.models import VerdictRow
+from monolith.modules.gate.policy import tier_direction
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_human_role
 from monolith.modules.gateway.auth.session import SessionContext
-from monolith.modules.inventory.lifecycle import InvalidTransitionError
+from monolith.modules.inventory.lifecycle import InvalidTransitionError, validate_transition
 from monolith.modules.inventory.models import SkillVersionRow
-from monolith.modules.inventory.service import register_skill_version, transition_skill
+from monolith.modules.inventory.ownership import SkillOwnershipError, authorize_skill_write
+from monolith.modules.inventory.service import (
+    ContentRegisteredToAnotherSkillError,
+    current_state,
+    get_registered_skill,
+    register_skill_version,
+    skill_id_for_content,
+    transition_skill,
+)
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow, ScanSubmitterRow
-from monolith.modules.orchestration.service import is_scan_submitter, submit_scan
+from monolith.modules.orchestration.service import (
+    SubmissionChannel,
+    is_scan_submitter,
+    submit_scan,
+    submitter_attribution,
+)
 from monolith.modules.reeval.reconciliation import (
     MarketplacePublishedEntry,
     PushEventVerificationError,
@@ -70,6 +88,22 @@ router = APIRouter(prefix="/v1")
 _submitter_or_above = require_human_role()
 
 _REVIEWER_ROLES = ("approver", "admin", "auditor")
+
+# 里程碑 F Task 16: what a scan with NO `scan_submitter` rows renders as.
+# `submitter_attribution` deliberately omits such a scan rather than returning
+# empty lists, so that decision belongs to each caller - and here it is empty
+# lists, never the scalar `ScanJob.submitter` promoted into a one-element list.
+# Promoting it would state that the first submitter is the ONLY authorized
+# reader, which is the claim `scan_submitter` exists to stop making.
+#
+# Read-only by construction: every value is an immutable empty tuple, so a
+# handler that mutated the shared default in place could not corrupt the next
+# request's response.
+_EMPTY_ATTRIBUTION: dict[str, Any] = {
+    "submitters": (),
+    "submitter_sources": (),
+    "source": (),
+}
 
 
 def get_scan_runtime(request: Request) -> ScanRuntime:
@@ -111,6 +145,117 @@ async def create_scan(
         # leaking internals, not caller-supplied-input diagnostics).
         raise HTTPException(status_code=400, detail=f"invalid package archive: {exc}") from exc
 
+    caller_is_admin = session.has_role("admin")
+    c_hash = compute_content_hash(files)
+    if skill_id:
+        if runtime.inventory_session_factory is None:
+            raise HTTPException(status_code=503, detail="inventory module is not configured")
+        # SECURITY (2026-07-29, milestone F Task 11 follow-up C1) - the
+        # inventory pre-flight, and it runs BEFORE `submit_scan` on purpose.
+        # A submission that is going to be REFUSED must not leave a scan_job,
+        # an artifact blob or a `scan_submitter` row behind on its way out;
+        # those are the rows every object-level authz check in the system
+        # reads, so creating them for a caller we are about to refuse would
+        # hand them readable state they should never have had. Worse for the
+        # `scan_submitter` row specifically: via single-flight dedup it
+        # attaches the caller to an EXISTING scan of the same bytes as an
+        # authorized reader - of a scan that may belong to another skill
+        # entirely, which is precisely the situation one of the refusals below
+        # exists to prevent.
+        #
+        # 2026-07-29 (milestones E+F review): all THREE refusals are checked
+        # here now, not just the ownership 403. `submit_scan` commits before
+        # the inventory transaction, so both 409 paths
+        # (`ContentRegisteredToAnotherSkillError` and `InvalidTransitionError`)
+        # used to tell the caller the submission failed while leaving exactly
+        # those rows committed. Each check below re-runs INSIDE
+        # `register_skill_version`'s writing transaction, and THAT run stays
+        # authoritative - this one is for fail-fast, for the status code, and
+        # for leaving nothing behind. What remains is the narrow TOCTOU race
+        # (someone registers the skill_id or these bytes between this read and
+        # that transaction), which still commits the rows before losing; that
+        # is the same window the ownership check has always accepted, and
+        # losing it safely is the point of the in-transaction re-check.
+        async with runtime.inventory_session_factory() as inv_session:
+            registered = await get_registered_skill(inv_session, skill_id=skill_id)
+            content_owner = await skill_id_for_content(inv_session, content_hash=c_hash)
+            prior_state = await current_state(inv_session, skill_id=skill_id)
+        if registered is not None:
+            try:
+                authorize_skill_write(
+                    skill_id=skill_id,
+                    recorded_owner=registered.owner,
+                    actor=session.subject,
+                    actor_is_admin=caller_is_admin,
+                )
+            except SkillOwnershipError as exc:
+                # SECURITY: 403, NOT the 409 this situation used to get by
+                # accident. "You may not modify this object" is not a
+                # conflict, and a client told 409 would retry with different
+                # content forever against a wall that is about identity.
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            # SECURITY: the tier a RESUBMISSION is judged at is the skill's
+            # RECORDED tier, never the caller's form field. `trust_tier`
+            # decides the BLOCK threshold (policies/gate/v1.yaml: `public`
+            # blocks at HIGH, every other tier only at CRITICAL), so honouring
+            # the form here let any submitter re-judge an existing `public`
+            # skill as `internal` and downgrade a finding that had to block -
+            # the second half of the takeover this task closes, and separately
+            # logged as finding I2. It was also plainly inconsistent:
+            # `register_skill_version` writes `skill.trust_tier` only when the
+            # skill is NEW, so inventory kept reporting the original tier while
+            # the verdict was being made at another one. The resolved tier is
+            # not silently swallowed either - it lands on `ScanJob.trust_tier`
+            # and is what `GET /v1/scans/{scan_id}` reports as `trust_tier`/
+            # `judged_at_tier`, the fields that exist to make the judged tier
+            # visible rather than assumed.
+            #
+            # Only the CONSOLE needs this. `marketplace_api`'s submit endpoint
+            # accepts no `skill_id` at all (and rejects a caller-supplied
+            # `trust_tier` outright with a 400), so no marketplace submission
+            # can ever be a resubmission of a registered skill - verified, not
+            # assumed: `register_skill_version` has exactly one caller in the
+            # tree, this handler.
+            try:
+                tier = TrustTier(registered.trust_tier)
+            except ValueError:
+                # A stored tier that is not a valid `TrustTier` means the row
+                # is corrupt. Fail CLOSED to the strictest tier rather than
+                # falling back to the caller's value (which is the input we
+                # just decided not to trust) or 500-ing on a skill that is
+                # otherwise perfectly submittable.
+                tier = TrustTier.PUBLIC
+
+        # SECURITY: AFTER the ownership decision above and never before it.
+        # "These bytes belong to another skill" names a skill_id the caller may
+        # have no relationship with, so it must not be answerable to someone
+        # who is not even allowed to write the skill_id they DID name - the
+        # same ordering `register_skill_version` documents for the same reason.
+        # (For an unregistered `skill_id` there is no owner to check: anyone
+        # may register a free name, so answering is not a disclosure.)
+        #
+        # Same wording as the in-transaction refusal it front-runs, so the two
+        # are indistinguishable to a client.
+        if content_owner is not None and content_owner != skill_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"this content is already registered to skill {content_owner!r}",
+            )
+        # The lifecycle refusal: `scanning` (racing an in-flight verdict),
+        # `retired` (terminal) and `quarantined` (an admin restores first) have
+        # no `-> submitted` edge. `validate_transition` is the SAME pure
+        # function `register_skill_version` reaches through `_record_transition`
+        # - not a second copy of the rule - and it accepts `prior_state is
+        # None` as the legitimate genesis case, so a brand-new skill_id passes
+        # here exactly as it does there.
+        try:
+            validate_transition(prior_state, "submitted")
+        except InvalidTransitionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"cannot submit a new scan for skill {skill_id!r}: {exc}",
+            ) from exc
+
     # coding spec §9 Admin·Engines: an admin-disabled engine (never a required
     # floor engine - engine_registry.set_engine_enabled enforces that INV-1
     # invariant at write time) takes effect on the NEXT submission.
@@ -127,18 +272,56 @@ async def create_scan(
             # SECURITY (2026-07-28, milestone B' Task 4): `tier` (above) is what
             # gets judged now - previously this scan's verdict silently used
             # `runtime.default_trust_tier` instead, regardless of what `tier`
-            # resolved to. Console behaviour is unchanged: a caller-supplied
-            # `trust_tier` form field still wins here (see `tier`'s own
-            # resolution above) - that gap is open, tracked in coding spec
-            # §4.1's closing note, and out of this task's scope.
+            # resolved to.
+            #
+            # 2026-07-29 (follow-up C1): the caller-supplied `trust_tier` form
+            # field no longer always wins, which narrows the gap coding spec
+            # §4.1's closing note tracks. For a RESUBMISSION of an
+            # already-registered `skill_id`, `tier` has been overwritten above
+            # with the skill's RECORDED tier - see that block for why. The gap
+            # remains open for a FIRST submission (new skill_id) and for an
+            # anonymous one (no skill_id), where there is no recorded tier to
+            # defer to and the form field is still the only input.
             trust_tier=tier,
+            # 里程碑 F Task 12: this handler IS the console channel - the fact
+            # is known here and nowhere else afterwards, so it is recorded on
+            # the `scan_submitter` row now rather than reconstructed at read
+            # time from the submitter's name. This module's own docstring is
+            # the authority for the constant: the console surface is closed to
+            # machine identities (`require_human_role`), so every submission
+            # reaching this line arrived through the console, by construction.
+            source=SubmissionChannel.CONSOLE,
+            # 里程碑 F Task 14: what THIS caller asked for, recorded on their
+            # own `scan_submitter` row even when single-flight dedup hands
+            # them a scan_job someone else's earlier submission created and a
+            # verdict adjudicated at that person's tier. `trust_tier` above
+            # only reaches `ScanJob` on the fresh-scan path; this reaches the
+            # association row on both, which is the whole point.
+            #
+            # `tier`, the RESOLVED tier - deliberately not the raw `trust_tier`
+            # form field. For a resubmission of a registered skill the block
+            # above has already overridden the form field with the skill's
+            # recorded tier (finding I2), and that override is the tier this
+            # submission would genuinely have been judged at. Recording the
+            # discarded form value instead would report the override itself as
+            # a divergence and hand an input we just decided not to trust a
+            # place in the response.
+            requested_trust_tier=tier,
             deadline_s=runtime.scan_deadline_s,
         )
 
     if skill_id:
+        # Re-checked rather than asserted: the pre-flight above already 503s on
+        # this, so in practice it cannot fire here - but an `assert` is removed
+        # under `python -O`, which would turn a misconfigured deployment into an
+        # AttributeError 500 instead of the honest 503. Cheap, explicit, and it
+        # narrows the Optional for mypy either way.
         if runtime.inventory_session_factory is None:
             raise HTTPException(status_code=503, detail="inventory module is not configured")
-        c_hash = compute_content_hash(files)
+        # `c_hash` is computed once, above the pre-flight - the "already
+        # registered to another skill" check needs it BEFORE `submit_scan`
+        # runs, and hashing the same bytes twice per submission to keep the
+        # computation next to its second use would be pure waste.
         t_digest = compute_toolchain_digest(enabled_engine_metadatas, runtime.policy.version)
         # FR-PAR-013: record the Skill's declared permissions so the gate and
         # human reviewers can see them. skill_version.declared_perms has existed
@@ -168,48 +351,124 @@ async def create_scan(
                     declared = {"tools": declared_tools(fm)}
                 break
         async with runtime.inventory_session_factory() as inv_session, inv_session.begin():
-            known = await inv_session.get(SkillVersionRow, c_hash)
-            if known is None:
-                try:
-                    await register_skill_version(
-                        inv_session,
-                        skill_id=skill_id,
-                        source="web-upload",
-                        trust_tier=tier.value,
-                        content_hash=c_hash,
-                        toolchain_digest=t_digest,
-                        declared_perms=declared,
-                        operator=session.subject,
-                    )
-                    await transition_skill(
-                        inv_session,
-                        skill_id=skill_id,
-                        to_state="scanning",
-                        reason=f"scan {scan_id} submitted",
-                        actor=session.subject,
-                        content_hash=c_hash,
-                    )
-                except InvalidTransitionError as exc:
-                    # SECURITY (found live 2026-07-24 via a real clawhub.ai
-                    # re-import batch): re-submitting new content for a
-                    # skill_id that's already published/quarantined/retired
-                    # is a real, expected caller scenario (a duplicate or
-                    # re-run submission), not a system fault - it must not
-                    # crash as an unhandled 500. Same FR-API-060 posture as
-                    # the sibling 409 below: this message only describes
-                    # skill_id's OWN lifecycle state, never internal system
-                    # state, so it's safe to return verbatim.
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"cannot submit a new scan for skill {skill_id!r}: {exc}",
-                    ) from exc
-            elif str(known.skill_id) != skill_id:
+            # 2026-07-29 (milestone F Task 11 follow-up I1): NO "is this
+            # content already known?" gate wraps this block any more. It used
+            # to skip BOTH `register_skill_version` and the `-> scanning`
+            # transition whenever `content_hash` was already a recorded
+            # version, which silently turned the policy-fix case (same bytes,
+            # new ruleset, skill sitting at `blocked`) into a 202 that wrote
+            # nothing: no lifecycle event, so `worker.sync_lifecycle_tick` -
+            # which only ever looks at `scanning`/`review_pending` - never
+            # touched the skill again and it stayed `blocked` forever. A 202
+            # that changes nothing is worse than an error, because the caller
+            # is told it worked.
+            #
+            # `register_skill_version` owns the whole decision now: it skips
+            # the duplicate `skill_version` row (`content_hash` is its PK, and
+            # that keying is what single-flight dedup and the verdict cache
+            # rest on) while still running ownership, the lifecycle re-entry
+            # and the cross-skill refusal below. One chokepoint, rather than a
+            # partial copy of its rules out here.
+            try:
+                await register_skill_version(
+                    inv_session,
+                    skill_id=skill_id,
+                    source="web-upload",
+                    trust_tier=tier.value,
+                    content_hash=c_hash,
+                    toolchain_digest=t_digest,
+                    declared_perms=declared,
+                    operator=session.subject,
+                    # SECURITY: the authoritative ownership check runs
+                    # INSIDE this call's transaction (the pre-flight above
+                    # races anything that registers `skill_id` in between).
+                    # Required keyword, no default - see
+                    # `register_skill_version`'s docstring.
+                    actor_is_admin=caller_is_admin,
+                )
+                await transition_skill(
+                    inv_session,
+                    skill_id=skill_id,
+                    to_state="scanning",
+                    reason=f"scan {scan_id} submitted",
+                    actor=session.subject,
+                    content_hash=c_hash,
+                    # SECURITY (2026-07-29, milestones E+F review finding C1):
+                    # the scan THIS submission created, recorded as a typed
+                    # column and not only interpolated into `reason` above.
+                    # `worker.sync_lifecycle_tick` resolves this event by it -
+                    # previously it took the newest verdict for `c_hash`, which
+                    # for a resubmission of unchanged bytes under a new
+                    # toolchain is the PREVIOUS toolchain's verdict, published
+                    # (or re-blocked) within a tick while the scan being
+                    # submitted right here was still running.
+                    scan_id=scan_id,
+                )
+            except SkillOwnershipError as exc:
+                # SECURITY (milestone F Task 11 follow-up C1): the pre-flight
+                # above answers this for every ordinary request. Reaching
+                # HERE means `skill_id` was registered by someone else in
+                # the window between that read and this transaction - the
+                # TOCTOU race the in-transaction check exists to lose
+                # safely. Same 403, so the race resolves to "the registrant
+                # who got there first owns it" rather than to a 500 or, far
+                # worse, a silent write.
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+            except ContentRegisteredToAnotherSkillError as exc:
                 # SECURITY: the same content is already registered under a
-                # DIFFERENT skill_id - never silently re-attribute it.
+                # DIFFERENT skill_id - never silently re-attribute it. This
+                # runs INSIDE the writing transaction, so a concurrent
+                # registration of these bytes cannot slip between the read and
+                # the write.
+                #
+                # 2026-07-29 (milestones E+F review): like the 403 above, this
+                # is now the TOCTOU-loser path rather than the ordinary one.
+                # The pre-flight answers it for every ordinary request, and it
+                # has to, because `submit_scan` has already COMMITTED by the
+                # time we get here - a caller refused at this line still leaves
+                # a scan_job, an artifact blob and a `scan_submitter` row
+                # behind, the last of which attaches them to another skill's
+                # existing scan as an authorized reader via dedup. Reaching
+                # here means those bytes were registered elsewhere in the
+                # window between the pre-flight read and this transaction.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except InvalidTransitionError as exc:
+                # SECURITY (found live 2026-07-24 via a real clawhub.ai
+                # re-import batch): re-submitting new content for a
+                # skill_id that already has lifecycle history is a real,
+                # expected caller scenario (a duplicate or re-run
+                # submission), not a system fault - it must not crash as
+                # an unhandled 500. Same FR-API-060 posture as the
+                # sibling 409 above: this message only describes
+                # skill_id's OWN lifecycle state, never internal system
+                # state, so it's safe to return verbatim.
+                #
+                # 2026-07-29 (milestone F Task 11): settled states
+                # (published/review_pending/blocked) now re-enter at
+                # `submitted` and reach the 202 below - a v2 release and a
+                # fixed BLOCKed skill used to land here forever. This
+                # branch is still reached, and must stay, for `scanning`
+                # (racing the in-flight verdict), `retired` (terminal),
+                # and `quarantined` (a deliberate gate - an admin restores
+                # to `published` first; see lifecycle.VALID_TRANSITIONS).
+                #
+                # I1: it now covers a resubmission of UNCHANGED bytes into
+                # those same three states too - which is the point. An
+                # honest 409 naming the state, instead of the silent 202
+                # that case used to get.
+                #
+                # 2026-07-29 (milestones E+F review): the pre-flight runs the
+                # SAME `validate_transition` before `submit_scan` commits, so
+                # the ordinary case no longer reaches this line at all. What
+                # still does is the race - most realistically the caller's own
+                # concurrent duplicate submission, which moves the skill to
+                # `scanning` in between. Kept, and kept identical in wording:
+                # a check that only exists in the pre-flight would be a check
+                # that a concurrent writer can walk straight past.
                 raise HTTPException(
                     status_code=409,
-                    detail=f"this content is already registered to skill {str(known.skill_id)!r}",
-                )
+                    detail=f"cannot submit a new scan for skill {skill_id!r}: {exc}",
+                ) from exc
     return {"scan_id": scan_id}
 
 
@@ -245,6 +504,42 @@ async def get_scan(
             await db_session.execute(select(ScanResultRow).where(ScanResultRow.scan_id == scan_id))
         ).scalar_one_or_none()
 
+        # 里程碑 F Task 2: every authorized reader (see `is_scan_submitter`
+        # above), not just `job.submitter` (the FIRST submitter only - see
+        # `ScanSubmitterRow`'s docstring). A deduped scan legitimately has N
+        # rightful submitters, and the console must show all of them rather
+        # than the one stranger's name the column happens to carry.
+        #
+        # Always a list, even for a single submitter - a response whose SHAPE
+        # changes with the data (list vs bare string) is exactly the kind of
+        # thing a consumer silently mis-parses.
+        #
+        # 里程碑 F Task 12 added `source`, Task 14 `requested_trust_tier`; both
+        # are real columns on that row, recorded at INSERT by whichever handler
+        # took the submission. 里程碑 F Task 16 moved the whole shape into
+        # `orchestration.service.submitter_attribution` so `GET /v1/scans` and
+        # `GET /v1/reviews` serve the IDENTICAL shape rather than three
+        # hand-rolled selects that drift apart - which is exactly what had
+        # happened: this endpoint had full attribution while both lists still
+        # showed the scalar first-submitter.
+        attribution = (await submitter_attribution(db_session, scan_ids=[scan_id])).get(
+            scan_id, _EMPTY_ATTRIBUTION
+        )
+        submitter_sources = attribution["submitter_sources"]
+        # 里程碑 F Task 14: the tier THIS caller asked for, off their OWN
+        # association row. `None` when they have no row (a reviewer reading
+        # someone else's scan - they made no request) or when their row records
+        # none (written before the column existed).
+        requested_by_caller = next(
+            (
+                entry["requested_trust_tier"]
+                for entry in submitter_sources
+                if entry["submitter"] == session.subject
+                and entry["requested_trust_tier"] is not None
+            ),
+            None,
+        )
+
     async with runtime.gate_session_factory() as gate_session:
         verdict_row = (
             await gate_session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
@@ -264,6 +559,55 @@ async def get_scan(
         "hard_gate_hits": result_row.hard_gate_hits if result_row is not None else [],
         "reasons": verdict_row.reasons if verdict_row is not None else [],
         "sarif_ref": f"/v1/scans/{scan_id}/sarif",
+        # 里程碑 F Task 14: these are two DIFFERENT facts now, and Task 2's
+        # note that they could only ever be the same column no longer holds.
+        #
+        # `judged_at_tier` is unchanged - `ScanJob.trust_tier`, the tier the
+        # verdict was actually adjudicated at, the same column
+        # `orchestration.service.get_scan_state_and_tier` serves to
+        # `marketplace_api.views.project_scan`. `trust_tier` is now what THIS
+        # caller asked for, read from their own `scan_submitter` row.
+        #
+        # They diverge exactly when single-flight dedup hands a later submitter
+        # someone else's verdict: `submit_scan` deliberately does not re-tier
+        # an existing adjudication, so a caller asking for `public` (the
+        # STRICTEST tier - `policies/gate/v1.yaml` blocks it at HIGH) can be
+        # handed a verdict reached at `internal` (blocks only at CRITICAL).
+        # `tier_direction` below says which way it cuts.
+        #
+        # The FALLBACK when this caller has no recorded request - a reviewer
+        # reading someone else's scan, or a row written before the column
+        # existed - is `job.trust_tier`, i.e. exactly what this field returned
+        # before this change. It is not a guess dressed up as a record: it
+        # makes the two fields equal, which suppresses the divergence warning
+        # rather than inventing one, and the per-row truth (including `null`
+        # for "no request recorded") stays visible in `submitter_sources`.
+        # `tier_direction` is `null` in that case for the same reason.
+        "trust_tier": requested_by_caller if requested_by_caller is not None else job.trust_tier,
+        "judged_at_tier": job.trust_tier,
+        # "looser" | "stricter" | "equivalent" | null - see
+        # `gate.policy.tier_direction`. "looser" is the case that matters: a
+        # verdict reached under a more permissive ruleset than this caller
+        # asked for. Task 18 moved that function out of this file and into
+        # `gate.policy` so the marketplace surface can disclose the same
+        # divergence without importing this router.
+        "tier_direction": tier_direction(
+            runtime.policy, requested=requested_by_caller, judged=job.trust_tier
+        ),
+        # 里程碑 F Task 12 (Task 2 reported this BLOCKED - no column existed).
+        # `source` is the set of channels this scan arrived through and
+        # `submitter_sources` is the per-submitter attribution behind it: which
+        # NAME came through which door and asked for which tier, which is what
+        # the console needs to label a deduplicated scan's submitter list rather
+        # than showing a stranger's name with no explanation. Both are read
+        # straight off `ScanSubmitterRow`; neither is inferred from the submitter
+        # string. `null` in `submitter_sources` means that row records no such
+        # fact and is passed through verbatim, the same never-guess posture as
+        # `trust_tier` above.
+        #
+        # 里程碑 F Task 16: identical keys, identical shape, produced by the same
+        # `submitter_attribution` call the two LIST endpoints use.
+        **attribution,
     }
 
 
@@ -309,6 +653,33 @@ async def list_scans(
     session: SessionContext = Depends(_submitter_or_above),
     runtime: ScanRuntime = Depends(get_scan_runtime),
 ) -> dict[str, Any]:
+    """`limit` (clamped to 200) + `offset`. **Returns no total, on purpose**
+    (里程碑 F Task 16 evaluated adding one and decided against it).
+
+    A total means `SELECT COUNT(*) FROM scan_job` on every request, and for the
+    reviewer roles - who see every scan, i.e. the console's primary users -
+    there is no `submitter` predicate to narrow it. InnoDB keeps no cached row
+    count, so that is a full index scan. `scan_job` is the highest-volume table
+    in this system (one row per scan, forever), and **this endpoint is POLLED**:
+    `web/src/pages/Scans.tsx` refetches on a 3s -> 5s -> 10s -> 20s backoff for
+    as long as any scan on the page is non-terminal, resetting to 3s whenever
+    the tab regains focus. A whole-table count on that cadence, per open tab, is
+    a cost the console does not currently pay and does not need to.
+
+    The submitter-scoped case would be cheap (`idx_submitter` on
+    `scan_submitter` serves it), so this is not a blanket claim that counting is
+    expensive - it is that the expensive case is the common one here.
+
+    Honest in the other direction too: the list query already sorts by
+    `created_at`, which has no index, so it is not free either. That is an
+    argument for indexing the sort, not for adding a second full scan beside it.
+
+    The frontend's degradation is the supported answer: it asks for
+    `limit = PAGE_SIZE + 1`, renders `PAGE_SIZE` rows, and uses the extra row
+    only to decide whether a "next" control exists - so it says "page N" and
+    never invents a page count it cannot know. Documented in
+    docs/USAGE_GUIDE.md as well, so consumers do not each guess.
+    """
     bounded_limit = max(1, min(limit, 200))
     stmt = select(ScanJob)
     # SECURITY: object-level authz - a plain submitter only ever sees their own
@@ -332,6 +703,20 @@ async def list_scans(
 
     async with runtime.orchestration_session_factory() as db_session:
         jobs = (await db_session.execute(stmt)).scalars().all()
+        # 里程碑 F Task 16: full attribution on the LIST, in the same shape the
+        # detail response uses (same function produces both). Until now this
+        # endpoint returned only the scalar `ScanJob.submitter` - the FIRST
+        # submitter - so a deduplicated scan showed a stranger's name on the
+        # list page and the right names one click away in the drawer. Task 8
+        # fixed the detail view and deliberately left the lists alone to avoid
+        # racing another agent in this file; this is that debt.
+        #
+        # SECURITY: no new disclosure. The rows are scoped to exactly the
+        # scan_ids the object-level filter above already authorized, and any
+        # reader of one of those scans can already see its full submitter list
+        # through `GET /v1/scans/{scan_id}`. ONE extra query for the whole page,
+        # not one per row.
+        attribution = await submitter_attribution(db_session, scan_ids=[j.scan_id for j in jobs])
 
     scan_ids = [j.scan_id for j in jobs]
     content_hashes = [j.content_hash for j in jobs]
@@ -365,11 +750,19 @@ async def list_scans(
             hash_rows = hash_result.tuples().all()
         skill_ids_by_hash = dict(hash_rows)
 
+    # NO `total`, deliberately - see this endpoint's docstring above and
+    # docs/USAGE_GUIDE.md, which state the same thing so consumers do not each
+    # have to rediscover it. The frontend's over-fetch-one-row probe
+    # (`web/src/pages/Scans.tsx`) and its honest "page N" display are the
+    # supported way to paginate here.
     return {
         "items": [
             {
                 "scan_id": j.scan_id,
                 "state": j.state,
+                # The FIRST submitter, kept for compatibility. `submitters` below
+                # is the authoritative list - see `ScanSubmitterRow`'s docstring
+                # for why this column is not the answer to "whose scan is this".
                 "submitter": j.submitter,
                 "content_hash": j.content_hash,
                 "verdict": verdicts_by_scan[j.scan_id][0]
@@ -383,6 +776,9 @@ async def list_scans(
                 ),
                 "skill_id": skill_ids_by_hash.get(j.content_hash),
                 "skill_name": j.skill_name,
+                # 里程碑 F Task 16: `submitters` / `submitter_sources` / `source`,
+                # byte-for-byte the shape `GET /v1/scans/{scan_id}` returns.
+                **attribution.get(j.scan_id, _EMPTY_ATTRIBUTION),
             }
             for j in jobs
         ]

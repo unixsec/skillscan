@@ -29,7 +29,7 @@ import pytest_asyncio
 import redis.asyncio as aioredis
 from common.blobstore import LocalFilesystemBlobStore
 from fastapi import FastAPI
-from skillscan_core import GatePolicy, StaticKeywordEngine, TrustTier, Verdict
+from skillscan_core import GatePolicy, Severity, StaticKeywordEngine, TrustTier, Verdict
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError
 
@@ -677,6 +677,167 @@ class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
         assert body["judged_at_tier"] != TrustTier.PUBLIC.value
 
 
+@pytest.fixture
+def tiered_app(
+    orchestration_sessionmaker: SessionmakerFixture,
+    gate_sessionmaker: SessionmakerFixture,
+    marketplace_sessionmaker: SessionmakerFixture,
+    reporting_sessionmaker: SessionmakerFixture,
+    redis_client: aioredis.Redis,
+    blobstore: LocalFilesystemBlobStore,
+) -> FastAPI:
+    """The `app` fixture above ships a policy with NO `tier_block_overrides`,
+    so every tier resolves to the same CRITICAL threshold and `tier_direction`
+    could only ever answer "equivalent" - a test written against it would pass
+    no matter what the implementation did. This one mirrors the REAL
+    `policies/gate/v1.yaml`: `public` blocks at HIGH, everything else at
+    CRITICAL. (Same trap, same fix, as test_trust_tier_plumbing.py's `_policy`.)
+    """
+    scan_runtime = ScanRuntime(
+        redis=redis_client,
+        blobstore=blobstore,
+        orchestration_session_factory=orchestration_sessionmaker,
+        gate_session_factory=gate_sessionmaker,
+        policy=GatePolicy(
+            version=f"test-market-tiered-{uuid.uuid4().hex[:8]}",
+            required_engines=frozenset({_ENGINE.metadata.name}),
+            hard_gate_rules=frozenset(),
+            tier_block_overrides=((TrustTier.PUBLIC, Severity.HIGH),),
+            fail_closed_verdict=Verdict.BLOCK,
+        ),
+        engine_metadatas=(_ENGINE.metadata,),
+        allowlist=(),
+        signer=LocalDevSigner(),
+        marketplace_session_factory=marketplace_sessionmaker,
+        marketplace_rate_limit_per_min=120,
+        reporting_session_factory=reporting_sessionmaker,
+    )
+    return create_app(scan_runtime=scan_runtime)
+
+
+@pytest_asyncio.fixture
+async def tiered_client(tiered_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=tiered_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        yield c
+
+
+class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
+    """SECURITY (里程碑 F Task 18): `judged_at_tier` alone reported a tier and
+    left the caller to assume it was the one they asked for.
+
+    On THIS surface it usually is not. A marketplace service account defaults to
+    PUBLIC, the STRICTEST tier (`policies/gate/v1.yaml` blocks it at HIGH; every
+    other tier only at CRITICAL), while the console commonly submits at
+    `internal`. Single-flight dedup then hands a marketplace poll a verdict
+    adjudicated under a MORE PERMISSIVE ruleset than it asked for - a HIGH
+    finding that should have blocked for it reads REVIEW/PASS instead. That is
+    the commonest instance of the dangerous direction, and until Task 18 nothing
+    in the response said so.
+
+    Task 14 added exactly this disclosure to the CONSOLE detail response and
+    stopped there.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_public_caller_handed_an_internal_verdict_is_told_it_is_looser(
+        self, tiered_app: FastAPI, tiered_client: httpx.AsyncClient
+    ) -> None:
+        package = _unique_package()
+
+        tiered_app.dependency_overrides[get_session_context] = lambda: _console_session("frank")
+        console_scan_id = await _submit_console(tiered_client, package)
+
+        market_account = _account("mkt-tier-direction")
+        tiered_app.dependency_overrides[get_session_context] = lambda: _market_session(
+            market_account, _BOTH, tier=TrustTier.PUBLIC
+        )
+        assert await _submit_market(tiered_client, package) == console_scan_id
+
+        body = (await tiered_client.get(f"/v1/market/scans/{console_scan_id}")).json()
+        assert body["judged_at_tier"] == TrustTier.INTERNAL.value
+        # This caller's OWN recorded request, off its OWN scan_submitter row -
+        # not the scan's tier under a second label.
+        assert body["requested_tier"] == TrustTier.PUBLIC.value
+        assert body["tier_direction"] == "looser"
+
+    @pytest.mark.asyncio
+    async def test_no_divergence_is_reported_when_the_caller_created_the_scan(
+        self, tiered_app: FastAPI, tiered_client: httpx.AsyncClient
+    ) -> None:
+        # The ordinary case must stay quiet: an alarm that fires on every poll
+        # is one nobody reads when it matters.
+        package = _unique_package()
+        market_account = _account("mkt-tier-agree")
+        tiered_app.dependency_overrides[get_session_context] = lambda: _market_session(
+            market_account, _BOTH, tier=TrustTier.PUBLIC
+        )
+        scan_id = await _submit_market(tiered_client, package)
+
+        body = (await tiered_client.get(f"/v1/market/scans/{scan_id}")).json()
+        assert body["judged_at_tier"] == TrustTier.PUBLIC.value
+        assert body["requested_tier"] == TrustTier.PUBLIC.value
+        assert body["tier_direction"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_disclosure_does_not_widen_the_whitelist(
+        self, tiered_app: FastAPI, tiered_client: httpx.AsyncClient
+    ) -> None:
+        """SECURITY: reading the divergence costs one `submitter_attribution`
+        call, which returns EVERY submitter of the scan - and §6.2 gives a
+        machine identity no business knowing which console user also submitted
+        the same bytes. Only this caller's own entry is used; the projection
+        whitelist is what makes that structural. Asserted on a real response
+        body, with the attribution keys named by hand: a test that only compared
+        against `views.EXTERNAL_TOP_LEVEL_FIELDS` would agree with an
+        implementation that had added them to the whitelist too.
+        """
+        package = _unique_package()
+        tiered_app.dependency_overrides[get_session_context] = lambda: _console_session("grace")
+        scan_id = await _submit_console(tiered_client, package)
+
+        market_account = _account("mkt-tier-whitelist")
+        tiered_app.dependency_overrides[get_session_context] = lambda: _market_session(
+            market_account, _BOTH, tier=TrustTier.PUBLIC
+        )
+        assert await _submit_market(tiered_client, package) == scan_id
+
+        body = (await tiered_client.get(f"/v1/market/scans/{scan_id}")).json()
+        assert set(body) == views.EXTERNAL_TOP_LEVEL_FIELDS
+        for leaked in ("submitters", "submitter_sources", "source", "submitter"):
+            assert leaked not in body, f"{leaked!r} crossed the marketplace boundary"
+
+
+# The contract, written out literally. NOT `views.EXTERNAL_TOP_LEVEL_FIELDS` -
+# asserting the implementation against the constant the implementation itself
+# reads is a tautology: delete a field and both sides shrink together, still
+# equal. That hole was real and shipped (2026-07-28, test_marketplace_views.py
+# closed it there with an identical literal); this file still only compared
+# against `views.EXTERNAL_TOP_LEVEL_FIELDS` below, so the router-level, real-
+# HTTP-response guard never got the same treatment. Duplicated here by hand
+# (not imported from test_marketplace_views.py) and must be edited deliberately
+# when the contract genuinely changes. Source of truth: design spec 5.3.
+_SPEC_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "scan_id",
+        "status",
+        "verdict",
+        "score",
+        "policy_version",
+        "decided_at",
+        "verdict_jws",
+        "fail_closed",
+        "requires_review",
+        "poll_after_ms",
+        "judged_at_tier",
+        "requested_tier",
+        "tier_direction",
+        "summary",
+        "findings",
+    }
+)
+
+
 class TestProjectionIsWhatCrossesTheBoundary:
     """spec §3.1 rule 2 / §5.3 - the response is `views.project_scan`'s output,
     field for field."""
@@ -718,6 +879,33 @@ class TestProjectionIsWhatCrossesTheBoundary:
         # the exact value seeded into the gate's own table, end to end.
         assert body["policy_version"] == _SEEDED_POLICY_VERSION
         assert body["decided_at"] == _SEEDED_ISSUED_AT.isoformat()
+
+    @pytest.mark.asyncio
+    async def test_top_level_contract_matches_the_spec_literally(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """Catches a field being REMOVED from the contract - the direction
+        `test_a_decided_scan_returns_exactly_the_whitelisted_fields` above
+        cannot catch, since it asserts against `views.EXTERNAL_TOP_LEVEL_FIELDS`
+        itself: delete a field there and that test's two sides shrink together,
+        still equal. Only a literal written independently of the implementation
+        can see a field vanish (or a new internal one leak in) on a REAL HTTP
+        response, not just the pure-function projection test_marketplace_views.py
+        already covers this way.
+        """
+        subject = _account("mkt-spec-contract")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        scan_id = await _submit(client)
+        await _seed_result(orchestration_sessionmaker, scan_id)
+        await _seed_verdict(gate_sessionmaker, scan_id)
+        await _force_state(orchestration_sessionmaker, scan_id, "decided")
+
+        body = (await client.get(f"/v1/market/scans/{scan_id}")).json()
+        assert set(body) == _SPEC_TOP_LEVEL_FIELDS
 
     @pytest.mark.asyncio
     async def test_snippet_hash_never_crosses_the_boundary(

@@ -151,3 +151,63 @@ def load_gate_policy(yaml_path: Path) -> GatePolicy:
             f"policy file {yaml_path} must contain a YAML mapping at the top level"
         )
     return parse_gate_policy(raw)
+
+
+def tier_direction(policy: GatePolicy, *, requested: str | None, judged: str | None) -> str | None:
+    """里程碑 F Task 14: which way a requested/judged tier divergence cuts.
+
+    `"looser"` is the one that matters - the verdict was adjudicated under a
+    MORE PERMISSIVE ruleset than this caller asked for, so a finding that
+    should have blocked for them may read PASS. `"stricter"` is the safe side
+    (possible over-blocking, still worth saying out loud). `"equivalent"` means
+    the tier NAMES differ but the policy treats them identically, i.e. nothing
+    about the verdict changes. `None` means the comparison cannot be made -
+    either tier unrecorded, or a stored value that is not a `TrustTier`.
+
+    Derived from `GatePolicy.block_threshold`, the authority, and NOT from
+    `TrustTier`'s declaration order. That order happens to run loose-to-strict
+    today, but strictness is a property of `tier_block_overrides` in the
+    policy file: `public` blocks at HIGH and every other tier at CRITICAL, and
+    a policy edit can change that without touching the enum. Reading the order
+    instead would be a shape check standing in for a policy check - the exact
+    substitution this codebase has already paid for once (see
+    `SubmissionChannel`'s docstring on the SUP-01 catalog audit).
+
+    A hint, not a claim about the past: it is computed from the policy loaded
+    NOW, while the verdict was reached under whatever policy version was loaded
+    then. Both tiers are always returned verbatim alongside it, so a consumer
+    is never dependent on this field being the last word.
+
+    LIVES HERE, not in `gateway.router` where Task 14 first wrote it (Task 18):
+    two surfaces now disclose the divergence - the console's
+    `GET /v1/scans/{scan_id}` and the marketplace's `GET /v1/market/scans/
+    {scan_id}` - and `marketplace_api` is a deliberate anti-corruption layer
+    that must not import another surface's HTTP router to reach a private
+    helper. `gate` is the module that owns applying `GatePolicy`, both callers
+    already depend on it, and this function touches no ORM class, so it costs
+    nothing at the module boundary (scripts/check_import_boundaries.py).
+
+    Takes the STORED column shape (`str | None`) rather than `TrustTier`
+    deliberately: both callers read these values straight out of
+    `scan_job.trust_tier` / `scan_submitter.requested_trust_tier`, both of
+    which are nullable and neither of which the database constrains to the
+    enum. Coercing at the two call sites instead would duplicate exactly the
+    "unrecorded vs. corrupt vs. valid" three-way that is the load-bearing part
+    of this function.
+    """
+    if requested is None or judged is None or requested == judged:
+        return None
+    try:
+        requested_threshold = policy.block_threshold(TrustTier(requested))
+        judged_threshold = policy.block_threshold(TrustTier(judged))
+    except ValueError:
+        # A stored value that is not a valid TrustTier. Report "cannot say"
+        # rather than picking a direction from a corrupt row.
+        return None
+    # LOWER block threshold = stricter (blocking at HIGH catches strictly more
+    # than blocking at CRITICAL - Severity is an IntEnum, HIGH=3 < CRITICAL=4).
+    if judged_threshold > requested_threshold:
+        return "looser"
+    if judged_threshold < requested_threshold:
+        return "stricter"
+    return "equivalent"
