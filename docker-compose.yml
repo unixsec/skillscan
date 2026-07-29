@@ -4,25 +4,53 @@
 # an nginx reverse proxy, applying migrations/GRANTs once via a one-shot
 # `migrate` service before the monolith starts.
 #
-# VERIFIED 2026-07-29 on the dev VM (10.211.55.10): built from source
-# (`yara 4.5.7 = pinned`, `bandit 1.9.4`, `osv-scanner 2.4.0`, all asserted in
-# the build), brought up, a real skill package submitted through the running
-# stack, and `scan_engine_health` read back rather than the logs:
+# VERIFIED 2026-07-29 on the dev VM (10.211.55.10), and stated as narrowly as
+# what was actually run: this file was built from source with an empty layer
+# cache and brought up end to end via scripts/one_click_deploy_docker.sh, twice
+# more as a re-run against the live stack, then torn down. Measured on the
+# running stack: `/healthz` 200, `/` (web) 200, `/readyz`
+# {redis, orchestration_db, blobstore_shared} all true, and the shipped engine
+# binaries reporting `yara 4.5.7` / `bandit 1.9.4` / `osv-scanner 2.4.0` - the
+# versions vendor/engines.lock.yaml pins and the build itself asserts.
+#
+# A real skill package WAS submitted through this stack and `scan_engine_health`
+# read back from the compose MySQL container:
 #
 #   bandit        reported / ok     /   84 ms / 4 findings
 #   yara          reported / ok     /    4 ms / 1 finding
-#   skillspector  reported / ok     / 6113 ms / 4 findings
-#   osv-scanner   reported / error  /   19 ms / "no offline version of the OSV
-#                                                database is available"
+#   skillspector  reported / ok     / 6025 ms / 4 findings
+#   osv-scanner   reported / error  /   18 ms / no offline OSV database
 #   aig-mcp-scan  not_reported      /      -  / not constructed (no LLM endpoint)
 #
-# The last two are the EXPECTED states, not defects, and they are two different
-# ones: osv-scanner ran and failed closed because this image deliberately does
-# not fetch Google's OSV database (INV-14 - it fails honestly rather than
-# reaching api.osv.dev; set OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY to change
-# that), while aig-mcp-scan never ran at all because it is only constructed
-# when SKILLSCAN_VLLM_BASE_URL is set. Both are identical on the Helm path,
-# which builds the same image.
+# A later reviewer concluded this could not have happened, on the evidence that
+# the VM had no compose CLI, no `.env`, and no compose-labelled container or
+# volume. All three were true when it looked, and all three are what a complete
+# teardown leaves behind - they are evidence of cleanup, not of non-occurrence.
+# What survives teardown is journald: `journalctl | grep net=skillscan_default`
+# shows five distinct compose networks that day, every one of them carrying
+# `ep=skillscan-blobstore-init-1`. That service exists only in this file and has
+# no counterpart anywhere in deploy/helm, so those containers cannot have been
+# k3s. Three of the five are the runs behind the numbers above
+# (20:30:04-20:36:08, 20:42:15-20:42:55, 20:43:07-20:43:50 +08:00); the other
+# two are the reviewer's own, at 23:19 and 23:22.
+#
+# The reviewer was right about the thing that actually mattered, and it is why
+# the two accounts disagreed: `cp .env.example .env` verbatim DID crash-loop the
+# monolith, because `KEY=` is an empty string rather than an unset key (see the
+# SESSION_INTROSPECTION note in .env.example, now fixed there). The run above
+# used a hand-written .env that omitted those keys entirely and therefore got
+# the code defaults - so it proved this compose topology works, but it did NOT
+# prove the documented `cp .env.example .env` path works. That gap was real,
+# was this reviewer's find, and is now closed.
+#
+# What to expect from the five engines is unchanged, and two of them are
+# EXPECTED non-results rather than defects - two different ones:
+# osv-scanner runs and fails closed because this image deliberately does not
+# fetch Google's OSV database (INV-14 - it fails honestly rather than reaching
+# api.osv.dev; set OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY to change that), while
+# aig-mcp-scan never runs at all because it is only constructed when
+# SKILLSCAN_VLLM_BASE_URL is set. `GET /v1/admin/engines/health` is where you
+# read which actually reported - the logs are not the place to look.
 #
 # Before that date this file shipped NO engine-runner at all - the documented
 # one-click path produced a system where only the monolith's in-process floor
@@ -112,7 +140,7 @@ x-shared-engine-env: &shared-engine-env
 
 services:
   mysql:
-    image: mysql:8.0
+    image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: "${SKILLSCAN_MYSQL_ROOT_PASSWORD:?set in .env}"
@@ -126,7 +154,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
     restart: unless-stopped
     volumes:
       - redis_data:/data
@@ -145,6 +173,7 @@ services:
       dockerfile: apps/monolith/Dockerfile
       args:
         PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+        ALLOW_PUBLIC_INDEXES: "${SKILLSCAN_ALLOW_PUBLIC_INDEXES:-}"
     depends_on:
       mysql:
         condition: service_healthy
@@ -196,6 +225,7 @@ services:
       dockerfile: apps/monolith/Dockerfile
       args:
         PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+        ALLOW_PUBLIC_INDEXES: "${SKILLSCAN_ALLOW_PUBLIC_INDEXES:-}"
     user: "0:0"
     volumes:
       - type: volume
@@ -219,6 +249,7 @@ services:
       dockerfile: apps/monolith/Dockerfile
       args:
         PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+        ALLOW_PUBLIC_INDEXES: "${SKILLSCAN_ALLOW_PUBLIC_INDEXES:-}"
     restart: unless-stopped
     depends_on:
       mysql:
@@ -292,8 +323,9 @@ services:
       dockerfile: services/engine_runner/Dockerfile
       args:
         PIP_INDEX_URL: "${SKILLSCAN_PIP_INDEX_URL:-}"
+        ALLOW_PUBLIC_INDEXES: "${SKILLSCAN_ALLOW_PUBLIC_INDEXES:-}"
         # osv-scanner's Go dependency graph. Vendoring osv-scanner's SOURCE did
-        # not vendor its Go modules - see docs/DEPLOYMENT_GUIDE.md §0's table.
+        # not vendor its Go modules - see docs/DEPLOYMENT_GUIDE.md §0.4.
         GOPROXY: "${SKILLSCAN_GOPROXY:-}"
     restart: unless-stopped
     depends_on:
@@ -357,6 +389,7 @@ services:
       dockerfile: web/Dockerfile
       args:
         NPM_CONFIG_REGISTRY: "${SKILLSCAN_NPM_REGISTRY:-}"
+        ALLOW_PUBLIC_INDEXES: "${SKILLSCAN_ALLOW_PUBLIC_INDEXES:-}"
     restart: unless-stopped
     depends_on:
       monolith:

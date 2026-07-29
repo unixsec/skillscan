@@ -196,8 +196,22 @@ fi
 # ---------------------------------------------------------------------------
 echo "=== [3/6] building three images, collecting two more ==="
 
+# INV-14 build-time egress gate (scripts/require_build_index.sh). This script's
+# whole job is to run WHERE THERE IS INTERNET and carry the built images to the
+# isolated side, so "public" is a legitimate answer here - but it now has to be
+# said out loud rather than obtained by leaving three variables blank. Failing
+# here costs a second; failing inside the first `docker build` costs the build.
+if [ -z "${PIP_INDEX_URL:-}${GOPROXY:-}${NPM_CONFIG_REGISTRY:-}" ] \
+   && [ "${ALLOW_PUBLIC_INDEXES:-}" != "true" ]; then
+  die "no package index configured. Set PIP_INDEX_URL/GOPROXY/NPM_CONFIG_REGISTRY to
+    internal mirrors, or ALLOW_PUBLIC_INDEXES=true to build against the public
+    ones deliberately (which is the normal case for this script - it is meant to
+    run on the connected side). An empty value is NOT the same as 'no network':
+    uv/npm/go each treat it as unset and use their public default silently."
+fi
+
 build_args=()
-for arg in PIP_INDEX_URL GOPROXY NPM_CONFIG_REGISTRY; do
+for arg in PIP_INDEX_URL GOPROXY NPM_CONFIG_REGISTRY ALLOW_PUBLIC_INDEXES; do
   value="${!arg:-}"
   if [ -n "$value" ]; then
     build_args+=(--build-arg "$arg=$value")

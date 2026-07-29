@@ -76,9 +76,16 @@
 # NOT VERIFIED beyond real builds+runs on the dev VM (10.211.55.10,
 # 2026-07-08/09) - no gVisor RuntimeClass available there, same posture as
 # every other Dockerfile in this repo.
-FROM golang:1.26.4-alpine3.23@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f AS osv-builder
+FROM golang:1.26.4-alpine3.23@sha256:18b460dd17542c2ba43299a633cf6ebfc1115101509531471d7cfce1019af083 AS osv-builder
 
 ARG GOPROXY
+ARG ALLOW_PUBLIC_INDEXES
+
+# INV-14 build-time egress gate, before `go mod download`. An empty GOPROXY does
+# not fail closed - `go env GOPROXY` resolves to https://proxy.golang.org,direct
+# (measured). See scripts/require_build_index.sh.
+COPY scripts/require_build_index.sh /usr/local/bin/require_build_index.sh
+RUN require_build_index.sh GOPROXY "${GOPROXY}" "${ALLOW_PUBLIC_INDEXES}" proxy.golang.org
 
 WORKDIR /src
 COPY vendor/osv-scanner/ ./
@@ -120,7 +127,7 @@ RUN go build -o osv-scanner ./cmd/osv-scanner/
 # `ACLOCAL_AMFLAGS=-I m4`, so `./bootstrap.sh` (`autoreconf --force --install`)
 # fails to expand that macro without it. Today's vendoring had to force this
 # file past an ignore rule; if it is ever lost, this stage is where it breaks.
-FROM debian:bookworm-slim AS yara-builder
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS yara-builder
 
 # The package list is taken from the real upstream CI recipe
 # (vendor/yara/.github/workflows/build.yml), per coding spec §10A.3's "读真实
@@ -150,15 +157,20 @@ RUN ./bootstrap.sh \
     && make -j"$(nproc)" \
     && strip yara
 
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS builder
 
 ARG PIP_INDEX_URL
+ARG ALLOW_PUBLIC_INDEXES
+
+# INV-14 build-time egress gate - see scripts/require_build_index.sh.
+COPY scripts/require_build_index.sh /usr/local/bin/require_build_index.sh
+RUN require_build_index.sh PIP_INDEX_URL "${PIP_INDEX_URL}" "${ALLOW_PUBLIC_INDEXES}" pypi.org
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.5@sha256:7bff3c3776ec467fc1437960f2c469d8beb30f536a6465a3350c647ccd260ec2 /uv /uvx /usr/local/bin/
 
 WORKDIR /build
 COPY pyproject.toml uv.lock ./
@@ -168,9 +180,20 @@ COPY services/ services/
 COPY policies/ policies/
 RUN UV_INDEX_URL="${PIP_INDEX_URL}" uv sync --frozen --no-dev --no-editable
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 ARG PIP_INDEX_URL
+
+ARG ALLOW_PUBLIC_INDEXES
+
+# INV-14 build-time egress gate. This stage matters as much as the builder: it
+# runs THREE `uv pip install` steps of its own (bandit, skillspector and
+# aig-mcp-scan's requirements.txt), so an unconfigured index here reaches
+# pypi.org just as silently. Removed again at the bottom of this stage, next to
+# the version guard's own cleanup - a build-time helper has no business in the
+# runtime image.
+COPY scripts/require_build_index.sh /usr/local/bin/require_build_index.sh
+RUN require_build_index.sh PIP_INDEX_URL "${PIP_INDEX_URL}" "${ALLOW_PUBLIC_INDEXES}" pypi.org
 
 # `yara` itself is NOT installed here any more - it is compiled from
 # vendor/yara in the yara-builder stage above and copied in below. What apt
@@ -187,7 +210,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --uid 10002 engine-runner
 
-COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.5@sha256:7bff3c3776ec467fc1437960f2c469d8beb30f536a6465a3350c647ccd260ec2 /uv /uvx /usr/local/bin/
 COPY --from=builder /build/.venv /app/.venv
 COPY --from=osv-builder /src/osv-scanner /usr/local/bin/osv-scanner
 COPY --from=yara-builder /build/yara/yara /usr/local/bin/yara
@@ -218,7 +241,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 # (build backend), PyYAML, stevedore and rich are still resolved from
 # PIP_INDEX_URL at build time - vendoring bandit's source does not vendor
 # bandit's dependency graph, exactly as vendoring osv-scanner's source did not
-# vendor its Go modules. docs/DEPLOYMENT_GUIDE.md §0 carries the full table.
+# vendor its Go modules. docs/DEPLOYMENT_GUIDE.md §0.4 carries the full table.
 RUN BANDIT_PIN="$(vendor_pinned_version.sh /tmp/engines.lock.yaml bandit)" \
     && PBR_VERSION="${BANDIT_PIN}" UV_INDEX_URL="${PIP_INDEX_URL}" \
         uv pip install --python /app/.venv/bin/python /tmp/bandit-src \
@@ -276,7 +299,8 @@ RUN set -eu; \
         echo "!!! image would fingerprint a toolchain it does not contain. Refusing." >&2; \
         exit 1; \
     fi; \
-    rm -f /tmp/engines.lock.yaml /usr/local/bin/vendor_pinned_version.sh
+    rm -f /tmp/engines.lock.yaml /usr/local/bin/vendor_pinned_version.sh \
+          /usr/local/bin/require_build_index.sh
 
 USER engine-runner
 WORKDIR /app

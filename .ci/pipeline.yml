@@ -97,9 +97,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build monolith + per-engine images
         run: |
-          docker build -t "${REGISTRY}/skillscan/monolith:${GITHUB_SHA}" -f apps/monolith/Dockerfile .
+          # ALLOW_PUBLIC_INDEXES=true, explicitly: a GitHub-hosted runner has
+          # real public internet and no internal mirror, so this is the honest
+          # answer. Without it the build now REFUSES rather than reaching
+          # pypi.org/proxy.golang.org silently - see
+          # scripts/require_build_index.sh. An internal runner should set the
+          # three mirror args instead and drop this line.
+          docker build --build-arg ALLOW_PUBLIC_INDEXES=true \
+            -t "${REGISTRY}/skillscan/monolith:${GITHUB_SHA}" -f apps/monolith/Dockerfile .
           for engine in bandit osv_scanner yara skillspector; do
-            docker build -t "${REGISTRY}/skillscan/engine-${engine}:${GITHUB_SHA}" \
+            docker build --build-arg ALLOW_PUBLIC_INDEXES=true \
+              -t "${REGISTRY}/skillscan/engine-${engine}:${GITHUB_SHA}" \
               -f "deploy/engines/${engine}/Dockerfile" .
           done
         env:

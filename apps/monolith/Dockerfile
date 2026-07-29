@@ -16,9 +16,17 @@
 # below) surfaced this way - this Dockerfile was never actually built before
 # that, only inspected, same "NOT VERIFIED" posture M5's
 # deploy/engines/*/Dockerfile still carries.
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS builder
 
 ARG PIP_INDEX_URL
+ARG ALLOW_PUBLIC_INDEXES
+
+# INV-14 build-time egress gate, FIRST so it costs a second rather than eight
+# minutes. An empty PIP_INDEX_URL does not fail closed - uv treats it as unset
+# and uses pypi.org. See scripts/require_build_index.sh for the measurement and
+# for why "public" stayed reachable but has to be asked for by name.
+COPY scripts/require_build_index.sh /usr/local/bin/require_build_index.sh
+RUN require_build_index.sh PIP_INDEX_URL "${PIP_INDEX_URL}" "${ALLOW_PUBLIC_INDEXES}" pypi.org
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates \
@@ -27,7 +35,7 @@ RUN apt-get update \
 # uv's dedicated multi-arch binary image (scratch, exposes /uv+/uvx at root) -
 # NOT the -python3.12-bookworm-slim variant, whose uv lives on PATH under
 # /usr/local/bin, so `COPY /uv` from it fails (found on first real image build).
-COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.5@sha256:7bff3c3776ec467fc1437960f2c469d8beb30f536a6465a3350c647ccd260ec2 /uv /uvx /usr/local/bin/
 
 # BUG (found running deploy/helm/skillscan/templates/migration-job.yaml
 # against the real dev VM, not by inspection): this WORKDIR used to be
@@ -53,12 +61,22 @@ COPY apps/ apps/
 COPY services/ services/
 COPY scripts/ scripts/
 COPY policies/ policies/
-# SECURITY: an empty/unset PIP_INDEX_URL makes uv's resolution fail closed,
-# rather than silently falling back to the public PyPI (same rationale as
-# deploy/engines/bandit/Dockerfile's own PIP_INDEX_URL handling).
+# SECURITY, corrected 2026-07-29 after measuring it: this used to claim that an
+# empty/unset PIP_INDEX_URL makes uv "fail closed rather than silently fall
+# back to the public PyPI". It does NOT. A cold build on the dev VM with
+# SKILLSCAN_PIP_INDEX_URL unset runs `UV_INDEX_URL="" uv sync --frozen` and
+# resolves every one of the 74 locked packages from pypi.org without a word -
+# uv treats an empty value as "not set" and uses its default index. The npm and
+# Go equivalents behave the same way (registry.npmjs.org, proxy.golang.org).
+#
+# 2026-07-30: that is now GATED rather than merely documented - the
+# require_build_index.sh step at the top of this stage refuses the build unless
+# PIP_INDEX_URL names a mirror or ALLOW_PUBLIC_INDEXES=true says public is
+# intended. Reaching this line therefore means one of those two was chosen on
+# purpose; an empty value can no longer arrive here by accident.
 RUN UV_INDEX_URL="${PIP_INDEX_URL}" uv sync --frozen --no-dev --no-editable
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 # BUG (found running deploy/helm/skillscan/templates/migration-job.yaml
 # against the real dev VM, not by inspection): this stage used to install

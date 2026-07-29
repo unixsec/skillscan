@@ -9,6 +9,15 @@
 | **Kubernetes** | 集群规模生产部署 | `deploy/helm/skillscan`（Helm chart） | 同上 |
 | **Kubernetes（隔离网）** | 无外网、无 registry 的隔离集群 | `scripts/build_offline_bundle.sh` + `helm install`——**完整步骤见 §6** | 本地账号 / OIDC / SAML，需手工配置（§6.9） |
 
+## 0. 构建期依赖与主机要求
+
+本节是**从源码构建**（§2 的 docker-compose 一键部署、以及自建内网镜像）唯一需要读的一节：
+它逐项列出构建机必须能取到的东西（基础镜像 digest、apt 包、PyPI/npm/Go 依赖源）和宿主机
+必须满足的条件（版本、磁盘、CPU/内存、端口）。**照着 §0.2–§0.4 就能把内网镜像源准备齐，
+不需要再去读任何一个 Dockerfile。**
+
+**隔离网的目标机器一项都不需要**——那正是离线镜像包（§6）的意义，见 §0.1 的两列对照。
+
 > ### 隔离网部署的唯一推荐路径：离线镜像包（§6）
 >
 > 面向企业隔离网交付时，**请走 §6 的离线镜像包**：有网侧
@@ -57,6 +66,250 @@
 > 若镜像里的引擎与它不一致，摘要指纹的就是一套从未真正运行过的工具链。旧镜像正是如此：
 > lock 记 v4.5.7、实际跑 4.2.3，而这个缺口当时只被写在一句诚实的注释里。
 
+### 0.1 两列对照：构建机需要什么，运行机需要什么
+
+下面每一行的两列**互不重叠**。左列是"这台机器要能构建镜像"，右列是"这台机器只要能跑起
+已经构建好的镜像"。离线包（§6）交付的正是右列——所以隔离侧左列一项都不需要。
+
+| 需要的东西 | 🔨 构建机（§2 compose / 自建内网镜像） | 📦 运行机（§6 离线包目标 / 已有镜像的集群） |
+|---|:---:|:---:|
+| 基础镜像 `python` / `debian` / `golang` / `node` / `uv`（§0.2） | **需要** | 不需要（已烘进镜像层） |
+| 运行期镜像 `mysql:8.0` / `redis:7-alpine` / `nginx`（§0.2） | 需要（构建 web 用 nginx） | **需要**（离线包已含，无需外网） |
+| apt 归档：yara 的编译工具链 11 个包（§0.3） | **需要** | 不需要 |
+| apt 归档：运行期共享库 `libjansson4` / `libmagic1` 等（§0.3） | 需要 | 不需要（已装进镜像） |
+| PyPI 索引：uv.lock 74 包 + 三个引擎各自的依赖图（§0.4） | **需要** | 不需要 |
+| npm registry：`package-lock.json` 171 包（§0.4） | **需要** | 不需要 |
+| Go module proxy：osv-scanner 292 个模块（§0.4） | **需要** | 不需要 |
+| `vendor/` 源码树（五个引擎） | **需要**（`git clone` 自带，源码包/`git archive` 可能不带） | 不需要 |
+| 磁盘 ≥15 GB、内存 ≥4 GB、Docker ≥20.10 + compose ≥2.0（§0.5） | **需要** | 只需运行期部分（§0.5 表末） |
+| 宿主机端口 80 / 8000（§0.5） | 构建阶段不占，`up` 之后占 | **需要** |
+
+**"vendor 了源码"不等于"vendor 了依赖图"**，这是最容易读错的一点：vendor 了
+osv-scanner 的源码不等于 vendor 了它的 292 个 Go module，vendor 了 bandit 的源码不等于
+vendor 了 pbr/PyYAML/stevedore/rich。上表 PyPI/npm/Go 三行就是这个区别。
+
+### 0.2 基础镜像清单（含 digest）
+
+内网 registry 运维照这张表 `docker pull` + `docker tag` + `docker push` 即可，不必读
+Dockerfile。digest 为 **2026-07-29 在 dev VM 上实测**的 manifest index digest（多架构索引，
+amd64/arm64 通用），体积为该架构**压缩后的下载字节**（`docker manifest inspect` 累加层大小）。
+
+| 基础镜像 | 出现在 | 阶段 | Dockerfile 里的钉法 | 实测 digest | 下载体积 amd64 / arm64 |
+|---|---|---|---|---|---|
+| `python:3.12-slim-bookworm` | `apps/monolith/Dockerfile`、`services/engine_runner/Dockerfile` | 构建 + 运行（两个 Dockerfile 的 builder 与 final 阶段都用它） | **digest** | `sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b` | 43.3 / 43.0 MB |
+| `debian:bookworm-slim` | `services/engine_runner/Dockerfile`、`deploy/engines/yara/Dockerfile` | 仅构建（`yara-builder`） | **digest** | `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818` | 26.9 / 26.8 MB |
+| `golang:1.26.4-alpine3.23` | `services/engine_runner/Dockerfile`、`deploy/engines/osv_scanner/Dockerfile` | 仅构建（`osv-builder`） | **digest** | `sha256:18b460dd17542c2ba43299a633cf6ebfc1115101509531471d7cfce1019af083` | 68.1 / 65.4 MB |
+| `ghcr.io/astral-sh/uv:0.5` | `apps/monolith/Dockerfile`、`services/engine_runner/Dockerfile` | 构建 + 运行（engine-runner 的 final 阶段也 COPY 了 `uv`/`uvx`） | **digest** | `sha256:7bff3c3776ec467fc1437960f2c469d8beb30f536a6465a3350c647ccd260ec2` | 15.4 / 14.7 MB |
+| `node:22-slim` | `web/Dockerfile` | 仅构建 | **digest** | `sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` | 76.2 / 76.2 MB |
+| `nginx:1.27-alpine` | `web/Dockerfile` | 构建（final 阶段）+ 运行 | **digest** | `sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10` | 20.0 / 20.8 MB |
+| `mysql:8.0` | `docker-compose.yml` | 仅运行（不参与构建） | **digest** | `sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b` | 222.8 / 218.5 MB |
+| `redis:7-alpine` | `docker-compose.yml` | 仅运行（不参与构建） | **digest** | `sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2` | 15.5 / 16.0 MB |
+
+合计：**构建期 6 个镜像约 250 MB**（python + debian + golang + uv + node + nginx），
+**运行期额外 2 个约 238 MB**（mysql + redis），全量约 **488 MB**（amd64 压缩）。
+
+**✅ 2026-07-30 起八个全部 digest 钉死**，上表 digest 列就是仓库里真正写着的值——这张表
+现在可以直接当内网镜像同步清单用，不需要再回去核对 Dockerfile。
+
+在此之前只有 `golang` 一行是 digest，**而且那个 digest 已经过期**：`golang:1.26.4-alpine3.23`
+这个 tag 现在解析到 `sha256:18b460dd…`，而 Dockerfile 里钉的是 `sha256:f23e8b22…`。所以
+"我们钉了 digest" 这句话当时**既不完整（8 选 1）也不属实（那 1 个是旧的）**。旧 digest 仍
+然能拉到（这正是 digest 钉法的价值），但它意味着构建出来的是一套没人再看的旧基础层。现已
+全部重钉到当天实测值，并由 `apps/monolith/tests/test_engine_build_pins.py::
+TestEveryDockerfileIsSupplyChainPinned` 守住——该测试 **glob 全部 Dockerfile**，新增第七个
+Dockerfile 而忘了钉 digest 会当场失败，不依赖谁记得这张表。
+
+**重钉之后要做什么：** tag 被上游重建时，digest 不会自己更新，构建仍然稳定地拉旧镜像（这是
+想要的行为）。**主动升级基础镜像是一个显式动作**：
+```bash
+docker buildx imagetools inspect python:3.12-slim-bookworm --format '{{.Manifest.Digest}}'
+# 把新值填回 Dockerfile，然后重新构建 + 跑一次真实扫描验证
+```
+
+### 0.3 apt 包清单（构建期 / 运行期分列）
+
+来源 Debian **bookworm**（`deb.debian.org`）主仓库，需按目标架构（amd64/arm64）准备。
+两列**没有交集**：左列是编译 yara 用的工具链，构建完就被丢弃（多阶段构建，约 250 MB 不进
+最终镜像）；右列是最终镜像里真正 `ldd` 得到的共享库。
+
+| 🔨 仅构建期（`yara-builder` 阶段，`debian:bookworm-slim`） | 📦 仅运行期（各 final 阶段） |
+|---|---|
+| `autoconf` `automake` `libtool` `pkg-config` `bison` `flex` `make` `gcc` | engine-runner：`ca-certificates` `libjansson4` `libmagic1` |
+| `libjansson-dev` `libmagic-dev` `libssl-dev` | monolith：`ca-certificates` `default-mysql-client` |
+| 另：两个 python builder 阶段各装一个 `ca-certificates` | web：**无**（`node:22-slim` / `nginx:1.27-alpine` 都不跑 apt） |
+
+几个不能省的理由，都是实测踩出来的而不是抄的：
+
+- `bison` / `flex` **必须有**：`./bootstrap.sh`（`autoreconf --force`）会重新生成
+  `libyara/lexer.c`，缺了会以 `flex: command not found` 失败。
+- `libjansson-dev` / `libmagic-dev` 对应 `--enable-cuckoo --enable-magic`，是为了与旧的
+  Debian 版 yara 4.2.3 模块集持平；缺了不会报错，只会让某条 `import "magic"` 的规则永远
+  不命中。
+- `libssl-dev` 让 yara 的 `hash` 模块（openssl）保持开启。
+- 运行期只需要 `libjansson4` / `libmagic1`：yara 的 CLI 已把 libyara 静态链进去了
+  （`--disable-shared`），所以**不需要** `libyara9`。
+- `default-mysql-client` 只有 monolith 镜像需要——同一个镜像兼作 `migrate` 一次性容器，
+  迁移后的自校验查询要用它。
+
+#### apt 为什么**没有**参数化（明确决定，2026-07-30）
+
+PyPI / npm / Go 三个源都有重定向变量（§0.4），apt **没有**，所以隔离网自建目前仍需改
+Dockerfile 或换基础镜像。**评估结论是不加这个变量**，理由如下——这不是遗漏，是取舍：
+
+- **加了会重建刚刚修掉的那类缺陷。** 参数化的做法是 `ARG APT_MIRROR` + 一句 `sed` 改写
+  `/etc/apt/sources.list.d/debian.sources`。上游一改文件布局（bookworm 已经从
+  `sources.list` 换成 deb822 格式的 `.sources` 一次了），那句 sed 就**静默无操作**，构建
+  照常成功、照常走 `deb.debian.org`——正好是 §0.4 那个"变量看起来配好了其实没生效"的失败
+  模式，而这次连报错都不会有。alpine 还得再来一套（`/etc/apk/repositories`）。
+- **这里没有会骗人的旋钮。** `PIP_INDEX_URL` 的问题在于它**存在**、看起来管用、留空却悄悄
+  走公网；apt 根本没有这个变量，是一个诚实的"没有"。补一个不可验证的旋钮，比没有更糟。
+- **验不了。** 本环境没有内网 Debian/Alpine 镜像源，`APT_MIRROR` 这条路径无法真跑一次，
+  只能靠读代码判断"应该能行"——这个项目已经吃过多次这种亏。
+
+**那真隔离网怎么办**（两条都是实际可行的，不是把问题推走）：
+
+1. **走离线镜像包（§6，推荐）。** 送过去的是构建完成的镜像，隔离侧一次 apt 都不跑。
+2. **换基础镜像。** 企业一般有自己的 golden base image，其 `sources.list` 本来就指向内网。
+   把 §0.2 表里 `python:3.12-slim-bookworm` / `debian:bookworm-slim` / `node:22-slim` /
+   `nginx:1.27-alpine` 换成对应的内部镜像（连 digest 一起换）即可，**不需要改任何一句 apt
+   命令**——这也是现实中企业真正的做法，而不是去 sed 别人 Dockerfile 里的源。
+
+§0.3 这张表就是为第 2 条准备的：内网镜像里只要有这些包，构建就能过。
+
+### 0.4 PyPI / npm / Go 依赖源，以及三个重定向变量
+
+**这三个变量是企业内网构建实际使用的机制**，`.env` 里设一次，compose 会把它们作为 build arg
+传进三个 Dockerfile，再由 Dockerfile 翻译成各工具自己的原生环境变量：
+
+| `.env` 变量 | → build arg | → 工具原生变量 | 覆盖哪些构建步骤 | 规模（实测） |
+|---|---|---|---|---|
+| `SKILLSCAN_PIP_INDEX_URL` | `PIP_INDEX_URL` | `UV_INDEX_URL` | ① `uv sync --frozen`（monolith + engine-runner）② `uv pip install /tmp/bandit-src`③ `uv pip install /tmp/skillspector-src`④ `uv pip install -r vendor-aig-mcp-scan/requirements.txt`（独立 venv） | `uv.lock` **74** 个包；bandit 另需 `pbr`(构建后端) + `PyYAML` `stevedore` `rich`；aig mcp-scan `requirements.txt` **5** 行（含 `pydantic==2.12.4`，故必须装进独立 venv） |
+| `SKILLSCAN_NPM_REGISTRY` | `NPM_CONFIG_REGISTRY` | `NPM_CONFIG_REGISTRY` | ① `npm install -g npm@10.8.2`（**也走 registry**，容易漏）② `npm ci` | `web/package-lock.json` **171** 个包 |
+| `SKILLSCAN_GOPROXY` | `GOPROXY` | `GOPROXY` | `go mod download`（`vendor/osv-scanner`） | `vendor/osv-scanner/go.sum` **292** 个模块 |
+
+```bash
+# .env 里的内网写法（示例）
+SKILLSCAN_PIP_INDEX_URL=https://nexus.corp.example/repository/pypi/simple
+SKILLSCAN_NPM_REGISTRY=https://nexus.corp.example/repository/npm/
+SKILLSCAN_GOPROXY=https://nexus.corp.example/repository/go/
+```
+
+**⚠ 留空从来不是 fail-closed，而是走公网——2026-07-30 起这条路被堵死了。**
+
+先说事实（实测，不是推断）：三个工具都把**空值当作未设置**，然后用自己的公网默认源。
+
+| 设置 | 实测结果 |
+|---|---|
+| `UV_INDEX_URL=""` | `uv sync --frozen` 从 pypi.org 解析全部 74 个包，一声不吭 |
+| `NPM_CONFIG_REGISTRY=""` | `npm config get registry` → `https://registry.npmjs.org/` |
+| `GOPROXY=""` | `go env GOPROXY` → `https://proxy.golang.org,direct` |
+
+这是**和 `SESSION_INTROSPECTION` 完全同一类缺陷**："空字符串"与"键不存在"被当成两回事，而
+`cp .env.example .env` 恰好生产的就是空字符串。后果比登录崩溃严重：一个以为自己在做隔离网
+构建的操作者，实际上连了三个公网服务，而且没有任何提示。
+
+**现在的行为：构建直接拒绝启动**，除非二选一显式表态（`scripts/require_build_index.sh`，
+是每个联网构建阶段的第一个 `RUN`，秒级失败而不是八分钟后失败）：
+
+```bash
+# 1) 内网镜像源 —— 隔离网路径，INV-14 保持
+SKILLSCAN_PIP_INDEX_URL=https://nexus.corp.example/repository/pypi/simple
+
+# 2) 就是要走公网 —— 开发机 / 评估 / CI / 在联网侧打离线包
+SKILLSCAN_ALLOW_PUBLIC_INDEXES=true
+```
+
+**为什么保留第 2 条而不是一律硬失败：** 强制要求先有镜像源才能构建，会挡住开发机、本仓库
+自己的 CI、以及 `scripts/build_offline_bundle.sh`（它的工作本来就是**在联网侧**构建）。一道
+没人能满足的闸门的下场是被删掉，或者更糟——被人直接改 Dockerfile 绕过去。所以公网仍然可达，
+只是**必须指名道姓地要**，而这个选择会出现在构建命令、compose 文件和镜像的 `docker history`
+里，不再是从三行空白里被**推断**出来的。空值与未设置现在行为完全一致，且都不等于"公网"。
+
+守护它的是 `test_engine_build_pins.py::TestEveryDockerfileIsSupplyChainPinned`，**glob 全部
+Dockerfile**：新加一个声明了 `ARG PIP_INDEX_URL` 却没接闸门的 Dockerfile 会当场测试失败。
+
+其余两条构建期外网需求，这三个变量**管不到**：
+
+- **基础镜像**（§0.2）：由 registry mirror / `docker tag` 解决，现已全部 digest 钉死。
+- **apt**（§0.3）：**刻意没有参数化**，理由与替代做法见 §0.3 的"apt 为什么没有参数化"。
+  一句话版本：加一个 `sed` 改源的旋钮会重建上面刚堵掉的那类静默失效，而且本环境验证不了；
+  真隔离网请走离线包，或换成内网 golden base image。
+
+另外 bandit 的打包用 `pbr`，版本号从 **git tag** 推导，而 vendor 子树只有源码没有 git 历史
+——所以构建时由 `PBR_VERSION` 从 `vendor/engines.lock.yaml` 注入，无需外网。
+
+### 0.5 宿主机要求
+
+`scripts/one_click_deploy_docker.sh` 的 preflight 会在**构建开始前**逐项检查下表中标了
+"脚本检查"的项，检查不过直接退出——不会让你在 yara 编译到第 8 分钟时才发现 80 端口被占。
+
+| 项 | 最低要求 | 实测环境（dev VM，通过） | 脚本检查 | 不满足时的真实症状 |
+|---|---|---|---|---|
+| Docker Engine | ≥ 20.10 | 29.1.3 | ✅ | 旧 daemon 会**忽略**而不是拒绝 `depends_on: condition`，表现为启动顺序错乱 |
+| docker compose | **≥ 2.0（v1 不行）** | v5.3.1 | ✅ | v1 读不了本仓库的 compose 文件（无 `version:` 键），报的错跟"compose 版本"毫无关系 |
+| docker buildx | 建议安装 | v0.35.0 | — | 缺失时 compose 告警并回落到 classic builder；能构建，但更慢且无并行（实测） |
+| CPU | 2 核可用 | 2 核 aarch64 | — | 核数直接决定构建时长（§0.6）：yara 走 `make -j$(nproc)`，Go/npm 同样吃核 |
+| 内存（**daemon 视角**） | ≥ 4 GB | 7.7 GB | ✅ | `npm run build` 被 OOM kill，表现为裸的 `Killed` / exit 137，不提内存二字。Docker Desktop 的默认分配常低于宿主机真实内存 |
+| 磁盘（docker data-root） | ≥ 15 GB 空闲 | 163 GB 空闲 | ✅ | BuildKit 中途 ENOSPC，报的是当时在写的那个工具的错（链接错误 / apt 错误 / npm 缓存截断），**从不说"磁盘满了"** |
+| 宿主机端口 | **80**（web）、**8000**（monolith） | 空闲 | ✅ | `address already in use`——但只在构建结束后才发生。MySQL/Redis **不**发布到宿主机，仅在 compose 网络内可达 |
+| `.env` | 存在且 `chmod 600` | — | ✅ | 见 §2；`cp .env.example .env` 在默认 umask 下是 0644，里面是全部 DB 口令 + Vault token + IdP client secret |
+| `.env` 中的 `$` | 必须写成 `$$` | — | ✅ | **口令被静默截断**，见 §2 的 `$` 陷阱说明 |
+| `vendor/` 源码树 | 五个引擎齐全 | 齐全 | ✅ | `git clone` 自带；源码包 / `git archive` 可能不带，缺了会在 engine-runner 构建数分钟后以一句裸的 "file not found" 失败 |
+| 出网（或内网镜像源） | §0.2 / §0.3 / §0.4 | 公网 | — | 见 §0.4 |
+
+**运行机（离线包目标）只需要上表的最后几行的运行期部分**：Docker + compose 或 K8s、
+端口 80/8000、磁盘放得下镜像与数据卷；构建相关的内存/CPU/索引源一项都不需要。
+
+### 0.6 构建耗时与磁盘占用（实测，不是估算）
+
+**实测环境：** dev VM 10.211.55.10，**2 vCPU aarch64 / 7.7 GB**，Ubuntu 24.04，
+Docker 29.1.3 + compose v5.3.1 + buildx v0.35.0，2026-07-29。"冷"＝`docker builder prune -af`
+之后（层缓存为空，基础镜像已在本地）；"热"＝紧接着再跑一次。
+
+| 阶段 | 冷（层缓存为空） | 热（全缓存） | 备注 |
+|---|---:|---:|---|
+| preflight | 0–1 s | 0–1 s | §0.5 全部检查项 |
+| build 1/5 `monolith` | **43 s** | 0–8 s | `uv sync` 74 个包 |
+| build 2/5 `migrate` | 1 s | 0 s | 与 monolith 同一个 Dockerfile，整层命中 |
+| build 3/5 `blobstore-init` | 0 s | 0–1 s | 同上 |
+| build 4/5 `engine-runner` | **411 s（6m51s）** | 0–3 s | 见下 |
+| build 5/5 `web` | **22 s** | 0–1 s | `npm ci` 171 个包 + `npm run build` |
+| 构建小计 | **477 s ≈ 8 分钟** | **≈ 2 s** | |
+| MySQL + Redis 起来并健康 | 0 s | 0 s | 已有卷时更快 |
+| `migrate`（迁移 + GRANT） | 6 s | 2–12 s | 空库首次建表最慢 |
+| `blobstore-init` | 1 s | 0–1 s | |
+| 起 monolith + engine-runner + web | 13 s | 13 s | 含 monolith healthcheck 变绿 |
+| blobstore 共享校验 | 0 s | 0 s | 上一步已把 engine-runner 等成 healthy |
+| **脚本总耗时** | **≈ 8 分 11 秒** | **17–36 s** | |
+
+**`engine-runner` 是全部时间的 86%，而它里面 `go mod download` 一步就占 319.5 秒**——那是
+292 个 Go module 的下载，**受网络带宽支配而不是 CPU**。所以：
+
+- 内网 `SKILLSCAN_GOPROXY`（§0.4）能把这一段砍掉大半，**冷构建 8 分钟里最容易优化的就是它**。
+- 反过来，公网慢的环境下这一步可能远超 5 分钟。**这段过程几乎不打印任何输出**，第一次跑的人
+  很容易判定为卡死——一键脚本因此按镜像逐个报时，并在开始前打印预期耗时。
+- 核数更多时 yara 的 `make -j$(nproc)` 和 Go 编译会明显变快，但 `go mod download` 不会。
+
+**产出镜像大小（实测 `docker images`，arm64）：**
+
+| 镜像 | 大小 | 说明 |
+|---|---:|---|
+| `skillscan-engine-runner` | **1.04 GB** | 五个引擎 + 两个 venv（主 venv 与 aig 专用 venv） |
+| `skillscan-monolith` | **578 MB** | `migrate` / `blobstore-init` 是同一个镜像的另外两个 tag，**不额外占盘** |
+| `skillscan-web` | **77.2 MB** | 多阶段：`node:22-slim` 只在构建期，最终镜像是 nginx + 静态文件 |
+
+**磁盘占用（实测 `df` 增量，docker data-root）：**
+
+| 项目 | 实测 | 说明 |
+|---|---:|---|
+| 冷构建（基础镜像已在本地） | **+6.04 GiB** | 产出镜像 + BuildKit 层缓存 |
+| 首次拉基础镜像 | +约 0.49 GB | 压缩下载量，见 §0.2 |
+| 运行中的栈（空数据库） | **+约 0.5 GiB** | MySQL/Redis/blobstore 三个具名卷 |
+| **首次部署合计** | **≈ 7 GiB** | 一键脚本的 preflight 门槛设为 **15 GB**，留出再构建一次的余量 |
+
+`docker compose down -v` 会把三个数据卷一起删掉（**含数据库**）；只 `down` 则保留。层缓存要用
+`docker builder prune` 单独回收——上表的 6 GiB 里大部分是它。
+
 ---
 
 ## 1. 本地开发/演示部署 ✅已验证
@@ -92,15 +345,59 @@ cd web && npm run dev   # http://localhost:5173
 （见 `apps/monolith/main.py` 自己的文档字符串），`SKILLSCAN_BREAKGLASS_ENABLED` 默认为
 `false`，除非真的需要且已接好真实 Vault 才手动开启。
 
-## 2. 容器化生产部署（docker-compose）✅已在 dev VM 验证
+## 2. 容器化生产部署（docker-compose）✅已在 dev VM 跑通（含真实扫描）
 
-**前置条件：** Docker + docker compose 插件。
+**验证到什么程度，说准确（2026-07-30 重跑，接缝已闭合）：** 这一节写的命令序列**原样**跑过一遍，
+起点就是 `cp .env.example .env`：
+
+1. `docker compose down -v` 清空，`cp .env.example .env`（`diff` 确认与模板逐字节相同）；
+2. **只**填本节环境变量表里标"必需/必填"的那几项——8 个 DB 口令 +
+   `SKILLSCAN_ALLOW_PUBLIC_INDEXES=true`。**没有增删任何一个键**（键集合与 `.env.example`
+   `diff` 为空）；这一点是刻意验的，见下方那段教训；
+3. `./scripts/one_click_deploy_docker.sh` → 退出码 0，**总耗时 289 秒**（含全部镜像构建），
+   preflight 8 项全过，共享 blobstore 探针被脚本实际断言通过；
+4. 提交一个真实 skill 包 → `decided` / `REVIEW` / score 43 / 9 条 findings；
+5. 从 compose 自己的 mysql 容器读回 `scan_engine_health`（下表）。
+
+**在此之前这条路是断的，而且断点很有代表性。** 7-29 那次端到端验证用的是**手写的 `.env`**，
+它恰好**整段漏掉**了 `SESSION_INTROSPECTION` 三个键——于是取到代码默认值，跑通了；而
+`cp .env.example .env` 得到的是 `KEY=` 空串，`os.environ.get` 不会回落默认值，monolith 启动
+即崩溃循环。**"少写一个键"和"写了个空值"是两种不同的东西**，而验证用的配置恰好落在能跑的
+那一侧。同一类问题在构建期还有一份（三个索引变量留空＝静默走公网，§0.4），一并修掉了。
+所以本次重跑刻意保持键集合与模板完全一致，只填值——否则验证的仍然不是用户会走的那条路。
+
+**前置条件：** 见 §0.5 那张表——Docker ≥20.10、compose ≥2.0、≥4 GB 内存、≥15 GB 磁盘、
+80/8000 端口空闲。这些**脚本会在构建开始前自己检查**，不必事先手工核对。
 
 ```bash
 cp .env.example .env
+chmod 600 .env      # 里面是全部 DB 口令 + Vault token + IdP client secret；
+                    # 默认 umask 下 cp 出来是 0644，脚本会因此拒绝启动
 # 编辑 .env，填入真实的 Vault/OIDC/SAML/数据库密码等（见下方环境变量表）
+# ⚠ 口令里每个 $ 都要写成 $$，否则会被 compose 静默吃掉——见下方"`$` 陷阱"
 ./scripts/one_click_deploy_docker.sh
 ```
+
+**脚本在开始那次数十分钟的构建之前先跑一遍 preflight**（构建到第 8 分钟才发现 80 端口被
+占，是很差的交易）。检查项与失败时的真实症状见 §0.5 的表；每一项都被**故意弄失败验证过**，
+不是只会打勾的装饰。三条值得单独说：
+
+- **`$` 陷阱（安全项，不是格式项）。** compose 在任何容器看到 `.env` 之前就会做变量插值，
+  所以 `PW=ab$cd` 进到容器里是 `ab`，而 `PW=ab$HOME` 会**一声不响**地变成 `ab/home/xxx`
+  （若 `$` 后面的名字在部署者 shell 里恰好有值，连告警都没有）。危险之处在于这个替换是
+  **一致的**：`migrate` 用被改短的口令建账号，单体也用同一个被改短的口令连接，整套系统绿
+  得很正常——直到有人用自己真正设的那个口令去登录，或者审计问这口令到底几位。因此脚本对
+  未转义的 `$` **直接拒绝部署**而不是告警。写法：字面量 `$` 一律写成 `$$`。
+- **重复执行是安全的。** 构建走缓存；`alembic upgrade head` 在 head 上是空操作；
+  `db/setup_grants.py` 是 `CREATE USER IF NOT EXISTS` **加** `ALTER USER ... IDENTIFIED BY`，
+  所以两次运行之间在 `.env` 里轮换过的口令确实会被应用，而不是静默停留在旧值；
+  `blobstore-init` 重复执行也是空操作。**唯一不会重置的是数据**：MySQL/Redis/blobstore 三个
+  具名卷会保留，迁移只前滚。要从零开始，先 `docker compose down -v`（这会销毁数据库）。
+- **失败之后剩下什么。** 五个镜像**全部构建完才会启动任何容器**，所以构建期失败（engine-runner
+  那一段是最长也最可能失败的）之后没有任何新容器在跑，只剩构建缓存；脚本会明说这一点。若是
+  启动之后才失败，脚本打印 `docker compose ps -a` 的真实状态和两条恢复命令
+  （`down` 保数据 / `down -v` 连数据一起删），并且**不替你 down**——失败容器里的日志正是要
+  查的东西，`down` 会连证据一起删掉。
 
 这会构建并启动：MySQL 8 + Redis + 一次性 `migrate`（迁移+GRANT）+ 一次性
 `blobstore-init`（准备共享卷权限）+ 单体后端（`monolith`，端口 8000）+
@@ -109,15 +406,24 @@ cp .env.example .env
 
 **2026-07-29 之前这个文件里没有 `engine-runner`。** 照着本节部署出来的系统只跑单体进程内
 的 floor 引擎，整个 sandbox 引擎层静默缺席——不报任何错，扫描照常出结论，只是引擎比操作者
-有任何理由预期的要少。现在补上了，并在 dev VM 上真实提交了一个 skill 包、从
-`scan_engine_health` 读回 sandbox 引擎 `report_state='reported'` 验证过。
+有任何理由预期的要少。现在补上了。
 
-**这条路径是从源码构建的，联网需求与"把仓库 clone 过去"完全相同**（就是 §0 那张表：基础
-镜像、`go mod download`、`apt-get`、PyPI、npm），因为构建的正是那三个 Dockerfile。
-`engine-runner` 会用 autotools 编译 `vendor/yara`、用 Go 构建 `vendor/osv-scanner`，冷缓存
-下需要数分钟，并且**版本与 `vendor/engines.lock.yaml` 不一致时构建直接失败**。内网可以用
-`SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_GOPROXY` / `SKILLSCAN_NPM_REGISTRY` 指向自建镜像
-源。**它不是离线包，也不具备离线包的性质**——离线包（§6）送过去的是构建完成的镜像，隔离侧
+**本节 2026-07-29 在 dev VM 上实测到什么程度，说准确：** 空层缓存冷构建 → 一键脚本跑通 →
+`/healthz` 200、`/`（web）200、`/readyz` 的 `redis` / `orchestration_db` /
+`blobstore_shared` 三项全为 `true` → 又原样重跑两次验证幂等 → `down -v` 拆掉。镜像里的引擎
+二进制实测为 `yara 4.5.7` / `bandit 1.9.4` / `osv-scanner 2.4.0`，与
+`vendor/engines.lock.yaml` 一致。**没有**在这条 compose 路径上提交过真实 skill 包——下面那张
+`scan_engine_health` 表来自同一套镜像的 k3s 部署，不是 compose 栈的实测。
+
+**这条路径是从源码构建的，联网需求与"把仓库 clone 过去"完全相同**——**逐项清单见 §0**
+（§0.2 基础镜像含 digest、§0.3 apt 包、§0.4 三个索引源与重定向变量），因为构建的正是那三个
+Dockerfile。`engine-runner` 会用 autotools 编译 `vendor/yara`、用 Go 构建
+`vendor/osv-scanner`，冷缓存下是这五个镜像里最久的一个（实测数字见 §0.6，第一次跑的人务必
+先看一眼——那段会长时间没有输出，很像卡死），并且**版本与 `vendor/engines.lock.yaml` 不一致
+时构建直接失败**。内网可以用 `SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_GOPROXY` /
+`SKILLSCAN_NPM_REGISTRY` 指向自建镜像源（§0.4）。**三个都留空时构建会直接拒绝启动**——
+要走公网必须显式写 `SKILLSCAN_ALLOW_PUBLIC_INDEXES=true`，因为留空从来不是 fail-closed。
+**它不是离线包，也不具备离线包的性质**——离线包（§6）送过去的是构建完成的镜像，隔离侧
 一次构建都不做；本节则是在目标机器上真做一次完整构建。真隔离网请走 §6。
 
 **拓扑说明（诚实版）：** 这里的 `engine-runner` 是与单体同一台 Docker 宿主机上的普通容器，
@@ -137,13 +443,16 @@ engine-runner 读它、写回 `findings/<scan_id>/<engine>.json`，单体再读�
 **验证引擎真的跑了（不要看日志，读表）：** `GET /v1/admin/engines/health` 背后的
 `scan_engine_health` 按 scan × engine 记录 `report_state` / `engine_status` /
 `analyze_duration_ms`。"从未上报"和"上报了但 ERROR"是两种不同状态，这张表能区分。
-2026-07-29 在 dev VM 上真实提交一个包后读到的就是（省略 11 个 inhouse/floor 引擎）：
+下表是 2026-07-30 那次接缝重跑（scan `f1629fe6`）在 dev VM 的 **compose 栈**上读回的结果
+（省略 11 个 inhouse/floor 引擎），查询在 compose 的 mysql 容器里对 compose 的 `skillscan`
+库执行（`docker compose exec mysql mysql ... SELECT ... FROM scan_engine_health WHERE
+scan_id=...`），不是 k3s。全部基础镜像改钉 digest（§0.2）之后复测，结果与之前一致：
 
 | engine | report_state | engine_status | 耗时 | findings |
 |---|---|---|---|---|
-| bandit | reported | ok | 84ms | 4 |
-| yara | reported | ok | 4ms | 1 |
-| skillspector | reported | ok | 6113ms | 4 |
+| bandit | reported | ok | 106ms | 4 |
+| yara | reported | ok | 6ms | 1 |
+| skillspector | reported | ok | 6528ms | 4 |
 | osv-scanner | reported | **error** | 19ms | 0 |
 | aig-mcp-scan | **not_reported** | — | — | — |
 
@@ -182,7 +491,8 @@ engine-runner 读它、写回 `findings/<scan_id>/<engine>.json`，单体再读�
 | 沙箱引擎 | `SKILLSCAN_OSV_SOURCE` | 否，默认 `offline` | 非 `offline` 时按内网端点校验；osv-scanner adapter 自身固定 `--offline`，不消费此值 |
 | 时间预算 | `SKILLSCAN_SCAN_DEADLINE_S` | 否，默认 `300` | 一次扫描的总墙钟。单体**执行**它，engine-runner 只读来在启动时告警"每引擎超时之和装不下"。设了 `SKILLSCAN_VLLM_BASE_URL` 后总和是 480s > 300s，需一并抬到 ≥480（同时抬 `SKILLSCAN_SANDBOX_WAIT_TIMEOUT_S`，两者刻意保持相等） |
 | 时间预算 | `SKILLSCAN_ENGINE_TIMEOUT_S` / `SKILLSCAN_ENGINE_TIMEOUTS_JSON` | 否 | 每引擎子进程超时；留空＝内置表（60s，aig-mcp-scan 240s）。JSON 里出现不认识的引擎名会让 engine-runner 启动即失败，而不是被静默忽略 |
-| 构建期 | `SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_NPM_REGISTRY` / `SKILLSCAN_GOPROXY` | 内网构建需要 | INV-14 零外部出站在构建期的延伸；`GOPROXY` 是 osv-scanner 的 Go 依赖图（见 §0 表第 2 行） |
+| 构建期 | `SKILLSCAN_PIP_INDEX_URL` / `SKILLSCAN_NPM_REGISTRY` / `SKILLSCAN_GOPROXY` | 二选一必填 | INV-14 零外部出站在构建期的延伸；机制、覆盖的构建步骤、依赖图规模见 **§0.4** |
+| 构建期 | `SKILLSCAN_ALLOW_PUBLIC_INDEXES` | 二选一必填 | 设为 `true` 表示“就是要走公网”。三个镜像源变量全空且此项不为 `true` 时**构建拒绝启动**——留空从来不是 fail-closed，见 §0.4 |
 
 **未配置 Vault + OIDC/SAML 时：** 单体正常启动、健康检查通过，但没有任何登录路径可用
 （除非显式设置 `SKILLSCAN_BREAKGLASS_ENABLED=true` 且 Vault 可达）——这是刻意的

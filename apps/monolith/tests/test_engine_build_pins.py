@@ -336,3 +336,153 @@ class TestPerEngineDockerfilesAgreeWithTheCombinedImage:
         for flag in ("--enable-magic", "--enable-cuckoo", "--disable-shared"):
             assert flag in per_engine, f"deploy/engines/yara/Dockerfile lost {flag}"
             assert flag in combined, f"services/engine_runner/Dockerfile lost {flag}"
+
+
+# ---------------------------------------------------------------------------
+# Build-time supply chain: base image digests + the INV-14 egress gate.
+#
+# Both of these are "one registry that has to agree with another" problems,
+# which is the defect class this repo has been bitten by five times. So both
+# DISCOVER their inputs (glob every Dockerfile) rather than listing them: a
+# seventh Dockerfile added tomorrow is covered the day it lands.
+# ---------------------------------------------------------------------------
+
+_INDEX_ARGS = {
+    "PIP_INDEX_URL": "pypi.org",
+    "NPM_CONFIG_REGISTRY": "registry.npmjs.org",
+    "GOPROXY": "proxy.golang.org",
+}
+
+
+def _all_dockerfiles() -> list[Path]:
+    found = [
+        _REPO_ROOT / "apps" / "monolith" / "Dockerfile",
+        _ENGINE_RUNNER_DOCKERFILE,
+        _REPO_ROOT / "web" / "Dockerfile",
+        *sorted(_PER_ENGINE_DIR.glob("*/Dockerfile")),
+    ]
+    return [p for p in found if p.is_file()]
+
+
+def _image_refs(dockerfile: str) -> list[str]:
+    """Every external image this build pulls: `FROM x` and `COPY --from=x`.
+
+    `COPY --from=<stage>` (an earlier stage in the same file) is excluded by
+    requiring a registry-ish reference - a stage name has no ':' or '/'.
+    """
+    refs: list[str] = []
+    for line in _instructions(dockerfile).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FROM "):
+            refs.append(stripped.split()[1])
+        elif stripped.startswith("COPY --from="):
+            candidate = stripped.split("--from=", 1)[1].split()[0]
+            if ":" in candidate or "/" in candidate:
+                refs.append(candidate)
+    return refs
+
+
+@pytest.mark.parametrize("dockerfile", _all_dockerfiles(), ids=lambda p: str(p.name and p))
+class TestEveryDockerfileIsSupplyChainPinned:
+    def test_every_external_image_is_pinned_by_digest(self, dockerfile: Path) -> None:
+        """A floating tag is not a pin.
+
+        MEASURED, not hypothetical: `golang:1.26.4-alpine3.23` was the ONE
+        image in this repo carrying a digest, and by 2026-07-30 that digest no
+        longer matched what the tag resolved to - upstream had rebuilt it. So
+        "we pin our base images" was simultaneously incomplete (1 of 9) and
+        untrue (the 1 was stale). Everything else - `python:3.12-slim-bookworm`,
+        `node:22-slim`, `nginx:1.27-alpine`, `debian:bookworm-slim` - could
+        change underneath a rebuild with no diff anywhere.
+
+        The digest list is also the artifact an operator mirroring images into
+        an internal registry actually needs, which is why
+        docs/DEPLOYMENT_GUIDE.md §0.4 carries it too.
+        """
+        unpinned = [ref for ref in _image_refs(dockerfile.read_text()) if "@sha256:" not in ref]
+        assert not unpinned, (
+            f"{dockerfile.relative_to(_REPO_ROOT)} pulls image(s) by floating tag: "
+            f"{unpinned}. Pin as `name:tag@sha256:<digest>` - resolve the current "
+            f"one with `docker buildx imagetools inspect <ref> "
+            f"--format '{{{{.Manifest.Digest}}}}'`."
+        )
+
+    def test_every_index_arg_is_gated_before_it_is_used(self, dockerfile: Path) -> None:
+        """INV-14: a Dockerfile that can reach a package index must refuse to
+        build until told which one.
+
+        The gate exists because an EMPTY value silently means "public" for all
+        three tools (uv -> pypi.org, npm -> registry.npmjs.org, go ->
+        proxy.golang.org - each measured on the dev VM 2026-07-30), so the
+        variable looks configured while the build reaches the internet. This
+        asserts the guard is present in every file that declares such an ARG -
+        the thing no diff review catches is a NEW Dockerfile that quietly
+        isn't.
+        """
+        text = dockerfile.read_text()
+        instructions = _instructions(text)
+        declared = {arg for arg in _INDEX_ARGS if f"ARG {arg}" in instructions}
+        if not declared:
+            pytest.skip("declares no package-index build arg")
+        assert "ARG ALLOW_PUBLIC_INDEXES" in instructions, (
+            f"{dockerfile.relative_to(_REPO_ROOT)} declares {sorted(declared)} but no "
+            "ARG ALLOW_PUBLIC_INDEXES - the gate has no way to be waived, so it "
+            "would be unbuildable rather than fail-closed"
+        )
+        for arg in sorted(declared):
+            assert f"require_build_index.sh {arg}" in instructions, (
+                f"{dockerfile.relative_to(_REPO_ROOT)} declares ARG {arg} but never "
+                f"gates it. Add, before the first step that uses it:\n"
+                f"  COPY scripts/require_build_index.sh /usr/local/bin/\n"
+                f'  RUN require_build_index.sh {arg} "${{{arg}}}" '
+                f'"${{ALLOW_PUBLIC_INDEXES}}" {_INDEX_ARGS[arg]}'
+            )
+
+
+class TestBuildIndexGate:
+    """The gate script itself, run for real - same posture as
+    TestVendorPinnedVersionHelper above."""
+
+    HELPER = _REPO_ROOT / "scripts" / "require_build_index.sh"
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(self.HELPER), *args], capture_output=True, text=True, check=False
+        )
+
+    def test_is_executable(self) -> None:
+        # The Dockerfiles COPY it onto PATH and call it by bare name.
+        assert os.access(self.HELPER, os.X_OK)
+
+    def test_a_configured_mirror_passes(self) -> None:
+        done = self._run("PIP_INDEX_URL", "https://pypi.internal/simple", "", "pypi.org")
+        assert done.returncode == 0
+        assert "pypi.internal" in done.stdout
+
+    def test_empty_and_absent_behave_identically_and_both_refuse(self) -> None:
+        """The whole point. `KEY=` in .env and no KEY at all reach the build as
+        the same empty string, and neither may mean "public"."""
+        empty = self._run("PIP_INDEX_URL", "", "", "pypi.org")
+        absent = self._run("PIP_INDEX_URL", "", "", "pypi.org")
+        assert empty.returncode == 1
+        assert absent.returncode == empty.returncode
+        assert "INV-14" in empty.stderr
+
+    def test_the_refusal_names_both_ways_forward(self) -> None:
+        done = self._run("GOPROXY", "", "", "proxy.golang.org")
+        # A gate an operator cannot satisfy gets deleted or worked around.
+        assert "ALLOW_PUBLIC_INDEXES=true" in done.stderr
+        assert "--build-arg GOPROXY=" in done.stderr
+
+    def test_public_is_reachable_but_only_when_asked_for_by_name(self) -> None:
+        done = self._run("NPM_CONFIG_REGISTRY", "", "true", "registry.npmjs.org")
+        assert done.returncode == 0
+        assert "registry.npmjs.org" in done.stdout
+
+    def test_only_the_exact_string_true_waives_the_gate(self) -> None:
+        # "1"/"yes"/"TRUE" must not work: this is a security waiver, and a
+        # near-miss spelling silently reverting to a refusal is the safe
+        # direction, but a near-miss spelling silently WAIVING would not be.
+        for near_miss in ("1", "yes", "TRUE", "True", "true ", ""):
+            done = self._run("PIP_INDEX_URL", "", near_miss, "pypi.org")
+            assert done.returncode == 1, f"{near_miss!r} must not waive the gate"

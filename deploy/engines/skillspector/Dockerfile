@@ -22,9 +22,15 @@
 # NOT VERIFIED: no Docker daemon is available in this development environment
 # - this Dockerfile has not been built here (same posture as this directory's
 # other Dockerfiles).
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS builder
 
 ARG PIP_INDEX_URL
+ARG ALLOW_PUBLIC_INDEXES
+
+# INV-14 build-time egress gate - see scripts/require_build_index.sh. An empty
+# PIP_INDEX_URL does not fail closed; it silently uses pypi.org.
+COPY scripts/require_build_index.sh /usr/local/bin/require_build_index.sh
+RUN require_build_index.sh PIP_INDEX_URL "${PIP_INDEX_URL}" "${ALLOW_PUBLIC_INDEXES}" pypi.org
 
 WORKDIR /build
 COPY vendor/skillspector/ ./
@@ -33,7 +39,7 @@ RUN python -m venv .venv
 # pip fails closed, rather than silently defaulting to public PyPI.
 RUN .venv/bin/pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" .
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates \

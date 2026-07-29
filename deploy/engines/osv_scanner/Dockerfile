@@ -30,9 +30,15 @@
 # NOT VERIFIED: no Docker daemon is available in this development environment
 # - this Dockerfile has not been built here (same posture as bandit's
 # Dockerfile in this same directory tree).
-FROM golang:1.26.4-alpine3.23@sha256:f23e8b227fb4493eabe03bede4d5a32d04092da71962f1fb79b5f7d1e6c2a17f AS builder
+FROM golang:1.26.4-alpine3.23@sha256:18b460dd17542c2ba43299a633cf6ebfc1115101509531471d7cfce1019af083 AS builder
 
 ARG GOPROXY
+ARG ALLOW_PUBLIC_INDEXES
+
+# INV-14 build-time egress gate - see scripts/require_build_index.sh. An empty
+# GOPROXY does not fail closed; it silently uses proxy.golang.org.
+COPY scripts/require_build_index.sh /usr/local/bin/require_build_index.sh
+RUN require_build_index.sh GOPROXY "${GOPROXY}" "${ALLOW_PUBLIC_INDEXES}" proxy.golang.org
 
 WORKDIR /src
 COPY vendor/osv-scanner/ ./
@@ -44,7 +50,7 @@ ENV GOPROXY=${GOPROXY}
 RUN go mod download
 RUN go build -o osv-scanner ./cmd/osv-scanner/
 
-FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
 
 RUN apk --no-cache add ca-certificates
 

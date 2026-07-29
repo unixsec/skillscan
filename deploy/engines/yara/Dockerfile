@@ -40,7 +40,7 @@
 # Base image pinned by tag only, not digest - see bandit/Dockerfile's comment
 # for why (resolving the exact digest is an enterprise build-pipeline step, not
 # fabricated here).
-FROM debian:bookworm-slim AS builder
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS builder
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
@@ -65,7 +65,7 @@ RUN ./bootstrap.sh \
     && make -j"$(nproc)" \
     && strip yara
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
