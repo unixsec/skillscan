@@ -226,6 +226,15 @@ kubectl get runtimeclass
 没有 gVisor 又必须先跑起来：`--set runtimeClass.engineRunner=""`。
 这会让不可信内容退回普通容器隔离运行，是一次明确的安全降级，请当成决定来做，不是配置细节。
 
+⚠ **这条规则不止对这个 chart 成立。** `deploy/vm/60-engine-runner.yaml`——内部 dev VM
+（10.211.55.10）用的原始清单，不走这个 chart，是它的 dev/test 对照版本，`deploy/vm/` 目录
+下其余文件同理——同样不设 `runtimeClassName`，原因相同：那台节点上没有 `gvisor`
+RuntimeClass（`kubectl get runtimeclass` 实测确认过，见该文件自己的注释）。如果要在那个
+namespace 上装 `deploy/helm/skillscan-kyverno-policies`，必须用
+`--set gvisorSandboxRuntimeClass.enabled=false` 渲染——默认值（`true`）在那里不会强制任何
+真实的安全边界（没有 gVisor 可以要求），只会挡住这个 Deployment 之后的每一次
+`kubectl apply`/`rollout restart`。
+
 **④ 镜像是 side-load 到每个节点的，不是从 registry 拉的**
 
 **每一个可能调度 skillscan pod 的节点都要各导入一次。** 少导一个节点，被调度到那里的
@@ -665,6 +674,10 @@ kubectl -n skillscan get events --sort-by=.lastTimestamp | tail
   `render.sh -n <你的 namespace>` 一起渲染，namespace 同样已参数化——不再只
   match `skillscan`）要求 engine-runner 必须是 `gvisor`——与 §6.1③ 的
   `--set runtimeClass.engineRunner=""` 直接冲突，两者只能取一。
+- 用 `deploy/vm/` 的原始清单（不是这个 chart）时同样适用：`60-engine-runner.yaml` 不设
+  `runtimeClassName`，若对那个 namespace 装 `require-gvisor-sandbox-runtimeclass` 时保持
+  默认（`gvisorSandboxRuntimeClass.enabled=true`），会拒绝它——渲染时同样要加
+  `--set gvisorSandboxRuntimeClass.enabled=false`，见 §6.1③ 的补充说明。
 
 拒绝时报错会指名具体是哪条规则：
 
@@ -691,6 +704,25 @@ kubectl -n skillscan exec deploy/skillscan-web -- grep proxy_pass /etc/nginx/ngi
 看到 `monolith:8000` 说明挂载没生效（那是 compose 的服务名，在 K8s 里不存在）。
 另：改了这个 ConfigMap 之后要手工 `kubectl -n skillscan rollout restart deploy/skillscan-web`，
 chart 没有给它加 checksum annotation。
+
+**第二种可能原因（实测于验证阶段）：`engine-runner` 被缩到了 0 副本。** 上面这条 nginx
+ConfigMap 检查完全正常时，问题可能根本不在 web 这一层——`monolith` 的 `/readyz` 用与
+§6.8①相同的共享探针机制确认 engine-runner 这个对等端还活着，探针时间戳超过
+`SHARE_PROBE_TTL_S`（300 秒）没有刷新就判定"看不到对方"，于是 `monolith` 自己
+fail-closed 返回 503。这是设计如此——宁可控制台整体不可用，也不要一个假装能扫描的系统，
+和 §6.8①的 `blobstore_shared` 检查是同一个机制——但**从"缩容一个后台 Deployment"到
+"整个控制台打不开"之间没有任何提示**：503 的 `/readyz` 让 monolith 的 pod 失去
+Service 的 ready endpoint，`skillscan-web` 代理到一个没有健康后端的 Service，于是每一个
+API 调用都 502，即使 nginx 配置本身毫无问题。确认与恢复：
+
+```bash
+kubectl -n skillscan get deploy skillscan-engine-runner       # READY 是不是 0/N
+kubectl -n skillscan port-forward deploy/skillscan-monolith 8000:8000
+curl -s localhost:8000/readyz | grep blobstore_shared          # false 就是这一种
+kubectl -n skillscan scale deploy/skillscan-engine-runner --replicas=1
+```
+
+调回至少 1 副本后 `monolith` 会在下一次探针周期自愈，不需要重启（实测确认）。
 
 #### ⑩ monolith `CrashLoopBackOff`，日志 `cannot read <某个策略文件>`
 
