@@ -25,6 +25,7 @@ import json
 import tarfile
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -53,7 +54,7 @@ from skillscan_core import (
 from skillscan_core import (
     toolchain_digest as compute_toolchain_digest,
 )
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -261,8 +262,8 @@ async def submit_scan(
     given, permanently (the next submission returns the same id). The tier is
     NOT re-derived for a later submitter: the adjudication already happened, at
     the first submitter's tier, and re-tiering it would mean claiming a decision
-    that was never made. `views.project_scan.judged_at_tier` is what makes that
-    visible externally rather than silently assumed.
+    that was never made. `views.project_skill_verdict`'s `judged_at_tier` is what
+    makes that visible externally rather than silently assumed.
 
     SECURITY (2026-07-29, milestone F Task 12): `source` is REQUIRED with no
     default, for the same reason `trust_tier` above is - a default is exactly
@@ -557,14 +558,30 @@ async def get_scan_result_view(session: AsyncSession, *, scan_id: str) -> dict[s
     None is meaningful, not merely "empty": a scan that was decided WITHOUT a
     result row is the fail-closed signature (`_dead_letter_and_decide` signs a
     BLOCK verdict but writes no findings blob), and
-    `marketplace_api.views.project_scan` derives `fail_closed` from exactly
-    this None. Returning `{}` here instead would silently turn every
-    fail-closed BLOCK into an ordinary one.
+    `marketplace_api.views` used to derive `fail_closed` from exactly this None,
+    which is the inference the 2026-07-30 note below replaced. Returning `{}` here
+    instead of None would still be wrong - it would claim a completed scan wrote an
+    empty finding set.
+
+    2026-07-30: None is no longer the fail-closed signature - `verdict.fail_closed`
+    is (see `gate.service.get_verdict_view`). It still means "this scan wrote no
+    findings row", which the dead-letter path is the only producer of, but nothing
+    now DERIVES fail-closed-ness from it.
 
     Same cross-module-boundary rationale as `is_scan_submitter` above. The key
     names are the ones `marketplace_api.views` reads; only the columns the
     external projection actually needs are included, so a new internal column
     does not become externally reachable by default.
+
+    `hard_gate_hits` (2026-07-30) is included because the marketplace contract is
+    now binary: an answer of "unsafe" that cannot say whether an UNWAIVABLE rule
+    fired (INV-3) or whether findings merely accumulated is not actionable. It is
+    the rule_id list `scoring.aggregate` recorded, never evidence text. Note this is
+    the RECORDED set - `gate.decide` also recomputes hard-gate hits against the
+    CURRENT policy and blocks on the union, so a rule that became hard-gate after
+    this scan ran is absent here; that case still carries the findings that produced
+    it, which is why `marketplace_api.views` labels it `content_findings` rather
+    than inventing a hit it cannot name.
     """
     row = (
         await session.execute(select(ScanResultRow).where(ScanResultRow.scan_id == scan_id))
@@ -575,7 +592,59 @@ async def get_scan_result_view(session: AsyncSession, *, scan_id: str) -> dict[s
         "findings": row.findings,
         "findings_capped": row.findings_capped,
         "findings_total": row.findings_total,
+        "hard_gate_hits": list(row.hard_gate_hits or ()),
     }
+
+
+@dataclass(frozen=True, slots=True)
+class ScanIdentity:
+    """One scan of a given package, reduced to what an external projection needs:
+    which scan, what state it is in, and the tier it is being judged at."""
+
+    scan_id: str
+    state: str
+    trust_tier: str | None
+
+
+async def latest_scan_identities_for_content(
+    session: AsyncSession, *, content_hash: str
+) -> tuple[ScanIdentity, ...]:
+    """The NEWEST scan(s) of these exact bytes - plural, and deliberately so.
+
+    Used by the skill-keyed marketplace poll, which resolves skill_id -> latest
+    version -> verdict and needs the scan that verdict belongs to. `scan_job` is
+    keyed on `scan_id`, and one `content_hash` legitimately accumulates several
+    scans: single-flight dedup is on `content_hash + toolchain_digest`, so a rescan
+    under a new toolchain (or a re-run after a policy change) is a second job over
+    identical bytes, with a verdict that can legitimately differ.
+
+    SECURITY - WHY THIS RETURNS A TUPLE INSTEAD OF "the latest". `created_at` is a
+    MySQL DATETIME with no fractional seconds, so two scans of the same bytes
+    submitted in the same second are an EXACT tie, and any tiebreak this function
+    picked (lowest scan_id, driver order) would silently choose between a PASS and a
+    BLOCK on an arbitrary basis - an attacker who controls submission timing can
+    manufacture that tie. So the tie is handed to the caller, which resolves it
+    fail-closed by reporting the least safe of the candidates. Same posture as
+    `reeval.reconciliation._currency`'s "on an EXACT tie the non-PASS verdict wins",
+    applied one layer earlier. Normal case: exactly one element.
+
+    Ordered by `scan_id` so the tied set itself is deterministic. Empty tuple when
+    these bytes have never been scanned.
+    """
+    newest = (
+        select(func.max(ScanJob.created_at))
+        .where(ScanJob.content_hash == content_hash)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        select(ScanJob.scan_id, ScanJob.state, ScanJob.trust_tier)
+        .where(ScanJob.content_hash == content_hash, ScanJob.created_at == newest)
+        .order_by(ScanJob.scan_id)
+    )
+    return tuple(
+        ScanIdentity(scan_id=str(row.scan_id), state=str(row.state), trust_tier=row.trust_tier)
+        for row in result
+    )
 
 
 async def run_mock_engine_worker_tick(

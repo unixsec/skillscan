@@ -320,8 +320,9 @@ class TestTierDirection:
     """里程碑 F Task 18: `tier_direction` moved out of `gateway.router` (where
     Task 14 wrote it as a private helper) into `gate.policy`, so BOTH surfaces
     that disclose a requested/judged divergence - the console's
-    `GET /v1/scans/{scan_id}` and the marketplace's `GET /v1/market/scans/
-    {scan_id}` - compute it from one implementation instead of two.
+    `GET /v1/scans/{scan_id}` and the marketplace's
+    `GET /v1/market/skills/{skill_id}` - compute it from one implementation
+    instead of two.
 
     Every case below runs against the REAL `policies/gate/v1.yaml`, not a
     synthetic policy: the whole point of the function is that strictness lives

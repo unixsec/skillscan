@@ -2,11 +2,23 @@ import { useParams } from 'react-router-dom'
 import { api } from '../api/client'
 import { useApiData } from '../api/useApiData'
 import { DataState } from '../components/DataState'
-import { ScoreBadge, SeverityBadge, VerdictBadge } from '../components/Badge'
+import { EngineHealthBadge, ScoreBadge, SeverityBadge, VerdictBadge } from '../components/Badge'
 import { useI18n } from '../i18n/I18nContext'
 import { reasonLabel } from '../i18n/reasons'
 import { scanStateLabel, TERMINAL_SCAN_STATES } from '../scanState'
-import type { Finding, ScanDetail, SubmitterSource } from '../api/types'
+import {
+  coverageObservation,
+  engineDurationLabel,
+  notReportedAttributionHint,
+  notReportedAttributionLabel,
+} from '../engineHealth'
+import type {
+  Finding,
+  ScanDetail,
+  ScanEngineCoverage,
+  ScanEngineCoverageEntry,
+  SubmitterSource,
+} from '../api/types'
 
 // The 8 detection categories (SRS §3.3 "8类61项") - shown in a FIXED, complete
 // order regardless of which ones actually have findings, so the by-category
@@ -28,6 +40,10 @@ interface ModuleRow {
   version?: string
   count: number
   maxSeverity: number | null
+  // 2026-07-30: this engine's evidence is NOT in the verdict, so its `count: 0`
+  // is an absence of evidence and not an absence of findings. Only ever set on
+  // the by-ENGINE rows - a category has no report state.
+  noEvidence?: boolean
 }
 
 function maxSeverityOf(findings: Finding[]): number | null {
@@ -62,7 +78,22 @@ export function scanTrifectaSignals(findings: Finding[]): string[] {
   return [...signals].sort()
 }
 
+// Engine names whose findings are absent from this verdict. Read off the
+// server's coverage answer, never re-derived from `provenance` - a timed-out
+// engine HAS a provenance triple (`unavailable_engine_result` fabricates one so
+// the gate can fail closed), which is precisely why the by-engine table below
+// used to score it green "PASS" on zero findings.
+//
+// `not_applicable` is included: an engine this deployment does not run has no
+// findings in the verdict either, and labelling that row "PASS" is the same
+// false statement. The COVERAGE section above is where the two classes are
+// distinguished; here they share one consequence.
+export function noEvidenceEngineNames(data: ScanDetail): Set<string> {
+  return new Set(data.engine_coverage.engines.map((e) => e.name))
+}
+
 function byEngine(data: ScanDetail, t: (key: string) => string): ModuleRow[] {
+  const noEvidence = noEvidenceEngineNames(data)
   const engines = new Map<string, string>() // name -> version
   for (const [name, version] of data.provenance) {
     engines.set(name, version)
@@ -83,6 +114,7 @@ function byEngine(data: ScanDetail, t: (key: string) => string): ModuleRow[] {
         version,
         count: findings.length,
         maxSeverity: maxSeverityOf(findings),
+        noEvidence: noEvidence.has(name),
       }
     })
 }
@@ -127,9 +159,20 @@ function ModuleTable({ rows, moduleLabel, versionLabel }: { rows: ModuleRow[]; m
                 <SeverityBadge severity={row.maxSeverity} />
               </td>
               <td>
-                <span className={row.count === 0 ? 'badge badge-pass' : 'badge badge-block'}>
-                  {row.count === 0 ? t('scanDetail.statusPass') : t('scanDetail.statusFail')}
-                </span>
+                {/* THREE outcomes, not two (2026-07-30). "0 findings" from an
+                    engine that never delivered is not a pass - it is no
+                    evidence, and this cell rendered it green for as long as the
+                    table has existed, directly beside a coverage warning saying
+                    the opposite. `provenance` cannot tell them apart because
+                    `unavailable_engine_result` fabricates a triple so the gate
+                    can fail closed; only the coverage read can. */}
+                {row.noEvidence ? (
+                  <span className="badge badge-review">{t('scanDetail.statusNoEvidence')}</span>
+                ) : (
+                  <span className={row.count === 0 ? 'badge badge-pass' : 'badge badge-block'}>
+                    {row.count === 0 ? t('scanDetail.statusPass') : t('scanDetail.statusFail')}
+                  </span>
+                )}
               </td>
             </tr>
           ))}
@@ -381,6 +424,122 @@ function ScanSignals({
   )
 }
 
+// WHICH engines' evidence is missing from this verdict (2026-07-30).
+//
+// The page already showed `requiredEngineWarning` off `required_ok`, and that
+// covers the FLOOR only - `GatePolicy.required_engines`, which fails closed. A
+// 290-scan real-world run confirmed that path works. Every OTHER engine fails
+// OPEN: it does not deliver, its findings are discarded, and the verdict is
+// computed on what remains. On that run, complete-evidence scans came back 60%
+// REVIEW and incomplete ones 29% - the verdict got MORE permissive as evidence
+// shrank, and this page said nothing about it.
+//
+// It also directly contradicted itself: the by-engine table below builds its
+// rows from `provenance`, which carries a triple for a timed-out engine too, and
+// scored it green "PASS" on 0 findings. `missingEngineNames` is threaded into
+// that table for exactly this reason.
+//
+// TWO CLASSES, rendered differently, and that distinction is the whole design:
+//   'missing'        - expected here, did not deliver, no readable cause. Red.
+//   'not_applicable' - this deployment does not run the engine at all.
+//                      `aig-mcp-scan` is in this class on 100% of scans of any
+//                      deployment with no LLM endpoint. Rendering it as a fault
+//                      on every scan forever would train readers to skip this
+//                      whole section, which is worse than not having it.
+function EngineCoverage({ coverage }: { coverage: ScanEngineCoverage }) {
+  const { t } = useI18n()
+  // No per-engine record at all: a dead-lettered scan, one past the health
+  // table's retention window, or one scored before that table existed. Said out
+  // loud rather than rendered as silence, because silence here is
+  // indistinguishable from "every engine reported".
+  if (coverage.complete === null) {
+    return (
+      <>
+        <h2>{t('scanDetail.coverage')}</h2>
+        <p className="hint">{t('scanDetail.coverageUnrecorded')}</p>
+      </>
+    )
+  }
+  const missing = coverage.engines.filter((e) => e.coverage === 'missing')
+  const notApplicable = coverage.engines.filter((e) => e.coverage === 'not_applicable')
+  return (
+    <>
+      <h2>{t('scanDetail.coverage')}</h2>
+      <p className={missing.length > 0 ? 'error' : 'hint'}>
+        {t('scanDetail.coverageCount', {
+          reported: coverage.reported,
+          expected: coverage.expected,
+        })}
+        {missing.length > 0 && <> {t('scanDetail.coverageIncompleteHint')}</>}
+      </p>
+      {missing.length > 0 && <CoverageRows entries={missing} />}
+      {notApplicable.length > 0 && (
+        <>
+          {/* Not a fault, and styled as the quietest thing on the page. Still
+              SHOWN: `expected` was reduced by exactly these engines, and a
+              coverage count whose denominator shrank for unstated reasons is
+              not falsifiable. */}
+          <p className="hint">
+            {t('scanDetail.coverageNotApplicable', { count: notApplicable.length })}
+          </p>
+          <CoverageRows entries={notApplicable} />
+        </>
+      )}
+      {/* The caveat that has to travel with the count, and the same one the
+          admin engine console prints: `expected` excludes engines TODAY'S
+          configuration says this deployment does not run, and nothing recorded
+          the configuration this scan actually ran under. Shown only when
+          something was actually excluded on that basis - printing it on every
+          scan is how a caveat becomes invisible. */}
+      {notApplicable.length > 0 && coverage.basis === 'current_config' && (
+        <p className="hint">{t('scanDetail.coverageBasisCurrentConfig')}</p>
+      )}
+    </>
+  )
+}
+
+function CoverageRows({ entries }: { entries: ScanEngineCoverageEntry[] }) {
+  const { t } = useI18n()
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>{t('scanDetail.colModule')}</th>
+            <th>{t('scanDetail.colStatus')}</th>
+            <th>{t('adminEngines.colLastDuration')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map((entry) => {
+            // `coverageObservation` narrows the row to the three fields
+            // engineHealth.ts reads, so this page uses the SAME six-state
+            // machine, the same badge colours and the same three duration
+            // states as the admin engine console - `error` and `not_reported`
+            // cannot land on one colour here either.
+            const observation = coverageObservation(entry)
+            const attribution = notReportedAttributionLabel(t, observation)
+            return (
+              <tr key={entry.name}>
+                <td>{engineLabel(entry.name, t)}</td>
+                <td>
+                  <EngineHealthBadge health={observation} />
+                  {attribution && (
+                    <div className="hint" title={notReportedAttributionHint(t, observation)}>
+                      {attribution}
+                    </div>
+                  )}
+                </td>
+                <td>{engineDurationLabel(t, observation)}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 export function ScanDetailContent({ scanId }: { scanId: string }) {
   const { t } = useI18n()
   const { data, loading, error, pollError } = useApiData<ScanDetail>(
@@ -460,6 +619,14 @@ export function ScanDetailContent({ scanId }: { scanId: string }) {
           {data.required_ok === false && (
             <p className="error">{t('scanDetail.requiredEngineWarning')}</p>
           )}
+
+          {/* ABOVE the findings, deliberately. The reader's next act is to
+              interpret a verdict and a findings list, and "this list was built
+              from 9 of 14 engines" changes what both of them mean. Below the
+              findings it would be a footnote to a conclusion already drawn.
+              Not rendered on a never-scored scan: there is no engine set to
+              report on (see `neverScored` below and `_dead_letter_and_decide`). */}
+          {!neverScored && <EngineCoverage coverage={data.engine_coverage} />}
 
           <ScanSignals
             hardGateHits={data.hard_gate_hits}

@@ -437,9 +437,25 @@ class TestVerdictResultScore(unittest.TestCase):
             effective_severity=Severity.NONE,
             trifecta_present=False,
             hard_gate_hits=(),
+            fail_closed=False,
             score=100,
         )
         self.assertEqual(result.score, 100)
+
+    def test_fail_closed_has_no_default_and_must_be_stated(self) -> None:
+        # SECURITY: a default of False would let a new construction site silently
+        # assert "this verdict was reached on a COMPLETE scan", which is the exact
+        # wrong answer the field exists to stop being inferred.
+        with self.assertRaises(TypeError):
+            VerdictResult(  # type: ignore[call-arg]
+                verdict=Verdict.PASS,
+                reasons=(),
+                policy_version="v1",
+                effective_severity=Severity.NONE,
+                trifecta_present=False,
+                hard_gate_hits=(),
+                score=100,
+            )
 
 
 if __name__ == "__main__":

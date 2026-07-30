@@ -168,10 +168,10 @@ class SecurityMetrics:
         COUNTS: object-level authorization denials only - a principal asked to
         read or write a specific object that exists and belongs to a DIFFERENT
         principal. `GET /v1/scans/{id}` and `.../sarif` refusing a scan the
-        caller is not in `scan_submitter` for; `GET /v1/market/scans/{id}`
-        refusing another service account's scan; `POST /v1/scans` refusing to
-        write a `skill_id` someone else owns (pre-flight and the
-        in-transaction TOCTOU re-check both). This is the IDOR signal: a
+        caller is not in `scan_submitter` for; `GET /v1/market/skills/{id}`
+        refusing another service account's skill; `POST /v1/scans` and
+        `POST /v1/market/scans` refusing to write a `skill_id` someone else owns
+        (pre-flight and the in-transaction TOCTOU re-check both). This is the IDOR signal: a
         nonzero rate means someone is naming objects that are not theirs.
 
         DOES NOT COUNT, deliberately:

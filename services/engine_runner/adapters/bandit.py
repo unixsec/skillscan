@@ -503,8 +503,41 @@ def _metadata(*, ruleset_digest: str, version: str) -> EngineMetadata:
     )
 
 
+# bandit's report goes to a FILE, not stdout, for the same reason
+# `skillspector` writes SARIF to `--output`: stdout is not a clean channel.
+# MEASURED 2026-07-30 against a real 98-file skillhub package - bandit renders a
+# `rich` progress bar to stdout AHEAD of the JSON:
+#
+#     Working... ━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:00:00
+#     {
+#       "errors": [],
+#
+# ...which made `json.loads(stdout)` fail with "Expecting value: line 1 column
+# 1". The trigger is not size or timing but an exact, deterministic condition in
+# `vendor/bandit/bandit/core/manager.py:269` - `len(files_list) >
+# PROGRESS_THRESHOLD` (50) AND log level <= INFO. So EVERY package over 50 files
+# lost bandit entirely, and bandit is advisory: its findings were dropped and the
+# verdict computed as though it had found nothing. The bigger the package, the
+# more code went unexamined, with nothing in the verdict saying so. Only 1 of 50
+# real packages was large enough to show it.
+#
+# `-q` would also silence the bar (it raises the log level past INFO), but its
+# documented meaning is "only show output in the case of an issue" - that trades
+# this bug for an empty report on every CLEAN package. The file is the fix that
+# adds no second failure mode.
+_REPORT_OUTPUT_NAME = "bandit-report.json"
+
+
 def _build_argv(target_dir: Path) -> list[str]:
-    return ["bandit", "-r", "-f", "json", str(target_dir)]
+    return [
+        "bandit",
+        "-r",
+        "-f",
+        "json",
+        "-o",
+        str(target_dir / _REPORT_OUTPUT_NAME),
+        str(target_dir),
+    ]
 
 
 def _test_item_id_and_category(test_id: str) -> tuple[str, DetectionCategory]:
@@ -530,10 +563,16 @@ def _test_item_id_and_category(test_id: str) -> tuple[str, DetectionCategory]:
 
 
 def parse_output(
-    completed: subprocess.CompletedProcess[bytes], _target_dir: Path, _files: dict[str, bytes]
+    _completed: subprocess.CompletedProcess[bytes], target_dir: Path, _files: dict[str, bytes]
 ) -> tuple[Finding, ...]:
+    report_path = target_dir / _REPORT_OUTPUT_NAME
+    if not report_path.is_file():
+        # SECURITY: fail-closed. bandit exiting before it writes the report (a
+        # crash, an unreadable tree) must not read as "no findings" - same
+        # posture as `skillspector`'s missing-SARIF check.
+        raise ValueError(f"bandit did not write the expected report at {report_path}")
     payload = json.loads(
-        completed.stdout
+        report_path.read_bytes()
     )  # SECURITY: malformed JSON -> raises -> caller fail-closes
     if not isinstance(payload, dict) or "results" not in payload:
         raise ValueError("bandit output missing 'results' key")

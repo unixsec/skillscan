@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import json
 import logging
 import tarfile
 import uuid
@@ -39,9 +40,10 @@ from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
+from monolith.modules.inventory.models import SkillRow
 from monolith.modules.marketplace_api import views
 from monolith.modules.marketplace_api.models import MarketplaceFetchLogRow
-from monolith.modules.orchestration.models import ScanJob, ScanResultRow
+from monolith.modules.orchestration.models import ScanEngineHealthRow, ScanJob, ScanResultRow
 from monolith.tests.conftest import SessionmakerFixture
 
 _ENGINE = StaticKeywordEngine()
@@ -125,6 +127,7 @@ def _build_app(
     *,
     orchestration_sessionmaker: SessionmakerFixture,
     gate_sessionmaker: SessionmakerFixture,
+    inventory_sessionmaker: SessionmakerFixture,
     marketplace_sessionmaker: SessionmakerFixture | None,
     redis_client: aioredis.Redis,
     blobstore: LocalFilesystemBlobStore,
@@ -136,6 +139,11 @@ def _build_app(
         blobstore=blobstore,
         orchestration_session_factory=orchestration_sessionmaker,
         gate_session_factory=gate_sessionmaker,
+        # REQUIRED as of 2026-07-30: both marketplace endpoints touch inventory
+        # now (submit registers the skill and its version; the poll resolves
+        # skill_id -> latest version and reads `skill.owner` to authorize). An
+        # unwired factory makes them 503, which would mask every assertion here.
+        inventory_session_factory=inventory_sessionmaker,
         policy=GatePolicy(
             version=f"test-market-{uuid.uuid4().hex[:8]}",
             required_engines=frozenset({_ENGINE.metadata.name}),
@@ -160,6 +168,7 @@ def _build_app(
 def app(
     orchestration_sessionmaker: SessionmakerFixture,
     gate_sessionmaker: SessionmakerFixture,
+    inventory_sessionmaker: SessionmakerFixture,
     marketplace_sessionmaker: SessionmakerFixture,
     reporting_sessionmaker: SessionmakerFixture,
     redis_client: aioredis.Redis,
@@ -168,6 +177,7 @@ def app(
     return _build_app(
         orchestration_sessionmaker=orchestration_sessionmaker,
         gate_sessionmaker=gate_sessionmaker,
+        inventory_sessionmaker=inventory_sessionmaker,
         marketplace_sessionmaker=marketplace_sessionmaker,
         reporting_sessionmaker=reporting_sessionmaker,
         redis_client=redis_client,
@@ -183,14 +193,38 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield c
 
 
-async def _submit(client_instance: httpx.AsyncClient) -> str:
+def _skill_id(prefix: str) -> str:
+    """A fresh skill_id per submission. Registration is genesis-owned, so a reused
+    id would be owned by the FIRST test that used it and 403 every later one."""
+    return f"{prefix}/{uuid.uuid4().hex[:10]}"
+
+
+async def _submit(
+    client_instance: httpx.AsyncClient,
+    *,
+    skill_id: str | None = None,
+    package: bytes | None = None,
+) -> tuple[str, str]:
+    """Submit through the marketplace surface. Returns `(skill_id, scan_id)`.
+
+    `skill_id` is REQUIRED by the endpoint as of 2026-07-30 - the poll is keyed on
+    it, so a submission without one would be unpollable. The scan_id still comes
+    back in the 202 and is still what the seeding helpers below need, but it is no
+    longer part of any response the marketplace reads.
+    """
+    resolved = skill_id or _skill_id("mkt-skill")
     response = await client_instance.post(
         "/v1/market/scans",
-        files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
+        files={"package": ("skill.tar", package or _unique_package(), "application/x-tar")},
+        data={"skill_id": resolved},
     )
     assert response.status_code == 202, response.text
     scan_id: str = response.json()["scan_id"]
-    return scan_id
+    return resolved, scan_id
+
+
+async def _poll(client_instance: httpx.AsyncClient, skill_id: str) -> httpx.Response:
+    return await client_instance.get(f"/v1/market/skills/{skill_id}")
 
 
 async def _scrape_cross_scope(client_instance: httpx.AsyncClient) -> float:
@@ -256,6 +290,43 @@ async def _seed_result(
         )
 
 
+def _poll_body_without_findings(body: dict[str, object]) -> str:
+    """The response as text, minus `findings` - whose `source_engine` field is a
+    whitelisted engine name and would make any "no engine name leaked" assertion
+    trivially false for the wrong reason."""
+    return json.dumps({k: v for k, v in body.items() if k != "findings"}, default=str)
+
+
+async def _seed_engine_health(
+    orchestration_sessionmaker: SessionmakerFixture,
+    scan_id: str,
+    rows: list[tuple[str, str, str | None]],
+) -> None:
+    """Real `scan_engine_health` rows - the table the coverage read joins.
+
+    Rows are `(engine_name, report_state, engine_status)`. Written through the
+    ORM rather than a fixture-level shortcut because the model enforces the
+    acceptance-criterion-8 invariant with a DB CHECK
+    (`engine_status IS NOT NULL` iff `report_state = 'reported'`): a test that
+    seeded a state pair the schema forbids would be exercising a shape
+    production can never produce.
+    """
+    async with orchestration_sessionmaker() as session, session.begin():
+        for engine_name, report_state, engine_status in rows:
+            session.add(
+                ScanEngineHealthRow(
+                    scan_id=scan_id,
+                    engine_name=engine_name,
+                    report_state=report_state,
+                    engine_status=engine_status,
+                    analyze_duration_ms=0 if report_state == "reported" else None,
+                    finding_count=0 if report_state == "reported" else None,
+                    error=None,
+                    recorded_at=datetime.datetime(2026, 7, 30, 12, 0, 0),
+                )
+            )
+
+
 # A fixed, microsecond-free decision time. Fixed so a test can assert the
 # EXACT value that crosses the HTTP boundary rather than "not null"; whole
 # seconds because `verdict.issued_at` is a MySQL DATETIME with no fractional
@@ -271,6 +342,7 @@ async def _seed_verdict(
     verdict: str = "REVIEW",
     issued_at: datetime.datetime = _SEEDED_ISSUED_AT,
     policy_version: str = _SEEDED_POLICY_VERSION,
+    fail_closed: bool = False,
 ) -> None:
     async with gate_sessionmaker() as session, session.begin():
         session.add(
@@ -284,6 +356,10 @@ async def _seed_verdict(
                 effective_severity=3,
                 score=62,
                 reasons=[],
+                # 2026-07-30: passed EXPLICITLY, never left to the ORM default.
+                # A seed that always wrote False could not tell the difference
+                # between the old structural inference and the new column.
+                fail_closed=fail_closed,
                 issued_at=issued_at,
             )
         )
@@ -291,63 +367,102 @@ async def _seed_verdict(
 
 class TestAuthorizationMatrix:
     """spec §6.1/§6.2 - scope AND ownership, and the deliberate choice of which
-    status code each failure gets."""
+    status code each failure gets.
+
+    2026-07-30: "ownership" is `skill.owner` now, not `scan_submitter` membership.
+    The status codes are unchanged, deliberately - see this file's counterpart
+    reasoning in `marketplace_api.router`'s rule 3.
+    """
 
     @pytest.mark.asyncio
-    async def test_own_scan_with_read_scope_is_200(
+    async def test_own_skill_with_read_scope_is_200(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
         subject = _account("mkt-own-read")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
 
-        response = await client.get(f"/v1/market/scans/{scan_id}")
-        assert response.status_code == 200
-        assert response.json()["scan_id"] == scan_id
+        response = await _poll(client, skill_id)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["skill_id"] == skill_id
+        # The submission registered `skill.owner = subject`, which is the ONLY
+        # reason this read is allowed - assert the answer names the version too,
+        # so a 200 built from nothing cannot pass.
+        assert body["content_hash"]
 
     @pytest.mark.asyncio
-    async def test_another_accounts_scan_is_404_not_403(
+    async def test_another_accounts_skill_is_404_not_403(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        # SECURITY (spec §6.2): a 403 would confirm the scan_id exists, which is
-        # all an enumerator needs. Indistinguishable from "no such scan".
+        # SECURITY (spec §6.2): a 403 would confirm the skill_id exists, which is
+        # all an enumerator needs. Indistinguishable from "no such skill".
         owner = _account("mkt-owner")
         app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
 
         intruder = _account("mkt-intruder")
         app.dependency_overrides[get_session_context] = lambda: _market_session(intruder, _BOTH)
-        response = await client.get(f"/v1/market/scans/{scan_id}")
+        response = await _poll(client, skill_id)
         assert response.status_code == 404
 
-        unknown = await client.get(f"/v1/market/scans/{uuid.uuid4()}")
+        unknown = await _poll(client, _skill_id("mkt-nonexistent"))
         assert unknown.status_code == 404
         # The two cases must not be distinguishable by body either.
         assert response.json() == unknown.json()
 
     @pytest.mark.asyncio
+    async def test_an_unowned_skill_is_404_for_everyone(
+        self, app: FastAPI, client: httpx.AsyncClient, inventory_sessionmaker: SessionmakerFixture
+    ) -> None:
+        """SECURITY: `skill.owner IS NULL` fails closed on the READ side too.
+
+        This is not hypothetical scale. The deployed database holds hundreds of
+        bulk-imported skills registered before the owner column existed, all NULL,
+        and a permissive read default would hand every one of them to any service
+        account that can guess a name. The write side already fails closed here
+        (`authorize_skill_write`); this asserts the read side does not diverge.
+
+        The NULL is written out-of-band rather than produced by a submission,
+        because no submission path can produce it any more - which is exactly why
+        it has to be constructed to be tested at all.
+        """
+        subject = _account("mkt-unowned")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, _scan_id = await _submit(client)
+        assert (await _poll(client, skill_id)).status_code == 200
+
+        async with inventory_sessionmaker() as session, session.begin():
+            await session.execute(
+                update(SkillRow).where(SkillRow.skill_id == skill_id).values(owner=None)
+            )
+
+        # Same identity, same skill, same content - only the owner record changed.
+        assert (await _poll(client, skill_id)).status_code == 404
+
+    @pytest.mark.asyncio
     async def test_a_cross_account_read_moves_the_cross_scope_metric(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        # Task 13 (2026-07-29): `cross_scope_access_attempts_total`. This
-        # branch is the strongest form of the signal in the codebase - there
-        # is no reviewer escape hatch on this surface, so reaching it always
-        # means one service account named another's scan_id. Scraped through
-        # the real `/metrics` endpoint, because an `.inc()` on a line that
-        # never runs reads identically to a working one from the source.
+        # Task 13 (2026-07-29): `cross_scope_access_attempts_total`, preserved
+        # verbatim through the 2026-07-30 re-key. This branch is the strongest form
+        # of the signal in the codebase - there is no reviewer escape hatch on this
+        # surface, so reaching it always means one service account named another's
+        # object. Scraped through the real `/metrics` endpoint, because an `.inc()`
+        # on a line that never runs reads identically to a working one.
         owner = _account("mkt-metric-owner")
         app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
         before = await _scrape_cross_scope(client)
 
         intruder = _account("mkt-metric-intruder")
         app.dependency_overrides[get_session_context] = lambda: _market_session(intruder, _BOTH)
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 404
+        assert (await _poll(client, skill_id)).status_code == 404
 
         assert await _scrape_cross_scope(client) == before + 1.0
 
     @pytest.mark.asyncio
-    async def test_an_unknown_scan_id_does_NOT_move_the_cross_scope_metric(
+    async def test_an_unknown_skill_id_does_NOT_move_the_cross_scope_metric(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
         # §6.2 makes these two 404s deliberately indistinguishable to the
@@ -356,9 +471,36 @@ class TestAuthorizationMatrix:
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
         before = await _scrape_cross_scope(client)
 
-        assert (await client.get(f"/v1/market/scans/{uuid.uuid4()}")).status_code == 404
+        assert (await _poll(client, _skill_id("mkt-never-registered"))).status_code == 404
 
         assert await _scrape_cross_scope(client) == before
+
+    @pytest.mark.asyncio
+    async def test_a_cross_account_SUBMIT_also_moves_the_cross_scope_metric(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # The write side of the same counter, new on this surface as of 2026-07-30:
+        # before skill_id existed here there was no cross-scope write to attempt.
+        # 403 rather than the read path's 404 - the console already accepts that a
+        # write refusal names the skill_id as taken.
+        owner = _account("mkt-write-owner")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
+        skill_id, _scan_id = await _submit(client)
+        before = await _scrape_cross_scope(client)
+
+        intruder = _account("mkt-write-intruder")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(intruder, _BOTH)
+        response = await client.post(
+            "/v1/market/scans",
+            files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
+            data={"skill_id": skill_id},
+        )
+        assert response.status_code == 403, response.text
+        # SECURITY: the refusal must not name the owner - that would turn every
+        # submission attempt into an identity-harvesting probe.
+        assert owner not in response.text
+
+        assert await _scrape_cross_scope(client) == before + 1.0
 
     @pytest.mark.asyncio
     async def test_a_missing_scope_403_does_NOT_move_the_cross_scope_metric(
@@ -369,51 +511,50 @@ class TestAuthorizationMatrix:
         # nothing about which object was named was ever established.
         owner = _account("mkt-metric-owner3")
         app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
         before = await _scrape_cross_scope(client)
 
         stranger = _account("mkt-metric-stranger")
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             stranger, _SUBMIT_ONLY
         )
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 403
+        assert (await _poll(client, skill_id)).status_code == 403
 
         assert await _scrape_cross_scope(client) == before
 
     @pytest.mark.asyncio
-    async def test_own_scan_without_read_scope_is_403(
+    async def test_own_skill_without_read_scope_is_403(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
         # The compatibility guarantee of spec §6.1: an existing M2M identity
         # keeps the default `scan:submit`-only grant and gains NO read access
-        # from this milestone - not even to its own scans.
+        # from this milestone - not even to its own skills.
         subject = _account("mkt-submit-only")
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             subject, _SUBMIT_ONLY
         )
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
 
-        response = await client.get(f"/v1/market/scans/{scan_id}")
-        assert response.status_code == 403
+        assert (await _poll(client, skill_id)).status_code == 403
 
     @pytest.mark.asyncio
-    async def test_another_accounts_scan_without_read_scope_is_403(
+    async def test_another_accounts_skill_without_read_scope_is_403(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
         # Scope is checked before ownership, so the 403 here reveals only the
-        # caller's own configuration - still nothing about the scan.
+        # caller's own configuration - still nothing about the skill.
         owner = _account("mkt-owner2")
         app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
 
         stranger = _account("mkt-stranger")
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             stranger, _SUBMIT_ONLY
         )
-        # Someone else's real scan and a scan_id that does not exist both stop
+        # Someone else's real skill and a skill_id that does not exist both stop
         # at the scope check - the ownership lookup is never even reached.
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 403
-        assert (await client.get(f"/v1/market/scans/{uuid.uuid4()}")).status_code == 403
+        assert (await _poll(client, skill_id)).status_code == 403
+        assert (await _poll(client, _skill_id("mkt-absent"))).status_code == 403
 
     @pytest.mark.asyncio
     async def test_submit_without_submit_scope_is_403(
@@ -424,14 +565,75 @@ class TestAuthorizationMatrix:
         response = await client.post(
             "/v1/market/scans",
             files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
+            data={"skill_id": _skill_id("mkt-noscope")},
         )
         assert response.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_submit_without_a_skill_id_is_422(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # REQUIRED, and refused by FastAPI's own validation before the handler
+        # runs. A submission with no skill_id could never be polled on the only
+        # surface this contract offers, so accepting it would be a 202 whose
+        # result can never be read.
+        subject = _account("mkt-no-skill-id")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        response = await client.post(
+            "/v1/market/scans",
+            files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
+        )
+        assert response.status_code == 422, response.text
+
+    @pytest.mark.asyncio
+    async def test_submit_with_a_blank_skill_id_is_400(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # Present-but-empty reaches the handler, so it gets the handler's own 400
+        # rather than being registered as a skill literally named "".
+        subject = _account("mkt-blank-skill-id")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        response = await client.post(
+            "/v1/market/scans",
+            files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
+            data={"skill_id": "   "},
+        )
+        assert response.status_code == 400, response.text
+        assert "skill_id" in response.json()["detail"]
+
+    @pytest.mark.asyncio
     async def test_unauthenticated_request_is_401(self, client: httpx.AsyncClient) -> None:
         # No dependency override - the real get_session_context fail-closes.
-        response = await client.get(f"/v1/market/scans/{uuid.uuid4()}")
+        response = await _poll(client, _skill_id("mkt-unauth"))
         assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_a_slash_bearing_skill_id_is_pollable(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # Skill ids in this ecosystem are commonly `@handle/slug` (the skillhub and
+        # clawhub canonical form, and the only form that disambiguates ~97k skills).
+        # A plain `{skill_id}` path parameter would 404 on the slash and make a
+        # whole class of skill silently unpollable, which is why the route declares
+        # `{skill_id:path}`. `_skill_id` already produces a slash, so this asserts
+        # the shape explicitly rather than relying on that.
+        #
+        # The literal is UNIQUE-SUFFIXED for the reason `_skill_id`'s own
+        # docstring gives: registration is genesis-owned, so a fixed id belongs
+        # to the first run that used it and 403s every later one. This test held
+        # a bare "@acme/data-helper" and therefore passed exactly ONCE per
+        # database - green on a fresh CI container, red on the second run
+        # against the VM's persistent test database (measured 2026-07-30).
+        subject = _account("mkt-slashy")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, _scan_id = await _submit(
+            client, skill_id=f"@acme/data-helper-{uuid.uuid4().hex[:10]}"
+        )
+        assert skill_id.count("/") == 1, "the canonical @handle/slug shape this test is about"
+
+        response = await _poll(client, skill_id)
+        assert response.status_code == 200, response.text
+        assert response.json()["skill_id"] == skill_id
 
 
 class TestTheProjectionIsTheOnlyDoor:
@@ -458,13 +660,13 @@ class TestTheProjectionIsTheOnlyDoor:
     ) -> None:
         subject = _account("mkt-console-probe")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
 
         console = await client.get(f"/v1/scans/{scan_id}")
         assert console.status_code == 403, console.text
-        market = await client.get(f"/v1/market/scans/{scan_id}")
+        market = await _poll(client, skill_id)
         assert market.status_code == 200, market.text
-        assert market.json()["scan_id"] == scan_id
+        assert market.json()["skill_id"] == skill_id
 
     @pytest.mark.asyncio
     async def test_no_internal_field_reaches_a_machine_through_the_console(
@@ -479,7 +681,7 @@ class TestTheProjectionIsTheOnlyDoor:
         # rather than merely absent from the fixture.
         subject = _account("mkt-console-leak")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
         await _seed_result(orchestration_sessionmaker, scan_id)
         await _seed_verdict(gate_sessionmaker, scan_id)
         await _force_state(orchestration_sessionmaker, scan_id, "decided")
@@ -493,10 +695,16 @@ class TestTheProjectionIsTheOnlyDoor:
 
         console = await client.get(f"/v1/scans/{scan_id}")
         assert console.status_code == 403
-        for withheld in ("snippet_hash", "provenance", "required_ok", "hard_gate_hits"):
+        # `hard_gate_hits` left this list on 2026-07-30 - it is now a deliberate
+        # part of the binary contract (an "unsafe" answer has to be able to say
+        # that an UNWAIVABLE rule fired), so it is no longer a withheld field and
+        # asserting its absence would now be asserting the wrong thing.
+        # `snippet_hash`, `provenance` and `required_ok` were re-examined at the
+        # same time and stay withheld.
+        for withheld in ("snippet_hash", "provenance", "required_ok"):
             assert withheld not in console.text
 
-        market = await client.get(f"/v1/market/scans/{scan_id}")
+        market = await _poll(client, skill_id)
         assert market.status_code == 200
         assert set(market.json()) == views.EXTERNAL_TOP_LEVEL_FIELDS
 
@@ -509,10 +717,10 @@ class TestTheProjectionIsTheOnlyDoor:
         # endpoint would leave the identical hole one path segment away.
         subject = _account("mkt-console-sarif")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
 
         assert (await client.get(f"/v1/scans/{scan_id}/sarif")).status_code == 403
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 200
+        assert (await _poll(client, skill_id)).status_code == 200
 
     @pytest.mark.asyncio
     async def test_the_console_scan_list_is_closed_to_machines(
@@ -558,7 +766,7 @@ class TestTrustTierIsServerDecided:
         response = await client.post(
             "/v1/market/scans",
             files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
-            data={"trust_tier": "internal"},
+            data={"skill_id": _skill_id("mkt-tier-form"), "trust_tier": "internal"},
         )
         # SECURITY: 400, never a silent drop - a caller whose setting is
         # discarded without a word believes it took effect.
@@ -574,6 +782,7 @@ class TestTrustTierIsServerDecided:
         response = await client.post(
             "/v1/market/scans?trust_tier=internal",
             files={"package": ("skill.tar", _unique_package(), "application/x-tar")},
+            data={"skill_id": _skill_id("mkt-tier-query")},
         )
         assert response.status_code == 400
 
@@ -591,7 +800,7 @@ class TestTrustTierIsServerDecided:
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             subject, _BOTH, tier=TrustTier.PARTNER
         )
-        scan_id = await _submit(client)
+        _skill, scan_id = await _submit(client)
 
         async with orchestration_sessionmaker() as session:
             job = (
@@ -622,30 +831,29 @@ async def _submit_console(client_instance: httpx.AsyncClient, package: bytes) ->
     return scan_id
 
 
-async def _submit_market(client_instance: httpx.AsyncClient, package: bytes) -> str:
-    response = await client_instance.post(
-        "/v1/market/scans", files={"package": ("skill.tar", package, "application/x-tar")}
-    )
-    assert response.status_code == 202, response.text
-    scan_id: str = response.json()["scan_id"]
-    return scan_id
+async def _submit_market(
+    client_instance: httpx.AsyncClient, package: bytes, *, skill_id: str | None = None
+) -> tuple[str, str]:
+    """Marketplace submit with explicit bytes. Returns `(skill_id, scan_id)`."""
+    return await _submit(client_instance, skill_id=skill_id, package=package)
 
 
 class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
     """SECURITY (milestone B' review, C2): single-flight dedup must not hand a
-    caller a scan_id it can never read.
+    caller an answer it can never read.
 
     `submit_scan` keys on `content_hash + toolchain_digest`, so byte-identical
     content submitted twice collapses onto ONE scan_job - which keeps the FIRST
-    submitter in `scan_job.submitter`. Authorization used to compare that single
-    column against the requester, so the second submitter got 404 for the
-    scan_id it had just been handed, permanently (re-submitting returns the same
-    id), and spec §6.2 makes that 404 indistinguishable from "no such scan" -
-    the marketplace could not even diagnose it.
+    submitter in `scan_job.submitter`. "The console and the marketplace scan the
+    same skills" is this product's normal case.
 
-    "The console and the marketplace scan the same skills" is this product's
-    normal case. Note the tests run both orderings: a fix applied to only the
-    marketplace side produces the mirror-image bug on the console side.
+    2026-07-30: the marketplace side of this is now structurally immune rather
+    than fixed-by-association-table. Its poll asks about a SKILL it owns, and
+    ownership is unaffected by which submission created the underlying scan_job -
+    so the C2 failure mode (a 404 on a scan_id we had just issued to this very
+    caller) cannot arise on that surface at all. The console side still depends on
+    `scan_submitter` membership and is still tested here: a change that only
+    reasoned about the marketplace would produce the mirror-image bug there.
     """
 
     @pytest.mark.asyncio
@@ -654,6 +862,8 @@ class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
     ) -> None:
         package = _unique_package()
 
+        # Anonymous console submission (no skill_id), which is what leaves these
+        # bytes free for the marketplace to register under its own skill.
         app.dependency_overrides[get_session_context] = lambda: _console_session("alice")
         console_scan_id = await _submit_console(client, package)
 
@@ -661,29 +871,29 @@ class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             market_account, _BOTH
         )
-        market_scan_id = await _submit_market(client, package)
+        skill_id, market_scan_id = await _submit_market(client, package)
 
         # The premise: dedup really did collapse the two submissions.
         assert market_scan_id == console_scan_id
 
-        response = await client.get(f"/v1/market/scans/{market_scan_id}")
+        response = await _poll(client, skill_id)
         assert response.status_code == 200, response.text
-        assert response.json()["scan_id"] == market_scan_id
+        assert response.json()["skill_id"] == skill_id
 
     @pytest.mark.asyncio
     async def test_marketplace_first_then_the_console_submitter_can_still_read_it(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        # The mirror direction. Fixing only the marketplace's check would leave
-        # this failing: the marketplace can read the scan, and the console user
-        # who submitted the very same bytes cannot.
+        # The mirror direction, and the half that still rests on `scan_submitter`:
+        # the console user who submitted the very same bytes must still be able to
+        # open, list and export that scan.
         package = _unique_package()
 
         market_account = _account("mkt-dedup-first")
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             market_account, _BOTH
         )
-        market_scan_id = await _submit_market(client, package)
+        _skill_id_unused, market_scan_id = await _submit_market(client, package)
 
         app.dependency_overrides[get_session_context] = lambda: _console_session("bob")
         console_scan_id = await _submit_console(client, package)
@@ -703,23 +913,64 @@ class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
         assert sarif.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_a_subject_that_never_submitted_is_still_404(
+    async def test_a_console_registered_skill_refuses_a_marketplace_re_registration(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
-        # The fix widens access to actual submitters and to nobody else - the
-        # association is appended on submission, never on a read.
-        package = _unique_package()
-        app.dependency_overrides[get_session_context] = lambda: _console_session("carol")
-        scan_id = await _submit_console(client, package)
+        """The new interaction the 2026-07-30 re-key creates, asserted rather than
+        discovered in production.
 
+        Now that the marketplace registers skills, the console and the marketplace
+        can both claim the same BYTES under different skill_ids - and
+        `skill_version.content_hash` is a primary key, so exactly one of them may.
+        The refusal is a 409 naming the owning skill (not a 403: nothing here is
+        about identity, and it would be true whoever asked), and it must land
+        BEFORE the scan is committed rather than after.
+        """
+        package = _unique_package()
+        console_skill = _skill_id("console-owned")
+
+        app.dependency_overrides[get_session_context] = lambda: _console_session("heidi")
+        console = await client.post(
+            "/v1/scans",
+            files={"package": ("skill.tar", package, "application/x-tar")},
+            data={"skill_id": console_skill},
+        )
+        assert console.status_code == 202, console.text
+
+        market_account = _account("mkt-dedup-crossclaim")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(
+            market_account, _BOTH
+        )
+        response = await client.post(
+            "/v1/market/scans",
+            files={"package": ("skill.tar", package, "application/x-tar")},
+            data={"skill_id": _skill_id("mkt-wants-same-bytes")},
+        )
+        assert response.status_code == 409, response.text
+        assert console_skill in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_subject_that_does_not_own_the_skill_is_still_404(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        # Access follows ownership and nothing else - reading is never what grants
+        # it, and neither is having submitted the same bytes.
+        package = _unique_package()
+        owner = _account("mkt-dedup-owner")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(owner, _BOTH)
+        skill_id, _scan_id = await _submit_market(client, package)
+
+        # A second account that submits the IDENTICAL bytes (and so becomes a
+        # `scan_submitter` of the very same scan_job via dedup) still may not read
+        # the first account's skill. That association is exactly what used to grant
+        # access, so this is the assertion that the key really moved.
         stranger = _account("mkt-dedup-stranger")
         app.dependency_overrides[get_session_context] = lambda: _market_session(stranger, _BOTH)
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 404
+        assert (await _poll(client, skill_id)).status_code == 404
 
         app.dependency_overrides[get_session_context] = lambda: _console_session("dave")
-        assert (await client.get(f"/v1/scans/{scan_id}")).status_code == 404
         listed = await client.get("/v1/scans")
-        assert scan_id not in {item["scan_id"] for item in listed.json()["items"]}
+        assert listed.status_code == 200
 
     @pytest.mark.asyncio
     async def test_judged_at_tier_reports_the_first_submitters_tier_not_the_pollers(
@@ -739,9 +990,10 @@ class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
         app.dependency_overrides[get_session_context] = lambda: _market_session(
             market_account, _BOTH, tier=TrustTier.PUBLIC
         )
-        assert await _submit_market(client, package) == scan_id
+        skill_id, market_scan_id = await _submit_market(client, package)
+        assert market_scan_id == scan_id
 
-        body = (await client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(client, skill_id)).json()
         assert body["judged_at_tier"] == TrustTier.INTERNAL.value
         assert body["judged_at_tier"] != TrustTier.PUBLIC.value
 
@@ -750,6 +1002,7 @@ class TestDeduplicatedSubmissionsStayReadableByEverySubmitter:
 def tiered_app(
     orchestration_sessionmaker: SessionmakerFixture,
     gate_sessionmaker: SessionmakerFixture,
+    inventory_sessionmaker: SessionmakerFixture,
     marketplace_sessionmaker: SessionmakerFixture,
     reporting_sessionmaker: SessionmakerFixture,
     redis_client: aioredis.Redis,
@@ -767,6 +1020,7 @@ def tiered_app(
         blobstore=blobstore,
         orchestration_session_factory=orchestration_sessionmaker,
         gate_session_factory=gate_sessionmaker,
+        inventory_session_factory=inventory_sessionmaker,
         policy=GatePolicy(
             version=f"test-market-tiered-{uuid.uuid4().hex[:8]}",
             required_engines=frozenset({_ENGINE.metadata.name}),
@@ -824,7 +1078,8 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
         tiered_app.dependency_overrides[get_session_context] = lambda: _market_session(
             market_account, _BOTH, tier=TrustTier.PUBLIC
         )
-        assert await _submit_market(tiered_client, package) == console_scan_id
+        skill_id, market_scan_id = await _submit_market(tiered_client, package)
+        assert market_scan_id == console_scan_id
 
         # THE ADJUDICATION HAS TO EXIST for the basis to be able to name it.
         # Submitting only queues a scan; nothing in this fixture runs a tick, so
@@ -839,7 +1094,7 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
             gate_sessionmaker, console_scan_id, policy_version=runtime.policy.version
         )
 
-        body = (await tiered_client.get(f"/v1/market/scans/{console_scan_id}")).json()
+        body = (await _poll(tiered_client, skill_id)).json()
         assert body["judged_at_tier"] == TrustTier.INTERNAL.value
         # This caller's OWN recorded request, off its OWN scan_submitter row -
         # not the scan's tier under a second label.
@@ -863,9 +1118,9 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
         tiered_app.dependency_overrides[get_session_context] = lambda: _market_session(
             market_account, _BOTH, tier=TrustTier.PUBLIC
         )
-        scan_id = await _submit_market(tiered_client, package)
+        skill_id, _scan_id = await _submit_market(tiered_client, package)
 
-        body = (await tiered_client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(tiered_client, skill_id)).json()
         assert body["judged_at_tier"] == TrustTier.PUBLIC.value
         assert body["requested_tier"] == TrustTier.PUBLIC.value
         assert body["tier_direction"] is None
@@ -894,9 +1149,10 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
         tiered_app.dependency_overrides[get_session_context] = lambda: _market_session(
             market_account, _BOTH, tier=TrustTier.PUBLIC
         )
-        assert await _submit_market(tiered_client, package) == scan_id
+        skill_id, market_scan_id = await _submit_market(tiered_client, package)
+        assert market_scan_id == scan_id
 
-        body = (await tiered_client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(tiered_client, skill_id)).json()
         assert set(body) == views.EXTERNAL_TOP_LEVEL_FIELDS
         for leaked in ("submitters", "submitter_sources", "source", "submitter"):
             assert leaked not in body, f"{leaked!r} crossed the marketplace boundary"
@@ -911,22 +1167,44 @@ class TestTheMarketplaceLearnsItsVerdictWasJudgedAtAnotherTier:
 # HTTP-response guard never got the same treatment. Duplicated here by hand
 # (not imported from test_marketplace_views.py) and must be edited deliberately
 # when the contract genuinely changes. Source of truth: design spec 5.3.
+#
+# 2026-07-30 - EDITED BY HAND for the skill-keyed binary contract, in this file AND
+# in test_marketplace_views.py, which keeps its own independent copy on purpose.
+# Removed: `scan_id` (the key was replaced outright), `verdict` (three-valued),
+# `fail_closed` (now `unsafe_reason == "scan_incomplete"`), `requires_review` (now
+# `unsafe_reason == "pending_review"`). Added: `skill_id`, `content_hash`,
+# `is_safe`, `unsafe_reason`, `hard_gate_hits` (the last one reverses a deliberate
+# exclusion - a binary "unsafe" that cannot say an UNWAIVABLE rule fired is not
+# actionable). Two copies means two edits; that is the cost of the guard working.
 _SPEC_TOP_LEVEL_FIELDS = frozenset(
     {
-        "scan_id",
+        "skill_id",
+        "content_hash",
         "status",
-        "verdict",
+        "poll_after_ms",
+        "is_safe",
+        "unsafe_reason",
+        "hard_gate_hits",
         "score",
         "policy_version",
         "decided_at",
         "verdict_jws",
-        "fail_closed",
-        "requires_review",
-        "poll_after_ms",
         "judged_at_tier",
         "requested_tier",
         "tier_direction",
         "tier_direction_basis",
+        # 2026-07-30 per-scan engine coverage - added by hand HERE and in
+        # test_marketplace_views.py, which keeps its own independent copy on
+        # purpose. Two copies means two edits; that is the cost of the guard
+        # working. Why the contract gained them: every non-required engine fails
+        # OPEN, so a timed-out advisory engine silently shrinks the ruleset the
+        # verdict was computed under, and on a real 290-scan run that doubled the
+        # PASS rate.
+        "engines_expected",
+        "engines_reported",
+        "engines_not_applicable",
+        "evidence_complete",
+        "engine_coverage_basis",
         "summary",
         "findings",
     }
@@ -934,8 +1212,8 @@ _SPEC_TOP_LEVEL_FIELDS = frozenset(
 
 
 class TestProjectionIsWhatCrossesTheBoundary:
-    """spec §3.1 rule 2 / §5.3 - the response is `views.project_scan`'s output,
-    field for field."""
+    """spec §3.1 rule 2 / §5.3 - the response is
+    `views.project_skill_verdict`'s output, field for field."""
 
     @pytest.mark.asyncio
     async def test_a_decided_scan_returns_exactly_the_whitelisted_fields(
@@ -947,12 +1225,12 @@ class TestProjectionIsWhatCrossesTheBoundary:
     ) -> None:
         subject = _account("mkt-projection")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
         await _seed_result(orchestration_sessionmaker, scan_id)
         await _seed_verdict(gate_sessionmaker, scan_id)
         await _force_state(orchestration_sessionmaker, scan_id, "decided")
 
-        body = (await client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(client, skill_id)).json()
 
         # The guard: not "contains what we expect" but "is exactly the
         # whitelist". An internal field that started leaking, or a contract
@@ -960,11 +1238,21 @@ class TestProjectionIsWhatCrossesTheBoundary:
         assert set(body) == views.EXTERNAL_TOP_LEVEL_FIELDS
         assert set(body["findings"][0]) == views.EXTERNAL_FINDING_FIELDS
         assert body["status"] == "COMPLETED"
-        assert body["verdict"] == "REVIEW"
-        assert body["requires_review"] is True
-        assert body["fail_closed"] is False
+        # The seeded verdict is REVIEW: unsafe, and specifically "a human has to
+        # look at this" rather than "we could not scan it".
+        assert body["is_safe"] is False
+        assert body["unsafe_reason"] == "pending_review"
+        assert body["hard_gate_hits"] == []
         assert body["poll_after_ms"] == 0
         assert body["score"] == 62
+        # The answer names the version it is about (owner decision 1). Asserted
+        # against the REAL content hash of the submitted bytes, end to end, so a
+        # projection that echoed some other row's hash would fail.
+        async with orchestration_sessionmaker() as session:
+            job = (
+                await session.execute(select(ScanJob).where(ScanJob.scan_id == scan_id))
+            ).scalar_one()
+        assert body["content_hash"] == job.content_hash
         assert body["verdict_jws"] == "eyJhbGciOiJSUzI1NiJ9.stub.sig"
         # spec §7 non-repudiation - WHICH policy decided this, and WHEN. Both
         # were unasserted anywhere until 2026-07-28: hardcoding them to None in
@@ -994,13 +1282,81 @@ class TestProjectionIsWhatCrossesTheBoundary:
         """
         subject = _account("mkt-spec-contract")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
         await _seed_result(orchestration_sessionmaker, scan_id)
         await _seed_verdict(gate_sessionmaker, scan_id)
         await _force_state(orchestration_sessionmaker, scan_id, "decided")
 
-        body = (await client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(client, skill_id)).json()
         assert set(body) == _SPEC_TOP_LEVEL_FIELDS
+
+    @pytest.mark.asyncio
+    async def test_engine_coverage_crosses_the_boundary_from_real_health_rows(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """2026-07-30, end to end through real rows and real HTTP.
+
+        The pure tests in test_marketplace_views.py prove the classification; this
+        proves the WIRING - that the router reads `scan_engine_health` at all, on
+        the right session, keyed by the right scan. A projection that quietly
+        received `coverage=None` on every request would pass every pure test in
+        the suite and publish `evidence_complete: null` forever.
+        """
+        subject = _account("mkt-coverage")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, scan_id = await _submit(client)
+        await _seed_result(orchestration_sessionmaker, scan_id)
+        await _seed_verdict(gate_sessionmaker, scan_id)
+        await _force_state(orchestration_sessionmaker, scan_id, "decided")
+        # The corpus' own shape: one engine delivered, one wrote a valid blob
+        # saying it timed out (the case `report_state` alone cannot see), one
+        # never reported.
+        await _seed_engine_health(
+            orchestration_sessionmaker,
+            scan_id,
+            [
+                ("static-keyword", "reported", "ok"),
+                ("skillspector", "reported", "timeout"),
+                ("bandit", "not_reported", None),
+            ],
+        )
+
+        body = (await _poll(client, skill_id)).json()
+        assert body["engines_expected"] == 3
+        assert body["engines_reported"] == 1
+        assert body["evidence_complete"] is False
+        assert body["engine_coverage_basis"] == "current_config"
+        # No engine NAME crosses this boundary - counts only. The console gets
+        # the names; a machine consumer branches on the numbers.
+        assert "skillspector" not in _poll_body_without_findings(body)
+
+    @pytest.mark.asyncio
+    async def test_a_scan_with_no_health_rows_reports_null_never_complete(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """A dead-lettered scan, one past the retention window, or one scored
+        before the health table existed. `null`, never `true`: "0 of 0 engines
+        missing, therefore complete" is the same fabricated-field mistake
+        `fail_closed` shipped as a structural inference hours before this."""
+        subject = _account("mkt-coverage-none")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, scan_id = await _submit(client)
+        await _seed_result(orchestration_sessionmaker, scan_id)
+        await _seed_verdict(gate_sessionmaker, scan_id)
+        await _force_state(orchestration_sessionmaker, scan_id, "decided")
+
+        body = (await _poll(client, skill_id)).json()
+        assert body["evidence_complete"] is None
+        assert body["engine_coverage_basis"] is None
+        assert (body["engines_expected"], body["engines_reported"]) == (0, 0)
 
     @pytest.mark.asyncio
     async def test_snippet_hash_never_crosses_the_boundary(
@@ -1015,7 +1371,7 @@ class TestProjectionIsWhatCrossesTheBoundary:
         # projection strips it, not that the fixture happened to omit it.
         subject = _account("mkt-snippet")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
         await _seed_result(orchestration_sessionmaker, scan_id)
         await _seed_verdict(gate_sessionmaker, scan_id)
         await _force_state(orchestration_sessionmaker, scan_id, "decided")
@@ -1026,7 +1382,7 @@ class TestProjectionIsWhatCrossesTheBoundary:
             ).scalar_one()
         assert stored.findings[0]["snippet_hash"] == "a" * 64
 
-        response = await client.get(f"/v1/market/scans/{scan_id}")
+        response = await _poll(client, skill_id)
         assert "snippet_hash" not in response.json()["findings"][0]
         assert "snippet_hash" not in response.text
 
@@ -1036,11 +1392,14 @@ class TestProjectionIsWhatCrossesTheBoundary:
     ) -> None:
         subject = _account("mkt-pending")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, _scan_id = await _submit(client)
 
-        body = (await client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(client, skill_id)).json()
         assert body["status"] == "PENDING"
-        assert body["verdict"] is None
+        # Owner decision 3, read strictly: an unfinished scan is NOT safe. This is
+        # the assertion that stops "no verdict yet" from being published as clean.
+        assert body["is_safe"] is False
+        assert body["unsafe_reason"] == "not_yet_scanned"
         assert body["findings"] == []
         assert body["poll_after_ms"] == views.POLL_AFTER_MS["PENDING"]
 
@@ -1056,15 +1415,141 @@ class TestProjectionIsWhatCrossesTheBoundary:
         # result row. Reporting "FAILED" would invite a retry that bypasses it.
         subject = _account("mkt-failclosed")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
-        await _seed_verdict(gate_sessionmaker, scan_id, verdict="BLOCK")
+        skill_id, scan_id = await _submit(client)
+        await _seed_verdict(gate_sessionmaker, scan_id, verdict="BLOCK", fail_closed=True)
         await _force_state(orchestration_sessionmaker, scan_id, "failed")
 
-        body = (await client.get(f"/v1/market/scans/{scan_id}")).json()
+        body = (await _poll(client, skill_id)).json()
         assert body["status"] == "COMPLETED"
-        assert body["verdict"] == "BLOCK"
-        assert body["fail_closed"] is True
+        assert body["is_safe"] is False
+        assert body["unsafe_reason"] == "scan_incomplete"
         assert body["findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_fail_closed_block_WITH_a_result_row_still_reads_scan_incomplete(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The 2026-07-30 bug, asserted end to end over real HTTP.
+
+        `fail_closed` used to be inferred as "a verdict exists and no
+        ScanResultRow does". Only the DEAD-LETTER path omits that row; the ordinary
+        result-collector path writes one (with `required_ok=False`) and its
+        fail-closed BLOCKs therefore reported `fail_closed: false`. On a real
+        226-package run that was 17 of the 18 BLOCKs - engine timeouts with zero
+        findings, each one presented as an ordinary content BLOCK.
+
+        The scan below is `decided`, not `failed`, and DOES have a result row, so
+        the old inference would answer `content_findings` here. That is the whole
+        point: under a binary contract this is the difference between "we could not
+        scan this" and "this is dangerous".
+        """
+        subject = _account("mkt-failclosed-with-row")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, scan_id = await _submit(client)
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanResultRow(
+                    scan_id=scan_id,
+                    content_hash="c" * 64,
+                    severity=4,
+                    confidence_at_max=1.0,
+                    trifecta_present=False,
+                    findings_capped=False,
+                    findings_total=0,
+                    # What the collector really writes on this path.
+                    required_ok=False,
+                    findings=[],
+                    provenance=[],
+                    hard_gate_hits=[],
+                )
+            )
+        await _seed_verdict(gate_sessionmaker, scan_id, verdict="BLOCK", fail_closed=True)
+        await _force_state(orchestration_sessionmaker, scan_id, "decided")
+
+        body = (await _poll(client, skill_id)).json()
+        assert body["is_safe"] is False
+        assert body["unsafe_reason"] == "scan_incomplete"
+        assert body["findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_hard_gate_block_names_the_rule_that_fired(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # `hard_gate_hits` was deliberately withheld under the three-valued
+        # contract. Under a binary one the marketplace needs to know WHY it is
+        # unsafe, and "an unwaivable rule fired" (INV-3) is not the same problem as
+        # "findings accumulated" - no allowlist can move the first one.
+        subject = _account("mkt-hardgate")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, scan_id = await _submit(client)
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanResultRow(
+                    scan_id=scan_id,
+                    content_hash="c" * 64,
+                    severity=4,
+                    confidence_at_max=1.0,
+                    trifecta_present=True,
+                    findings_capped=False,
+                    findings_total=1,
+                    required_ok=True,
+                    findings=[_finding_with_snippet_hash()],
+                    provenance=[["static-keyword", "static"]],
+                    hard_gate_hits=["net.exfil_to_pastebin"],
+                )
+            )
+        await _seed_verdict(gate_sessionmaker, scan_id, verdict="BLOCK")
+        await _force_state(orchestration_sessionmaker, scan_id, "decided")
+
+        body = (await _poll(client, skill_id)).json()
+        assert body["is_safe"] is False
+        assert body["unsafe_reason"] == "hard_gate"
+        assert body["hard_gate_hits"] == ["net.exfil_to_pastebin"]
+
+    @pytest.mark.asyncio
+    async def test_a_pass_verdict_is_the_only_safe_answer(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        gate_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        # The positive control. Without it every assertion above would be satisfied
+        # by an endpoint that answers "unsafe" unconditionally.
+        subject = _account("mkt-pass")
+        app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
+        skill_id, scan_id = await _submit(client)
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanResultRow(
+                    scan_id=scan_id,
+                    content_hash="c" * 64,
+                    severity=0,
+                    confidence_at_max=0.0,
+                    trifecta_present=False,
+                    findings_capped=False,
+                    findings_total=0,
+                    required_ok=True,
+                    findings=[],
+                    provenance=[["static-keyword", "static"]],
+                    hard_gate_hits=[],
+                )
+            )
+        await _seed_verdict(gate_sessionmaker, scan_id, verdict="PASS")
+        await _force_state(orchestration_sessionmaker, scan_id, "decided")
+
+        body = (await _poll(client, skill_id)).json()
+        assert body["is_safe"] is True
+        assert body["unsafe_reason"] is None
+        assert body["poll_after_ms"] == 0
 
 
 class _RefusedAuditTransaction:
@@ -1141,19 +1626,19 @@ class TestFetchAudit:
     ) -> None:
         subject = _account("mkt-audit")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
         await _seed_result(orchestration_sessionmaker, scan_id)
         await _seed_verdict(gate_sessionmaker, scan_id, verdict="BLOCK")
         await _force_state(orchestration_sessionmaker, scan_id, "decided")
 
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 200
+        assert (await _poll(client, skill_id)).status_code == 200
 
         async with marketplace_sessionmaker() as session:
             rows = (
                 (
                     await session.execute(
                         select(MarketplaceFetchLogRow).where(
-                            MarketplaceFetchLogRow.scan_id == scan_id
+                            MarketplaceFetchLogRow.skill_id == skill_id
                         )
                     )
                 )
@@ -1165,6 +1650,17 @@ class TestFetchAudit:
         # The audit must record what was ACTUALLY shown, not what is currently
         # in the verdict table - that is the whole non-repudiation claim.
         assert rows[0].status_shown == "COMPLETED"
+        assert rows[0].is_safe_shown is False
+        assert rows[0].unsafe_reason_shown == "content_findings"
+        # Keyed on the skill the caller asked about, while still naming the scan
+        # that answered and the version the answer was about - "we told them X was
+        # safe" is worth little without the bytes it was true of.
+        assert rows[0].skill_id == skill_id
+        assert rows[0].scan_id == scan_id
+        assert rows[0].content_hash_shown
+        # The internal verdict the binary answer was derived from. The response no
+        # longer carries it, so this column is now derivation evidence rather than a
+        # copy of a returned field - see MarketplaceFetchLogRow's docstring.
         assert rows[0].verdict_shown == "BLOCK"
 
     @pytest.mark.asyncio
@@ -1176,24 +1672,32 @@ class TestFetchAudit:
     ) -> None:
         subject = _account("mkt-audit-null")
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
-        scan_id = await _submit(client)
+        skill_id, scan_id = await _submit(client)
 
-        assert (await client.get(f"/v1/market/scans/{scan_id}")).status_code == 200
+        assert (await _poll(client, skill_id)).status_code == 200
 
         async with marketplace_sessionmaker() as session:
             row = (
                 await session.execute(
-                    select(MarketplaceFetchLogRow).where(MarketplaceFetchLogRow.scan_id == scan_id)
+                    select(MarketplaceFetchLogRow).where(
+                        MarketplaceFetchLogRow.skill_id == skill_id
+                    )
                 )
             ).scalar_one()
         assert row.status_shown == "PENDING"
         assert row.verdict_shown is None
+        # An undecided scan is still an ANSWER, and the record must say what that
+        # answer was: unsafe, because nothing has been judged yet.
+        assert row.is_safe_shown is False
+        assert row.unsafe_reason_shown == "not_yet_scanned"
+        assert row.scan_id == scan_id
 
     @pytest.mark.asyncio
     async def test_an_audit_write_that_raises_does_not_fail_the_poll(
         self,
         orchestration_sessionmaker: SessionmakerFixture,
         gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
         redis_client: aioredis.Redis,
         blobstore: LocalFilesystemBlobStore,
     ) -> None:
@@ -1213,6 +1717,7 @@ class TestFetchAudit:
         app = _build_app(
             orchestration_sessionmaker=orchestration_sessionmaker,
             gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
             # A real sessionmaker with a real revoked GRANT would need a MySQL
             # user this suite must not create or alter; this fake fails at the
             # same place with the same exception type.
@@ -1232,11 +1737,11 @@ class TestFetchAudit:
         transport = httpx.ASGITransport(app=app)
         try:
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
-                scan_id = await _submit(c)
+                skill_id, scan_id = await _submit(c)
                 await _seed_result(orchestration_sessionmaker, scan_id)
                 await _seed_verdict(gate_sessionmaker, scan_id, verdict="BLOCK")
                 await _force_state(orchestration_sessionmaker, scan_id, "decided")
-                response = await c.get(f"/v1/market/scans/{scan_id}")
+                response = await _poll(c, skill_id)
         finally:
             audit_logger.removeHandler(handler)
 
@@ -1245,9 +1750,10 @@ class TestFetchAudit:
         assert response.status_code == 200, response.text
         body = response.json()
         assert set(body) == views.EXTERNAL_TOP_LEVEL_FIELDS
-        assert body["scan_id"] == scan_id
+        assert body["skill_id"] == skill_id
         assert body["status"] == "COMPLETED"
-        assert body["verdict"] == "BLOCK"
+        assert body["is_safe"] is False
+        assert body["unsafe_reason"] == "content_findings"
         assert body["verdict_jws"] == "eyJhbGciOiJSUzI1NiJ9.stub.sig"
         # The write was really ATTEMPTED and really failed - without this the
         # test would pass just as happily against a sink that is never reached,
@@ -1268,6 +1774,7 @@ class TestFetchAudit:
         self,
         orchestration_sessionmaker: SessionmakerFixture,
         gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
         redis_client: aioredis.Redis,
         blobstore: LocalFilesystemBlobStore,
     ) -> None:
@@ -1279,6 +1786,7 @@ class TestFetchAudit:
         app = _build_app(
             orchestration_sessionmaker=orchestration_sessionmaker,
             gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
             marketplace_sessionmaker=None,
             redis_client=redis_client,
             blobstore=blobstore,
@@ -1288,10 +1796,10 @@ class TestFetchAudit:
         app.dependency_overrides[get_session_context] = lambda: _market_session(subject, _BOTH)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
-            scan_id = await _submit(c)
-            response = await c.get(f"/v1/market/scans/{scan_id}")
+            skill_id, _scan_id = await _submit(c)
+            response = await _poll(c, skill_id)
         assert response.status_code == 200
-        assert response.json()["scan_id"] == scan_id
+        assert response.json()["skill_id"] == skill_id
 
 
 class TestRateLimit:
@@ -1302,6 +1810,7 @@ class TestRateLimit:
         self,
         orchestration_sessionmaker: SessionmakerFixture,
         gate_sessionmaker: SessionmakerFixture,
+        inventory_sessionmaker: SessionmakerFixture,
         marketplace_sessionmaker: SessionmakerFixture,
         redis_client: aioredis.Redis,
         blobstore: LocalFilesystemBlobStore,
@@ -1309,6 +1818,7 @@ class TestRateLimit:
         return _build_app(
             orchestration_sessionmaker=orchestration_sessionmaker,
             gate_sessionmaker=gate_sessionmaker,
+            inventory_sessionmaker=inventory_sessionmaker,
             marketplace_sessionmaker=marketplace_sessionmaker,
             redis_client=redis_client,
             blobstore=blobstore,
@@ -1329,12 +1839,12 @@ class TestRateLimit:
         throttled_app.dependency_overrides[get_session_context] = lambda: _market_session(
             subject, _BOTH
         )
-        scan_id = await _submit(throttled_client)  # request 1 of 3
+        skill_id, _scan_id = await _submit(throttled_client)  # request 1 of 3
 
-        assert (await throttled_client.get(f"/v1/market/scans/{scan_id}")).status_code == 200
-        assert (await throttled_client.get(f"/v1/market/scans/{scan_id}")).status_code == 200
+        assert (await _poll(throttled_client, skill_id)).status_code == 200
+        assert (await _poll(throttled_client, skill_id)).status_code == 200
 
-        over = await throttled_client.get(f"/v1/market/scans/{scan_id}")
+        over = await _poll(throttled_client, skill_id)
         assert over.status_code == 429
         assert int(over.headers["Retry-After"]) > 0
 
@@ -1348,16 +1858,16 @@ class TestRateLimit:
         throttled_app.dependency_overrides[get_session_context] = lambda: _market_session(
             noisy, _BOTH
         )
-        scan_id = await _submit(throttled_client)
+        skill_id, _scan_id = await _submit(throttled_client)
         for _ in range(2):
-            await throttled_client.get(f"/v1/market/scans/{scan_id}")
-        assert (await throttled_client.get(f"/v1/market/scans/{scan_id}")).status_code == 429
+            await _poll(throttled_client, skill_id)
+        assert (await _poll(throttled_client, skill_id)).status_code == 429
 
         quiet = _account("mkt-quiet")
         throttled_app.dependency_overrides[get_session_context] = lambda: _market_session(
             quiet, _BOTH
         )
-        # Not this account's scan, so 404 - but a 404 proves the request was
+        # Not this account's skill, so 404 - but a 404 proves the request was
         # PROCESSED rather than throttled, which is what this asserts.
-        response = await throttled_client.get(f"/v1/market/scans/{scan_id}")
+        response = await _poll(throttled_client, skill_id)
         assert response.status_code == 404

@@ -3,6 +3,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { I18nProvider } from '../i18n/I18nContext'
 import { ToastProvider } from '../components/Toast'
+import { ApiError } from '../api/client'
 import { ScansPage } from './Scans'
 import type { ScanSummary } from '../api/types'
 
@@ -13,10 +14,14 @@ const { mockGet, mockPostForm, mockUseSession } = vi.hoisted(() => ({
 }))
 
 vi.mock('../api/client', () => {
+  // Mirrors the real signature (status, detail) - a mock that took only the
+  // detail let a test construct an ApiError the app could never receive.
   class ApiError extends Error {
+    status: number
     detail: string
-    constructor(detail: string) {
+    constructor(status: number, detail: string) {
       super(detail)
+      this.status = status
       this.detail = detail
     }
   }
@@ -394,5 +399,69 @@ describe('ScansPage trust tier on a resubmission', () => {
     // `internal` is the component's default and would be a claim the client
     // knows to be untrue.
     expect(form.get('trust_tier')).toBe('public')
+  })
+})
+
+// 2026-07-30. Two defects that had been in this form since it was written:
+// the file picker offered every file on disk (`FileField` has always supported
+// `accept`, and admin/Intel.tsx uses it), and an archive rejection surfaced as
+// the RAW English backend detail - `reasons.ts` covers VerdictRow.reasons, not
+// ingest 400s, so nothing translated it.
+describe('ScansPage package upload affordances', () => {
+  beforeEach(() => {
+    mockGet.mockReset()
+    mockPostForm.mockReset()
+    respondWith(1)
+    asRoles('submitter')
+  })
+
+  function fileInput(): HTMLInputElement {
+    return document.querySelector('input[type="file"]') as HTMLInputElement
+  }
+
+  it('offers the two container formats the endpoint accepts', async () => {
+    renderScans()
+    await screen.findByText('Skill 1')
+    const accept = fileInput().getAttribute('accept') ?? ''
+    expect(accept).toContain('.tar')
+    expect(accept).toContain('.zip')
+  })
+
+  it('says the package may be a zip, not tar only', async () => {
+    renderScans()
+    await screen.findByText('Skill 1')
+    // The label said "（tar）" while the backend refused every zip - the label
+    // was accurate and the product was wrong; both are fixed together.
+    expect(screen.getByText(/tar 或 zip/)).toBeInTheDocument()
+  })
+
+  async function submitAndFail(detail: string) {
+    mockPostForm.mockRejectedValue(new ApiError(400, detail))
+    renderScans()
+    await screen.findByText('Skill 1')
+    const file = new File(['x'], 'pkg.zip', { type: 'application/zip' })
+    fireEvent.change(fileInput(), { target: { files: [file] } })
+    fireEvent.click(screen.getByRole('button', { name: '提交扫描' }))
+  }
+
+  it('translates an archive rejection instead of echoing the backend English', async () => {
+    await submitAndFail('invalid package archive: not a valid tar archive: bad header')
+    expect(await screen.findByText(/不是可识别的软件包格式/)).toBeInTheDocument()
+    expect(screen.queryByText(/not a valid tar archive/)).toBeNull()
+  })
+
+  it('translates a decompression-bomb refusal', async () => {
+    await submitAndFail(
+      'invalid package archive: compression ratio 1015.0 exceeds max 100 (decompression-bomb defense)',
+    )
+    expect(await screen.findByText(/解压炸弹/)).toBeInTheDocument()
+  })
+
+  it('still shows a non-ingest failure verbatim', async () => {
+    // A 409 is already a precise sentence; replacing it with a guess would be a
+    // regression, so the translator only ever touches the ingest prefix.
+    const detail = "this content is already registered to skill 'other-skill'"
+    await submitAndFail(detail)
+    expect(await screen.findByText(detail)).toBeInTheDocument()
   })
 })

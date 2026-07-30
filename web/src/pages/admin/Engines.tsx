@@ -10,6 +10,7 @@ import {
   engineVersionLabel,
   notReportedAttributionHint,
   notReportedAttributionLabel,
+  windowObservation,
 } from '../../engineHealth'
 import type { EngineHealth, EngineHealthReport, EngineInfo } from '../../api/types'
 
@@ -99,7 +100,16 @@ export function AdminEnginesPage() {
               // EngineHealthBadge: "no observation" is one of the states, not
               // an absence to be branched around.
               const h = healthByEngine.get(e.name)
-              const attribution = notReportedAttributionLabel(t, h)
+              // 2026-07-30: `engineHealth.ts`'s renderers took `EngineHealth`
+              // until per-scan coverage grew a second surface carrying the same
+              // three values under unprefixed names. They now take the minimal
+              // `EngineObservation` and this is the adapter - so the two
+              // surfaces share ONE state machine, one badge-class table and one
+              // duration three-state instead of drifting apart.
+              // `engineDurationHint` below still takes the whole `EngineHealth`:
+              // its window maximum has no per-scan counterpart.
+              const observed = h && windowObservation(h)
+              const attribution = notReportedAttributionLabel(t, observed)
               return (
                 <tr key={e.name}>
                   <td>{engineLabel(e.name, t)}</td>
@@ -119,9 +129,9 @@ export function AdminEnginesPage() {
                     />
                   </td>
                   <td>
-                    <EngineHealthBadge health={h} />
+                    <EngineHealthBadge health={observed} />
                     {attribution && (
-                      <div className="hint" title={notReportedAttributionHint(t, h)}>
+                      <div className="hint" title={notReportedAttributionHint(t, observed)}>
                         {attribution}
                       </div>
                     )}
@@ -129,7 +139,7 @@ export function AdminEnginesPage() {
                       <div className="hint">{h.last_error}</div>
                     )}
                   </td>
-                  <td title={engineDurationHint(t, h)}>{engineDurationLabel(t, h)}</td>
+                  <td title={engineDurationHint(t, h)}>{engineDurationLabel(t, observed)}</td>
                   <td className="hint">
                     {h
                       ? t('adminEngines.countsCell', {

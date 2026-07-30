@@ -26,8 +26,14 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+
+# bandit ships no py.typed; narrow ignore rather than loosening the repo-wide
+# override list for a dev-only test dependency. Importing the REAL constant is
+# deliberate - if upstream moves or renames it, this fails loudly instead of
+# silently testing a threshold that no longer exists.
+from bandit.core import manager as bandit_manager  # type: ignore[import-untyped]
 from engine_runner.adapters import bandit
-from skillscan_core import DetectionCategory, EngineStatus, Severity
+from skillscan_core import DetectionCategory, EngineStatus, Finding, Severity
 
 
 def _completed(
@@ -36,6 +42,18 @@ def _completed(
     return subprocess.CompletedProcess(
         args=["bandit"], returncode=returncode, stdout=json.dumps(payload).encode(), stderr=b""
     )
+
+
+def _parse(payload: Mapping[str, object], target_dir: Path) -> tuple[Finding, ...]:
+    """Write the payload where the adapter now reads it and parse.
+
+    bandit's report moved from stdout to `-o <target_dir>/bandit-report.json`
+    on 2026-07-30, because bandit prints a progress bar to stdout for any tree
+    over 50 files (see `bandit.py`'s `_REPORT_OUTPUT_NAME` comment). stdout is
+    still passed through untouched so the adapter's own signature stays honest.
+    """
+    (target_dir / bandit._REPORT_OUTPUT_NAME).write_bytes(json.dumps(payload).encode())
+    return bandit.parse_output(_completed(payload), target_dir, {})
 
 
 def _result(**overrides: object) -> dict[str, object]:
@@ -54,22 +72,22 @@ def _result(**overrides: object) -> dict[str, object]:
 
 
 class TestParseOutput:
-    def test_weak_hash_test_id_maps_to_code_10(self) -> None:
+    def test_weak_hash_test_id_maps_to_code_10(self, tmp_path: Path) -> None:
         # 2026-07-27: corrected from CODE-12 ("进程创建"/process creation in the
         # catalog, not weak crypto) to CODE-10 ("弱加密"/weak encryption), the
         # actual catalog entry for bandit's weak-hash/cipher/random test IDs.
         payload = {"results": [_result(test_id="B324")], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert len(findings) == 1
         assert findings[0].test_item_id == "CODE-10"
         assert findings[0].category is DetectionCategory.CODE
 
-    def test_hardcoded_tmp_dir_maps_to_file_06(self) -> None:
+    def test_hardcoded_tmp_dir_maps_to_file_06(self, tmp_path: Path) -> None:
         # 2026-07-27: corrected from FILE-04 ("任意文件读取"/arbitrary file read
         # in the catalog, not TOCTOU) to FILE-06 ("临时文件与符号链接风险"), the
         # actual catalog entry for B108 (hardcoded_tmp_directory).
         payload = {"results": [_result(test_id="B108")], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].test_item_id == "FILE-06"
         assert findings[0].category is DetectionCategory.FILE_PACKAGE
 
@@ -91,13 +109,15 @@ class TestParseOutput:
             ("B301", "CODE-07"),
         ],
     )
-    def test_2026_07_27_added_mappings(self, test_id: str, expected_item: str) -> None:
+    def test_2026_07_27_added_mappings(
+        self, test_id: str, expected_item: str, tmp_path: Path
+    ) -> None:
         payload = {"results": [_result(test_id=test_id)], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].test_item_id == expected_item
         assert findings[0].category is DetectionCategory.CODE
 
-    def test_unmapped_test_id_falls_back_to_gen_01_not_the_raw_id(self) -> None:
+    def test_unmapped_test_id_falls_back_to_gen_01_not_the_raw_id(self, tmp_path: Path) -> None:
         # 2026-07-27: the fallback used to pass bandit's own raw test_id
         # straight through to test_item_id - that never matches a catalog
         # entry, so a report keyed on the catalog silently counted it as
@@ -106,41 +126,41 @@ class TestParseOutput:
         # the fallback must now be the catalog's own explicit "detected but
         # unclassified" marker, GEN-01 - never the raw engine id again.
         payload = {"results": [_result(test_id="B101")], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].test_item_id == "GEN-01"
         assert findings[0].category is DetectionCategory.CODE
 
-    def test_severity_and_confidence_mapped(self) -> None:
+    def test_severity_and_confidence_mapped(self, tmp_path: Path) -> None:
         payload = {
             "results": [_result(issue_severity="HIGH", issue_confidence="LOW")],
             "errors": [],
             "metrics": {},
         }
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].severity is Severity.HIGH
         assert findings[0].confidence == pytest.approx(0.3)
 
-    def test_undefined_severity_fails_toward_stricter_medium(self) -> None:
+    def test_undefined_severity_fails_toward_stricter_medium(self, tmp_path: Path) -> None:
         payload = {
             "results": [_result(issue_severity="UNDEFINED")],
             "errors": [],
             "metrics": {},
         }
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].severity is Severity.MEDIUM
 
-    def test_snippet_hash_set_when_code_present(self) -> None:
+    def test_snippet_hash_set_when_code_present(self, tmp_path: Path) -> None:
         payload = {"results": [_result(code="secret = 1\n")], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].snippet_hash is not None
         assert len(findings[0].snippet_hash) == 64
 
-    def test_snippet_hash_none_when_code_absent(self) -> None:
+    def test_snippet_hash_none_when_code_absent(self, tmp_path: Path) -> None:
         payload = {"results": [_result(code="")], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].snippet_hash is None
 
-    def test_evidence_redacted_never_contains_raw_code_snippet(self) -> None:
+    def test_evidence_redacted_never_contains_raw_code_snippet(self, tmp_path: Path) -> None:
         # SECURITY (INV-9): the raw `code` field is a plaintext snippet from
         # the scanned file - it must only ever reach snippet_hash, never
         # evidence_redacted (which carries bandit's own issue_text instead).
@@ -150,25 +170,35 @@ class TestParseOutput:
             "errors": [],
             "metrics": {},
         }
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert raw_secret not in findings[0].evidence_redacted
 
-    def test_multiple_results_all_parsed(self) -> None:
+    def test_multiple_results_all_parsed(self, tmp_path: Path) -> None:
         payload = {
             "results": [_result(test_id="B105"), _result(test_id="B324", line_number=20)],
             "errors": [],
             "metrics": {},
         }
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert len(findings) == 2
 
-    def test_missing_results_key_raises(self) -> None:
+    def test_missing_results_key_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="results"):
-            bandit.parse_output(_completed({"errors": []}), Path("."), {})
+            _parse({"errors": []}, tmp_path)
 
-    def test_source_engine_and_capability_set(self) -> None:
+    def test_a_missing_report_file_raises_rather_than_reading_as_clean(
+        self, tmp_path: Path
+    ) -> None:
+        # Fail-closed: bandit dying before it writes the report must not be
+        # indistinguishable from "bandit ran and found nothing". Note this check
+        # fires BEFORE the results-key check above, which is the right order -
+        # "no report" is a stronger failure than "malformed report".
+        with pytest.raises(ValueError, match="did not write the expected report"):
+            bandit.parse_output(_completed({"results": []}), tmp_path, {})
+
+    def test_source_engine_and_capability_set(self, tmp_path: Path) -> None:
         payload = {"results": [_result()], "errors": [], "metrics": {}}
-        findings = bandit.parse_output(_completed(payload), Path("."), {})
+        findings = _parse(payload, tmp_path)
         assert findings[0].source_engine == "bandit"
         assert findings[0].rule_id.startswith("bandit.")
 
@@ -220,3 +250,36 @@ class TestRealEndToEnd:
         result = adapter.analyze({"clean.py": clean.read_bytes()})
         assert result.status is EngineStatus.OK
         assert result.findings == ()
+
+    def test_real_bandit_survives_a_package_past_the_progress_bar_threshold(self) -> None:
+        """THE 2026-07-30 REGRESSION LOCK, against the real CLI.
+
+        `vendor/bandit/bandit/core/manager.py:269` renders a `rich` progress bar
+        to STDOUT when `len(files_list) > PROGRESS_THRESHOLD` (50) and the log
+        level is <= INFO. That bar landed ahead of the JSON, so
+        `json.loads(stdout)` raised "Expecting value: line 1 column 1" and the
+        adapter reported `error` - dropping every finding in the package.
+
+        bandit is advisory, so the verdict was then computed as though it had
+        found nothing, silently. Measured against a real 98-file skillhub
+        package (`anyhui__douyin-learning-pipeline`): 1 of 50 real packages was
+        large enough, and it was the largest one.
+
+        Deliberately crosses the threshold with REAL files through the REAL CLI
+        rather than asserting on a fixture: the bug lived entirely in the gap
+        between what the tool writes and what a fixture pretends it writes.
+        """
+        files = {
+            f"mod_{index:03d}.py": b"import hashlib\n\n\ndef h(d):\n    return hashlib.md5(d)\n"
+            for index in range(bandit_manager.PROGRESS_THRESHOLD + 5)
+        }
+        assert len(files) > bandit_manager.PROGRESS_THRESHOLD
+        adapter = bandit.make_adapter(ruleset_digest="live-cli-probe", version="1.9.4")
+        result = adapter.analyze(files)
+
+        assert result.status is EngineStatus.OK, f"engine failed: {result.error}"
+        assert result.usable
+        # One weak-hash finding per module - proof the whole report parsed, not
+        # merely that it did not raise.
+        assert len(result.findings) == len(files)
+        assert {f.rule_id for f in result.findings} == {"bandit.B324"}

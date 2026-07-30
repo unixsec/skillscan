@@ -17,7 +17,7 @@ from __future__ import annotations
 import datetime
 
 from engine_runner.sandbox_engines import llm_gated_engine_names
-from skillscan_core import EngineCapability, EngineMetadata, StaticKeywordEngine
+from skillscan_core import EngineCapability, EngineMetadata, EngineStatus, StaticKeywordEngine
 
 from monolith.modules.admin.engine_registry import (
     ATTRIBUTION_BASIS_CURRENT_CONFIG,
@@ -28,13 +28,18 @@ from monolith.modules.admin.engine_registry import (
     llm_unconfigured_engine_names,
     not_reported_attribution,
     not_reported_attribution_basis,
+    structurally_absent_engine_names,
 )
+from monolith.modules.orchestration.aggregate import EngineReportState
 from monolith.modules.orchestration.engine_health import (
     MAX_WINDOW_SCANS,
+    EngineCoverageClass,
     EngineHealthCounts,
     EngineHealthObservation,
     clamp_window_scans,
+    classify_engine_coverage,
     summarize_engine_health,
+    summarize_scan_coverage,
 )
 
 _T0 = datetime.datetime(2026, 7, 29, 12, 0, 0)
@@ -479,3 +484,271 @@ class TestVersionUnavailableIsExplained:
             (row["version"] is None) == (row["version_unavailable_reason"] is not None)
             for row in rows
         )
+
+
+# --------------------------------------------------------------------------- #
+# PER-SCAN COVERAGE (2026-07-30)
+# --------------------------------------------------------------------------- #
+
+
+class TestCoverageSplitsOnDeliveryNotOnReportState:
+    """THE measurement that produced this feature, turned into assertions.
+
+    On the 290-scan run, every engine timeout was a `('reported', 'timeout')`
+    row: the airlock times `analyze()` out and writes a valid findings blob
+    carrying zero findings. So the obvious definition of coverage - "did we hear
+    from the engine" - read 14.0 engines on the scans WITH timeouts and 14.0 on
+    the scans without, while the findings those scans were judged on dropped
+    from 12.7 to 4.3. If any of these tests can be made to pass with
+    `report_state` alone, the field is measuring nothing.
+    """
+
+    def test_a_reported_timeout_is_missing_evidence(self) -> None:
+        coverage = summarize_scan_coverage(
+            [
+                _obs(scan="s1", engine="static-keyword", engine_status="ok"),
+                _obs(scan="s1", engine="skillspector", engine_status="timeout", duration=3218),
+            ]
+        )
+        assert coverage.expected == 2
+        assert coverage.reported == 1
+        assert coverage.missing == 1
+        assert coverage.complete is False
+        assert [e.engine_name for e in coverage.entries] == ["skillspector"]
+        # The state pair is preserved, NOT flattened: the console needs both to
+        # tell "the engine told us it timed out" from "we never heard from it".
+        assert coverage.entries[0].report_state == "reported"
+        assert coverage.entries[0].engine_status == "timeout"
+        # A timed-out engine has a REAL measured duration - the airlock timed the
+        # run it cut short. Corpus range: 0 to 3218 ms.
+        assert coverage.entries[0].analyze_duration_ms == 3218
+
+    def test_a_reported_error_is_missing_evidence_too(self) -> None:
+        """osv-scanner returned `error` on 21 of the 290 scans, all of them in
+        the bucket the original analysis called "no timeouts". Those 21 are
+        exactly as evidence-less as a timeout, and this definition catches them
+        (162 complete / 128 incomplete, against the analysis' own 183 / 107)."""
+        coverage = summarize_scan_coverage(
+            [_obs(scan="s1", engine="osv-scanner", engine_status="error")]
+        )
+        assert coverage.complete is False
+        assert coverage.entries[0].coverage is EngineCoverageClass.MISSING
+
+    def test_partial_counts_as_delivered(self) -> None:
+        """A degraded success that still contributed findings - the same call
+        `FAILED_ENGINE_STATUSES` makes. Not a rounding decision: osv-scanner
+        reports PARTIAL on 161 of 290 scans, so the other choice would mark more
+        than half of all scans incomplete and make the flag meaningless."""
+        coverage = summarize_scan_coverage(
+            [_obs(scan="s1", engine="osv-scanner", engine_status="partial")]
+        )
+        assert coverage.complete is True
+        assert coverage.reported == 1
+        assert coverage.entries == ()
+
+    def test_unreadable_is_missing_and_never_explained_away(self) -> None:
+        """Something WROTE to that key, so the engine demonstrably ran. Config
+        cannot explain it away even if the name is structurally absent."""
+        coverage = summarize_scan_coverage(
+            [_obs(scan="s1", engine="aig-mcp-scan", report_state="unreadable", engine_status=None)],
+            structurally_absent=frozenset({"aig-mcp-scan"}),
+        )
+        assert coverage.entries[0].coverage is EngineCoverageClass.MISSING
+        assert coverage.not_applicable == 0
+        assert coverage.complete is False
+
+
+class TestStructurallyAbsentIsNotAFault:
+    """`aig-mcp-scan` has a `not_reported` row on 290 of 290 scans in the corpus
+    - every deployment without an internal LLM endpoint looks like this, which is
+    the honest default state, not a fault. Counting it as a gap would publish
+    `complete: false` on every scan the system will ever run, and a warning that
+    is always on teaches operators that coverage warnings mean nothing."""
+
+    def test_it_is_excluded_from_expected_and_does_not_break_complete(self) -> None:
+        coverage = summarize_scan_coverage(
+            [
+                _obs(scan="s1", engine="static-keyword", engine_status="ok"),
+                _obs(
+                    scan="s1",
+                    engine="aig-mcp-scan",
+                    report_state="not_reported",
+                    engine_status=None,
+                    duration=None,
+                    findings=None,
+                ),
+            ],
+            structurally_absent=frozenset({"aig-mcp-scan"}),
+        )
+        assert coverage.expected == 1
+        assert coverage.reported == 1
+        assert coverage.not_applicable == 1
+        assert coverage.complete is True
+
+    def test_it_is_still_LISTED_so_the_absence_is_visible(self) -> None:
+        """Excluded from the count, NOT hidden. "This deployment does not run
+        that engine" is a fact a reader is entitled to; silently shrinking
+        `expected` from 15 to 14 with no accounting is how a coverage number
+        becomes unfalsifiable."""
+        coverage = summarize_scan_coverage(
+            [
+                _obs(
+                    scan="s1",
+                    engine="aig-mcp-scan",
+                    report_state="not_reported",
+                    engine_status=None,
+                    duration=None,
+                )
+            ],
+            structurally_absent=frozenset({"aig-mcp-scan"}),
+        )
+        assert [e.engine_name for e in coverage.entries] == ["aig-mcp-scan"]
+        assert coverage.entries[0].coverage is EngineCoverageClass.NOT_APPLICABLE
+
+    def test_an_expected_engine_that_did_not_arrive_is_a_gap(self) -> None:
+        """The other half of the same distinction - the whole point of having
+        two classes. Nothing in today's configuration explains this one, so no
+        cause is claimed and it counts against `complete`."""
+        coverage = summarize_scan_coverage(
+            [
+                _obs(
+                    scan="s1",
+                    engine="skillspector",
+                    report_state="not_reported",
+                    engine_status=None,
+                    duration=None,
+                )
+            ],
+            structurally_absent=frozenset({"aig-mcp-scan"}),
+        )
+        assert coverage.entries[0].coverage is EngineCoverageClass.MISSING
+        assert coverage.complete is False
+
+    def test_a_delivered_result_outranks_the_config_inference(self) -> None:
+        """EVIDENCE OUTRANKS INFERENCE, the rule `not_reported_attribution` was
+        rewritten to follow. `structurally_absent` is read NOW; a blob is proof
+        about THIS scan. So an engine the config claims is absent, but which
+        delivered here, is simply reported."""
+        coverage = summarize_scan_coverage(
+            [_obs(scan="s1", engine="aig-mcp-scan", engine_status="ok")],
+            structurally_absent=frozenset({"aig-mcp-scan"}),
+        )
+        assert coverage.reported == 1
+        assert coverage.not_applicable == 0
+        assert coverage.entries == ()
+
+    def test_a_reported_timeout_is_not_explained_away_by_a_disable(self) -> None:
+        """An operator disabling an engine AFTER a scan must not retroactively
+        erase that scan's real timeout. A `reported` row is proof it ran."""
+        coverage = summarize_scan_coverage(
+            [_obs(scan="s1", engine="yara", engine_status="timeout", duration=0)],
+            structurally_absent=frozenset({"yara"}),
+        )
+        assert coverage.entries[0].coverage is EngineCoverageClass.MISSING
+        assert coverage.complete is False
+
+
+class TestNoRecordIsNotCompleteCoverage:
+    """`complete is None`, never True. Three ordinary ways to have no rows:
+    `_dead_letter_and_decide` never aggregates, Task 9's retention sweep deletes
+    old rows, and scans scored before milestone C never had any.
+
+    This is the field that had to be gotten right: hours before this feature,
+    the marketplace's `fail_closed` was found to be a structural inference
+    ("a verdict with no result row") that read `false` for 17 of 18 REAL
+    fail-closed BLOCKs. "0 of 0 engines missing, therefore complete" is the same
+    mistake with the same shape."""
+
+    def test_no_rows_means_no_answer(self) -> None:
+        coverage = summarize_scan_coverage([])
+        assert coverage.observed is False
+        assert coverage.complete is None
+        assert coverage.expected == 0
+        assert coverage.reported == 0
+        assert coverage.entries == ()
+
+    def test_rows_that_all_delivered_means_complete(self) -> None:
+        coverage = summarize_scan_coverage([_obs(scan="s1", engine="static-keyword")])
+        assert coverage.observed is True
+        assert coverage.complete is True
+
+
+class TestEveryEnumPairIsClassified:
+    """The cross-registry assertion. Milestone D produced FIVE defects of the
+    "new detector added, sibling registry not updated" shape, none findable by
+    reading a diff - so this enumerates both enums rather than listing the pairs
+    a human remembered. A new `EngineStatus` or `EngineReportState` member makes
+    this test fail with the pair named, instead of sliding silently into
+    `MISSING` and quietly widening what counts as a gap.
+    """
+
+    def _classify(self, report_state: str, engine_status: str | None) -> EngineCoverageClass:
+        return classify_engine_coverage(
+            _obs(scan="s1", report_state=report_state, engine_status=engine_status),
+            structurally_absent=frozenset(),
+        )
+
+    def test_every_reported_status_is_deliberately_placed(self) -> None:
+        expected = {
+            EngineStatus.OK.value: EngineCoverageClass.REPORTED,
+            EngineStatus.PARTIAL.value: EngineCoverageClass.REPORTED,
+            EngineStatus.ERROR.value: EngineCoverageClass.MISSING,
+            EngineStatus.TIMEOUT.value: EngineCoverageClass.MISSING,
+        }
+        assert {status.value for status in EngineStatus} == set(expected), (
+            "EngineStatus grew a member - decide whether it means the engine's "
+            "findings reached the verdict, and add it to DELIVERED_ENGINE_STATUSES "
+            "or not. Do not leave it to the MISSING default."
+        )
+        for status, want in expected.items():
+            assert self._classify(EngineReportState.REPORTED.value, status) is want
+
+    def test_every_report_state_is_deliberately_placed(self) -> None:
+        assert {state.value for state in EngineReportState} == {
+            "reported",
+            "not_reported",
+            "unreadable",
+        }, "EngineReportState grew a member - classify_engine_coverage must be taught it"
+        assert (
+            self._classify(EngineReportState.NOT_REPORTED.value, None)
+            is EngineCoverageClass.MISSING
+        )
+        assert (
+            self._classify(EngineReportState.UNREADABLE.value, None) is EngineCoverageClass.MISSING
+        )
+
+    def test_an_unrecognised_value_falls_to_missing_not_to_reported(self) -> None:
+        """The conservative direction, and the opposite of what `_count` does
+        above - see `classify_engine_coverage`'s docstring for why the two
+        differ. A completeness claim may only ever be weakened by ignorance."""
+        assert self._classify("reported", "some_future_status") is EngineCoverageClass.MISSING
+        assert self._classify("some_future_state", None) is EngineCoverageClass.MISSING
+
+
+class TestStructurallyAbsentSetIsTheSameOneTheConsoleExplains:
+    """One definition, two consumers. If this union and
+    `not_reported_attribution`'s two authorities ever diverged, a single scan
+    would carry "this engine is disabled" beside "this engine is missing
+    evidence" - two statements about one engine that cannot both be acted on."""
+
+    def test_it_is_the_union_of_the_two_readable_authorities(self) -> None:
+        absent = structurally_absent_engine_names(
+            disabled=frozenset({"yara"}), llm_unconfigured=frozenset({"aig-mcp-scan"})
+        )
+        assert absent == frozenset({"yara", "aig-mcp-scan"})
+
+    def test_every_member_has_an_attribution_the_console_can_print(self) -> None:
+        """No member of this set may be excluded from `expected` without a cause
+        the console can name. An engine silently subtracted with nothing to show
+        for it is exactly the unaccounted shrink this feature exists to stop."""
+        disabled = frozenset({"yara"})
+        llm_unconfigured = llm_unconfigured_engine_names(sandbox_llm_configured=False)
+        assert llm_unconfigured, "the LLM gate is empty - this test would be vacuous"
+        for name in structurally_absent_engine_names(
+            disabled=disabled, llm_unconfigured=llm_unconfigured
+        ):
+            attribution = not_reported_attribution(
+                name, disabled=disabled, llm_unconfigured=llm_unconfigured
+            )
+            assert attribution is not None, name
+            assert not_reported_attribution_basis(attribution) == ATTRIBUTION_BASIS_CURRENT_CONFIG

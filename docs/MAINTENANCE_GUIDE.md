@@ -43,6 +43,20 @@
   `marketplace_fetch_log` 表永远空着——看起来像"系统健康、只是还没人轮询过"。部署本里程碑
   后，第一次真实轮询发生后应主动 grep 应用日志中的 `marketplace_fetch_audit_write_failed`；
   出现即说明 `svc_marketplace` 授权缺失或过期，重跑 `db/setup_grants.py` 补上。
+  （端点路径 2026-07-30 变为 `POST /v1/market/scans` + `GET /v1/market/skills/{skill_id}`；
+  该表同时扩了 `skill_id`/`content_hash_shown`/`is_safe_shown`/`unsafe_reason_shown` 四列。
+  **表级授权自动覆盖新列，manifest 无需改动**——但迁移必须在真实库上跑过，见下条。）
+- **市场对接 2026-07-30 契约替换后的两个部署检查（新增，两个都会静默失败）：**
+  1. **迁移必须在真实部署库上跑过**：`alembic upgrade head` 后确认
+     `alembic current` == `alembic heads`。本轮新增两个修订（`a1f4c7b2e903` 给 `verdict`
+     加 `fail_closed` 并按 `reasons` 精确回填；`b5e28d13ca7f` 扩 `marketplace_fetch_log`
+     并把 `scan_id` 改为 nullable）。本仓库有过 1103 个测试全绿、部署库却缺 88 列的记录：
+     测试套件自己从 head 建库，因此**永远不会**发现部署库没迁移。
+  2. **市场轮询现在依赖 `inventory` 模块已配置**（未配置直接 `503`），并按 `skill.owner`
+     鉴权（`inventory.ownership.authorize_skill_read`，读侧 fail-closed）。VM 上数百个批量
+     导入的存量 skill **owner 全为 NULL**，对任何服务账号都返回 `404`——表现为"接口正常、
+     就是查不到任何 skill"。要么让市场账号自己重新提交（提交即登记为 owner），要么先经
+     `/admin/ownership`（`POST /v1/inventory/{skill_id}/owner`）由管理员指派。
 - **改过 `企业Skill安全评估测试维度清单.xlsx` 后必须重跑目录生成器（2026-07-29，里程碑 C
   Task 6）：** `uv run python scripts/gen_detection_catalog.py`，并把
   `policies/detection_catalog.json` 一起提交。那份 .xlsx 是 62 个 `test_item_id` 的唯一权威源，
@@ -130,10 +144,13 @@ reeval 触发的重扫真正执行（worker 的队列补投递把 DB-only scan_j
      这个检测**结构上不可实现**——接上去只会得到一个永远返回空、看起来在工作但什么也
      检测不到的调度器。§6.8（取用审计表 `marketplace_fetch_log`）是这个空缺在 pull 模型
      下唯一可实现的对偶：能查"已出判定但从未被取走"，是最接近 ORPHAN 的信号，且完全来自
-     我方数据，不依赖对方接口。
+     我方数据，不依赖对方接口。2026-07-30 起该表按 `skill_id` 键控并记录
+     `is_safe_shown`/`unsafe_reason_shown`，所以这个查询现在可以直接按 skill 做，
+     不必先把 scan_id 映回 skill。
 8. **控制台 `POST /v1/scans` 仍接受调用方表单提交的 `trust_tier`**——本里程碑（B'）只把
    `/v1/market/scans` 改成了服务端按身份决定 tier（见 `USAGE_GUIDE.md` §6.3），控制台路径
-   未改动。这被认为风险模型不同（控制台面向已认证的内部人员，市场路径面向不受控的外部
+   未改动。（2026-07-29 起对**已登记 skill 的重复提交**这个缺口已收窄：那种情况按 skill 的
+   **记录** tier 判，不按表单值；缺口仍然存在于首次提交与匿名提交。）这被认为风险模型不同（控制台面向已认证的内部人员，市场路径面向不受控的外部
    提交内容），因此不在本里程碑范围内，但仍是一个真实差距：一个内部提交者理论上仍可以
    声明 `trust_tier=internal` 把本该 BLOCK 的 HIGH 级 finding 降级为 REVIEW。
 

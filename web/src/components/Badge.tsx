@@ -4,7 +4,7 @@ import {
   engineHealthLabel,
   engineHealthState,
 } from '../engineHealth'
-import type { EngineHealth } from '../api/types'
+import type { EngineObservation } from '../engineHealth'
 
 const VERDICT_CLASS: Record<string, string> = {
   PASS: 'badge badge-pass',
@@ -69,7 +69,13 @@ export function BoolBadge({
 // input - it renders "no observation in the retained window", which is neither
 // a failure nor a success - so callers pass a lookup miss straight in rather
 // than branching around this component and inventing their own dash.
-export function EngineHealthBadge({ health }: { health: EngineHealth | undefined }) {
+//
+// Takes an `EngineObservation`, not an `EngineHealth` (2026-07-30): the same
+// badge now serves the admin window summary (via `windowObservation`) and a
+// scan's per-engine coverage rows. A second badge for the second surface would
+// have been a second chance to put `error` and `not_reported` on one colour,
+// which is the distinction acceptance criterion 8 exists for.
+export function EngineHealthBadge({ health }: { health: EngineObservation | undefined }) {
   const { t } = useI18n()
   return (
     <span className={ENGINE_HEALTH_BADGE_CLASS[engineHealthState(health)]}>

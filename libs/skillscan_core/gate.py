@@ -66,6 +66,11 @@ def decide(
             effective_severity=scan_result.severity,
             trifecta_present=scan_result.trifecta_present,
             hard_gate_hits=scan_result.hard_gate_hits,
+            # SECURITY: the ONE place this is true. Recorded rather than left to
+            # be inferred downstream from the absence of a findings row - see
+            # `VerdictResult.fail_closed` for why that inference was wrong for
+            # every fail-closed BLOCK that arrived through the collector path.
+            fail_closed=True,
             score=security_score(
                 verdict,
                 scan_result.findings,
@@ -93,6 +98,11 @@ def decide(
             effective_severity=scan_result.severity,
             trifecta_present=scan_result.trifecta_present,
             hard_gate_hits=tuple(sorted(combined_hard_gate)),
+            # A hard-gate BLOCK is a decision about content that WAS examined -
+            # `required_ok` was true to reach this branch at all. Not fail-closed,
+            # and the distinction matters externally: one says "this package is
+            # dangerous", the other says "we could not scan this package".
+            fail_closed=False,
             score=security_score(
                 Verdict.BLOCK, scan_result.findings, pin_to_floor=True, weights=weights
             ),
@@ -221,5 +231,6 @@ def decide(
         effective_severity=sev_all,
         trifecta_present=trif_all,
         hard_gate_hits=(),
+        fail_closed=False,
         score=security_score(verdict, effective, pin_to_floor=pin_to_floor, weights=weights),
     )

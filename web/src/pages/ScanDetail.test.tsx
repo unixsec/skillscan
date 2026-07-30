@@ -3,7 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api/client'
 import { I18nProvider } from '../i18n/I18nContext'
 import { ScanDetailContent, scanTrifectaSignals, submitterTierDivergence } from './ScanDetail'
-import type { Finding, ScanDetail } from '../api/types'
+import type {
+  Finding,
+  ScanDetail,
+  ScanEngineCoverage,
+  ScanEngineCoverageEntry,
+} from '../api/types'
 
 const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }))
 
@@ -83,6 +88,39 @@ function scan(overrides: Partial<ScanDetail> = {}): ScanDetail {
     submitters: ['alice'],
     source: ['console'],
     submitter_sources: [{ submitter: 'alice', source: 'console', requested_trust_tier: 'public' }],
+    // 2026-07-30: complete coverage by default, so the existing tests read the
+    // "nothing to warn about" page and the coverage tests below opt in
+    // explicitly. `complete: true` and NOT `null`: null is the "no per-engine
+    // record" state and would silently put every other test on the
+    // unrecorded-coverage branch.
+    engine_coverage: coverage(),
+    ...overrides,
+  }
+}
+
+function coverage(overrides: Partial<ScanEngineCoverage> = {}): ScanEngineCoverage {
+  return {
+    expected: 1,
+    reported: 1,
+    not_applicable: 0,
+    complete: true,
+    basis: 'current_config',
+    engines: [],
+    ...overrides,
+  }
+}
+
+function coverageEntry(
+  overrides: Partial<ScanEngineCoverageEntry> = {},
+): ScanEngineCoverageEntry {
+  return {
+    name: 'skillspector',
+    report_state: 'reported',
+    engine_status: 'timeout',
+    analyze_duration_ms: 3218,
+    coverage: 'missing',
+    not_reported_attribution: null,
+    not_reported_attribution_basis: null,
     ...overrides,
   }
 }
@@ -543,5 +581,142 @@ describe('ScanDetail submitter attribution', () => {
     const line = screen.getByText(/提交者：/)
     expect(line.textContent).toContain('alice')
     expect(line.textContent).not.toContain('请求层级')
+  })
+})
+
+describe('engine coverage', () => {
+  // 2026-07-30. `required_ok` covers the FLOOR only and fails closed; every
+  // other engine fails OPEN - it does not deliver, its findings are discarded,
+  // and the verdict is computed as though it found nothing. Measured over 290
+  // real scans: complete-evidence scans went to REVIEW 60% of the time,
+  // incomplete ones 29%. The page said nothing about the difference.
+
+  it('names the engines whose evidence is missing, and says the count', async () => {
+    renderScan({
+      engine_coverage: coverage({
+        expected: 3,
+        reported: 1,
+        complete: false,
+        engines: [coverageEntry({ name: 'skillspector' })],
+      }),
+    })
+    await waitForLoaded()
+    expect(screen.getByText(/引擎覆盖度/)).toBeTruthy()
+    expect(screen.getByText(/基于 1\/3 个引擎的证据/)).toBeTruthy()
+    // The NAME - the whole point of this surface, as against the marketplace's
+    // counts - through the page's own `engineLabel`, so the coverage table reads
+    // in the viewer's locale like every other engine cell rather than showing a
+    // raw wire value.
+    expect(screen.getAllByText(/skillspector（Skill 结构化风险分析）/).length).toBeGreaterThan(0)
+  })
+
+  it('renders a reported timeout through the shared engine-health vocabulary', async () => {
+    // NOT a fourth spelling of these states: `coverageObservation` feeds the
+    // same six-state machine and the same badge classes as the admin engine
+    // console, so `error` and `not_reported` cannot collapse onto one colour
+    // here either. '引擎超时' is engineHealth.timeout's own zh label.
+    renderScan({
+      engine_coverage: coverage({
+        expected: 2,
+        reported: 1,
+        complete: false,
+        engines: [coverageEntry({ report_state: 'reported', engine_status: 'timeout' })],
+      }),
+    })
+    await waitForLoaded()
+    expect(screen.getByText('引擎超时')).toBeTruthy()
+    // Task 7's three duration states survive to the browser. A TIMED-OUT engine
+    // has a real measured duration - the airlock timed the run it cut short.
+    expect(screen.getByText('3218 毫秒')).toBeTruthy()
+  })
+
+  it('does not label a non-delivering engine as a green PASS in the by-engine table', async () => {
+    // THE CONTRADICTION THIS FIXES. `provenance` carries a triple for a
+    // timed-out engine too (`unavailable_engine_result` fabricates one so the
+    // gate can fail closed), so the by-engine table scored it "通过" on zero
+    // findings - directly beside a coverage warning saying the opposite. Only
+    // the coverage read can tell the two apart.
+    renderScan({
+      findings: [],
+      provenance: [['skillspector', 'unknown']],
+      engine_coverage: coverage({
+        expected: 1,
+        reported: 0,
+        complete: false,
+        engines: [coverageEntry({ name: 'skillspector' })],
+      }),
+    })
+    await waitForLoaded()
+    // Asserted on the by-ENGINE row itself, not on the page: '通过' / '不通过'
+    // also appear in the by-category table and in the verdict badge, so a
+    // page-wide query would pass or fail for unrelated reasons.
+    const engineRows = screen
+      .getAllByText(/skillspector（Skill 结构化风险分析）/)
+      .map((cell) => cell.closest('tr'))
+      .filter((row): row is HTMLTableRowElement => row !== null)
+    const byEngineRow = engineRows.find((row) => row.textContent?.includes('unknown'))
+    expect(byEngineRow).toBeTruthy()
+    // A third state, not a rename of the second: this row is neither the green
+    // '通过' it used to show on zero findings nor the '不通过' a real finding
+    // would produce.
+    expect(byEngineRow?.textContent).toContain('无证据')
+    expect(byEngineRow?.textContent).not.toContain('通过')
+  })
+
+  it('shows a structurally-absent engine without calling it a fault', async () => {
+    // `aig-mcp-scan` reads not_reported on 100% of scans of any deployment with
+    // no LLM endpoint - 290 of 290 in the corpus that produced this feature. A
+    // red row on every scan forever would train readers to skip the section.
+    renderScan({
+      engine_coverage: coverage({
+        expected: 1,
+        reported: 1,
+        not_applicable: 1,
+        complete: true,
+        engines: [
+          coverageEntry({
+            name: 'aig-mcp-scan',
+            report_state: 'not_reported',
+            engine_status: null,
+            analyze_duration_ms: null,
+            coverage: 'not_applicable',
+            not_reported_attribution: 'llm_endpoint_unconfigured',
+            not_reported_attribution_basis: 'current_config',
+          }),
+        ],
+      }),
+    })
+    await waitForLoaded()
+    // Listed, with its cause...
+    expect(
+      screen.getAllByText(/aig-mcp-scan（AI 网关\/MCP 安全扫描）/).length,
+    ).toBeGreaterThan(0)
+    expect(screen.getByText('当前配置：本服务未配置内部 LLM 端点')).toBeTruthy()
+    // ...and NOT presented as incomplete evidence.
+    expect(screen.getByText(/基于 1\/1 个引擎的证据/)).toBeTruthy()
+    expect(screen.queryByText(/未进入本次判定/)).toBeNull()
+    // The caveat that has to travel with a count computed from CURRENT config.
+    expect(screen.getByText(/而非本次扫描当时的配置/)).toBeTruthy()
+  })
+
+  it('says "no record" rather than implying every engine reported', async () => {
+    // A dead-lettered scan, one past the health-table retention window, or one
+    // scored before that table existed. Silence here is indistinguishable from
+    // "complete", which is the claim the data cannot support.
+    renderScan({
+      engine_coverage: coverage({ expected: 0, reported: 0, complete: null, basis: null }),
+    })
+    await waitForLoaded()
+    expect(screen.getByText(/没有保留逐引擎记录/)).toBeTruthy()
+    expect(screen.queryByText(/个引擎的证据/)).toBeNull()
+  })
+
+  it('is not rendered at all on a never-scored scan', async () => {
+    // `_dead_letter_and_decide` never aggregates, so there is no engine set to
+    // report on - the page already explains that case in one notice, and a
+    // coverage section beside it would be a second, weaker account of it.
+    renderScan({ required_ok: null, verdict: 'BLOCK', findings: [] })
+    await screen.findByText(/从未真正完成引擎评分/)
+    expect(screen.queryByText(/引擎覆盖度/)).toBeNull()
   })
 })

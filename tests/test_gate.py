@@ -38,6 +38,36 @@ class TestGateFailClosed(unittest.TestCase):
         verdict_result = decide(scan_result, policy, TrustTier.INTERNAL, now=0.0)
         self.assertEqual(verdict_result.verdict, Verdict.BLOCK)
 
+    def test_the_fail_closed_flag_is_set_on_this_branch_and_nowhere_else(self) -> None:
+        """SECURITY (2026-07-30): `fail_closed` must be a RECORDED fact.
+
+        Every consumer used to infer it from "a verdict exists but no
+        ScanResultRow does", which only holds for the dead-letter path - the
+        result-collector path writes a `scan_result` row with
+        `required_ok=False`, so its fail-closed BLOCKs were indistinguishable
+        from ordinary content BLOCKs (17 of 18 BLOCKs on a real 226-package
+        run). Asserted in BOTH directions, because the flag is only useful if
+        the negative case is trustworthy too.
+        """
+        policy = default_policy()
+        timed_out = scan_result_from_findings([], policy, engine_status=EngineStatus.TIMEOUT)
+        self.assertTrue(decide(timed_out, policy, TrustTier.INTERNAL, now=0.0).fail_closed)
+
+        clean = scan_result_from_findings([], policy)
+        self.assertFalse(decide(clean, policy, TrustTier.INTERNAL, now=0.0).fail_closed)
+
+        hard_gate_policy = default_policy(hard_gate_rules=frozenset({"gate.hit"}))
+        hit = scan_result_from_findings(
+            [make_finding(rule_id="gate.hit", severity=Severity.LOW, confidence=1.0)],
+            hard_gate_policy,
+        )
+        hard_gate_result = decide(hit, hard_gate_policy, TrustTier.INTERNAL, now=0.0)
+        # A hard-gate BLOCK is a decision about content that WAS examined. If
+        # this ever reported fail_closed, "we could not scan this" and "this is
+        # dangerous" would collapse into one answer externally.
+        self.assertEqual(hard_gate_result.verdict, Verdict.BLOCK)
+        self.assertFalse(hard_gate_result.fail_closed)
+
 
 class TestGateHardGate(unittest.TestCase):
     def test_inv3_hard_gate_hit_blocks_unconditionally(self) -> None:

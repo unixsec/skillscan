@@ -10,7 +10,9 @@ import {
   engineVersionLabel,
   notReportedAttributionHint,
   notReportedAttributionLabel,
+  windowObservation,
   type EngineHealthState,
+  type EngineObservation,
 } from './engineHealth'
 import type { EngineHealth, EngineInfo } from './api/types'
 
@@ -40,7 +42,18 @@ function health(overrides: Partial<EngineHealth> = {}): EngineHealth {
   }
 }
 
-const NEVER_REPORTED = health({
+// 2026-07-30: every renderer here except `engineDurationHint` now takes the
+// minimal `EngineObservation`, so these tests go through `windowObservation` -
+// the same adapter admin/Engines.tsx uses. Deliberately NOT a fixture that
+// carries BOTH field spellings: a dual-shaped object would let a renderer that
+// still read `last_report_state` pass, which is the one thing this refactor has
+// to make impossible. `engineDurationHint` keeps the whole `EngineHealth`
+// because its window maximum has no per-scan counterpart.
+function observed(overrides: Partial<EngineHealth> = {}): EngineObservation {
+  return windowObservation(health(overrides))
+}
+
+const NEVER_REPORTED = observed({
   last_report_state: 'not_reported',
   last_engine_status: null,
   last_analyze_duration_ms: null,
@@ -51,7 +64,7 @@ const NEVER_REPORTED = health({
   counts: { ok: 0, partial: 0, error: 0, not_reported: 3, unreadable: 0 },
 })
 
-const RETURNED_ERROR = health({
+const RETURNED_ERROR = observed({
   last_engine_status: 'error',
   last_error: 'adapter exited 1',
   counts: { ok: 0, partial: 0, error: 3, not_reported: 0, unreadable: 0 },
@@ -113,22 +126,24 @@ describe('the three duration states', () => {
   // last place they can still be collapsed.
   it('0 is a measurement, not a blank', () => {
     const h = health({ last_analyze_duration_ms: 0, max_analyze_duration_ms: 0 })
-    expect(engineDurationDisplay(h)).toEqual({ kind: 'sub_millisecond' })
-    expect(engineDurationLabel(zh, h)).toBe('<1 毫秒')
-    expect(engineDurationLabel(en, h)).toBe('<1 ms')
+    const o = windowObservation(h)
+    expect(engineDurationDisplay(o)).toEqual({ kind: 'sub_millisecond' })
+    expect(engineDurationLabel(zh, o)).toBe('<1 毫秒')
+    expect(engineDurationLabel(en, o)).toBe('<1 ms')
     expect(engineDurationHint(en, h)).toContain('real measurement')
   })
 
   it('null is NOT MEASURED, and says so rather than showing a dash', () => {
     const h = health({ last_analyze_duration_ms: null, max_analyze_duration_ms: null })
-    expect(engineDurationDisplay(h)).toEqual({ kind: 'not_measured', reason: 'no_duration_field' })
-    expect(engineDurationLabel(zh, h)).toBe('未测量')
-    expect(engineDurationLabel(en, h)).toBe('not measured')
+    const o = windowObservation(h)
+    expect(engineDurationDisplay(o)).toEqual({ kind: 'not_measured', reason: 'no_duration_field' })
+    expect(engineDurationLabel(zh, o)).toBe('未测量')
+    expect(engineDurationLabel(en, o)).toBe('not measured')
     expect(engineDurationHint(en, h)).toContain('older than the field')
   })
 
   it('a positive integer renders as the measurement it is', () => {
-    const h = health({ last_analyze_duration_ms: 42 })
+    const h = observed({ last_analyze_duration_ms: 42 })
     expect(engineDurationDisplay(h)).toEqual({ kind: 'measured', ms: 42 })
     expect(engineDurationLabel(zh, h)).toBe('42 毫秒')
     expect(engineDurationLabel(en, h)).toBe('42 ms')
@@ -137,9 +152,9 @@ describe('the three duration states', () => {
   it('all three render differently from each other in both locales', () => {
     const rendered = (t: typeof zh) =>
       [
-        engineDurationLabel(t, health({ last_analyze_duration_ms: 0 })),
-        engineDurationLabel(t, health({ last_analyze_duration_ms: null })),
-        engineDurationLabel(t, health({ last_analyze_duration_ms: 42 })),
+        engineDurationLabel(t, observed({ last_analyze_duration_ms: 0 })),
+        engineDurationLabel(t, observed({ last_analyze_duration_ms: null })),
+        engineDurationLabel(t, observed({ last_analyze_duration_ms: 42 })),
         engineDurationLabel(t, NEVER_REPORTED),
       ]
     for (const t of [zh, en]) {
@@ -162,7 +177,7 @@ describe('the three duration states', () => {
     // timing is unknown, which is the definition of not-measured. The DB CHECK
     // forces a NULL duration on every non-reported row, so the data cannot
     // distinguish it; the display must not claim more than the data holds.
-    const unreadable = health({
+    const unreadable = observed({
       last_report_state: 'unreadable',
       last_engine_status: null,
       last_analyze_duration_ms: null,
@@ -198,8 +213,8 @@ describe('the three duration states', () => {
   it('a falsy-vs-null confusion cannot survive: 0 and null take different branches', () => {
     // Written as its own assertion because `if (!ms)` is the natural way to
     // write this and is wrong for exactly one value.
-    expect(engineDurationDisplay(health({ last_analyze_duration_ms: 0 })).kind).not.toBe(
-      engineDurationDisplay(health({ last_analyze_duration_ms: null })).kind,
+    expect(engineDurationDisplay(observed({ last_analyze_duration_ms: 0 })).kind).not.toBe(
+      engineDurationDisplay(observed({ last_analyze_duration_ms: null })).kind,
     )
   })
 
@@ -235,9 +250,19 @@ describe('the three duration states', () => {
     expect(engineDurationHint(en, noDurationField)).toContain('older than the field')
 
     // Even for a row that did not report: the maximum is a fact about the
-    // WINDOW, not about the last run.
+    // WINDOW, not about the last run. Built from `health` rather than from
+    // NEVER_REPORTED, which is now an observation and carries no window fields.
     expect(
-      engineDurationHint(en, { ...NEVER_REPORTED, max_analyze_duration_ms: 4756 }),
+      engineDurationHint(
+        en,
+        health({
+          last_report_state: 'not_reported',
+          last_engine_status: null,
+          last_analyze_duration_ms: null,
+          max_analyze_duration_ms: 4756,
+          measured_duration_count: 1,
+        }),
+      ),
     ).toContain('4756')
   })
 
@@ -254,11 +279,10 @@ describe('the three duration states', () => {
 })
 
 describe('not_reported attribution: two knowable causes, three that are not', () => {
-  function neverReportedWith(attribution: string | null): EngineHealth {
+  function neverReportedWith(attribution: string | null): EngineObservation {
     return {
       ...NEVER_REPORTED,
       not_reported_attribution: attribution,
-      not_reported_attribution_basis: attribution === null ? null : 'current_config',
     }
   }
 
@@ -305,10 +329,10 @@ describe('not_reported attribution: two knowable causes, three that are not', ()
 
 describe('a state the backend grows before the console learns it', () => {
   it('echoes the raw value instead of a bare translation key', () => {
-    const future = health({ last_report_state: 'reported', last_engine_status: 'degraded' })
+    const future = observed({ last_report_state: 'reported', last_engine_status: 'degraded' })
     expect(engineHealthState(future)).toBe('unknown')
     expect(engineHealthLabel(en, future)).toBe('degraded')
-    const futureState = health({ last_report_state: 'quarantined', last_engine_status: null })
+    const futureState = observed({ last_report_state: 'quarantined', last_engine_status: null })
     expect(engineHealthLabel(en, futureState)).toBe('quarantined')
   })
 })

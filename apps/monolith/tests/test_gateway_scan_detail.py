@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import json
 import tarfile
 import uuid
 from collections.abc import AsyncIterator
@@ -53,6 +54,8 @@ import pytest
 import pytest_asyncio
 import redis.asyncio as aioredis
 from common.blobstore import LocalFilesystemBlobStore
+from common.engine_toggle import DISABLED_ENGINES_KEY
+from engine_runner.sandbox_engines import llm_gated_engine_names
 from fastapi import FastAPI
 from skillscan_core import GatePolicy, Severity, StaticKeywordEngine, TrustTier, Verdict
 
@@ -62,7 +65,11 @@ from monolith.modules.gate.signer import LocalDevSigner
 from monolith.modules.gateway.auth.dependencies import get_session_context
 from monolith.modules.gateway.auth.session import SessionContext
 from monolith.modules.gateway.runtime import ScanRuntime
-from monolith.modules.orchestration.models import ScanJob, ScanSubmitterRow
+from monolith.modules.orchestration.models import (
+    ScanEngineHealthRow,
+    ScanJob,
+    ScanSubmitterRow,
+)
 from monolith.tests.conftest import SessionmakerFixture
 
 _ENGINE = StaticKeywordEngine()
@@ -300,9 +307,18 @@ async def _submit_console(
     return scan_id
 
 
-async def _submit_market(client_instance: httpx.AsyncClient, package: bytes) -> str:
+async def _submit_market(
+    client_instance: httpx.AsyncClient, package: bytes, *, skill_id: str | None = None
+) -> str:
+    # `skill_id` became REQUIRED on this endpoint on 2026-07-30, when the
+    # marketplace contract was re-keyed from scan_id to skill_id: a poll keyed on
+    # skill_id can only work if the submission recorded one. These tests are
+    # about the `source` channel and `requested_trust_tier`, not about inventory,
+    # so each gets its own unique id and no test here shares one.
     response = await client_instance.post(
-        "/v1/market/scans", files={"package": ("skill.tar", package, "application/x-tar")}
+        "/v1/market/scans",
+        files={"package": ("skill.tar", package, "application/x-tar")},
+        data={"skill_id": skill_id or f"@test/scan-detail-{uuid.uuid4().hex[:12]}"},
     )
     assert response.status_code == 202, response.text
     scan_id: str = response.json()["scan_id"]
@@ -935,3 +951,245 @@ class TestListCarriesTheSameAttributionAsDetail:
         assert item["submitters"] == []
         assert item["submitter_sources"] == []
         assert item["source"] == []
+
+
+class TestEngineCoverage:
+    """2026-07-30: WHICH engines did not report on this scan.
+
+    `required_ok`, which this response already carried, covers
+    `GatePolicy.required_engines` only - the floor, which fails closed. Every
+    other engine fails OPEN: its findings are discarded and the verdict is
+    computed as though it found nothing. On a 290-scan real-world run, scans with
+    complete evidence came back 60% REVIEW and scans without it 29%, and the page
+    said nothing about the difference.
+
+    These tests seed real `scan_engine_health` rows (the model carries a DB CHECK
+    tying `engine_status` to `report_state`, so a shape production cannot produce
+    cannot be seeded either) and read them back through real HTTP.
+    """
+
+    async def _seed_health(
+        self,
+        orchestration_sessionmaker: SessionmakerFixture,
+        scan_id: str,
+        rows: list[tuple[str, str, str | None, int | None]],
+    ) -> None:
+        async with orchestration_sessionmaker() as session, session.begin():
+            for engine_name, report_state, engine_status, duration in rows:
+                session.add(
+                    ScanEngineHealthRow(
+                        scan_id=scan_id,
+                        engine_name=engine_name,
+                        report_state=report_state,
+                        engine_status=engine_status,
+                        analyze_duration_ms=duration,
+                        finding_count=0 if report_state == "reported" else None,
+                        error=None,
+                        recorded_at=datetime.datetime(2026, 7, 30, 12, 0, 0),
+                    )
+                )
+
+    async def _scan(self, client_instance: httpx.AsyncClient) -> str:
+        response = await client_instance.post(
+            "/v1/scans",
+            files={
+                "package": ("skill.tar", _make_tar_bytes(_unique_content()), "application/x-tar")
+            },
+            data={"trust_tier": "internal"},
+        )
+        assert response.status_code == 202
+        return str(response.json()["scan_id"])
+
+    @pytest.mark.asyncio
+    async def test_a_reported_timeout_is_listed_as_missing_evidence(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """The case `report_state` alone cannot see, and the case that produced
+        the whole feature: the airlock times `analyze()` out and writes a VALID
+        findings blob carrying zero findings, so `report_state` says `reported`
+        and the findings are gone anyway."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        scan_id = await self._scan(client)
+        await self._seed_health(
+            orchestration_sessionmaker,
+            scan_id,
+            [
+                (_ENGINE.metadata.name, "reported", "ok", 3),
+                ("skillspector", "reported", "timeout", 3218),
+            ],
+        )
+
+        coverage = (await client.get(f"/v1/scans/{scan_id}")).json()["engine_coverage"]
+        assert coverage["expected"] == 2
+        assert coverage["reported"] == 1
+        assert coverage["complete"] is False
+        assert coverage["basis"] == "current_config"
+        assert [e["name"] for e in coverage["engines"]] == ["skillspector"]
+        entry = coverage["engines"][0]
+        # BOTH fields, never merged (acceptance criterion 8) - the console's
+        # engineHealth.ts renders the six-state machine off this pair.
+        assert (entry["report_state"], entry["engine_status"]) == ("reported", "timeout")
+        assert entry["coverage"] == "missing"
+        # A timed-out engine has a REAL measured duration. Task 7's three states
+        # survive to the browser: `0` is a measurement too, `null` is not one.
+        assert entry["analyze_duration_ms"] == 3218
+        # A `reported` row is EVIDENCE the engine ran here, so no
+        # configuration-based cause is offered for it at all.
+        assert entry["not_reported_attribution"] is None
+        assert entry["not_reported_attribution_basis"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_error_text_reaches_this_surface(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """SECURITY: `ScanEngineHealthRow.error` carries an engine's own message,
+        which can quote the scanned bytes. This endpoint is submitter-or-above -
+        a reviewer reading somebody else's package - so the message stays on the
+        admin-only health endpoint. Seeded non-null on purpose, so this proves
+        the projection drops it rather than that the fixture omitted it."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        scan_id = await self._scan(client)
+        async with orchestration_sessionmaker() as session, session.begin():
+            session.add(
+                ScanEngineHealthRow(
+                    scan_id=scan_id,
+                    engine_name="skillspector",
+                    report_state="reported",
+                    engine_status="error",
+                    analyze_duration_ms=7,
+                    finding_count=0,
+                    error="TRACEBACK-CANARY /tmp/pkg/secret.py line 3",
+                    recorded_at=datetime.datetime(2026, 7, 30, 12, 0, 0),
+                )
+            )
+
+        body = (await client.get(f"/v1/scans/{scan_id}")).json()
+        assert "TRACEBACK-CANARY" not in json.dumps(body)
+        assert body["engine_coverage"]["engines"][0]["coverage"] == "missing"
+
+    @pytest.mark.asyncio
+    async def test_a_structurally_absent_engine_is_shown_but_is_not_a_fault(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """`aig-mcp-scan` reads `not_reported` on EVERY scan of any deployment
+        with no LLM endpoint - 290 of 290 in the corpus. It is listed, with an
+        attribution and the `current_config` caveat, and it does NOT make the
+        scan incomplete: a warning that fires on every scan forever teaches
+        operators to ignore the one that matters.
+
+        The app fixture wires no `sandbox_llm_configured`, so `ScanRuntime`'s
+        fail-safe default (False) puts every LLM-gated engine in the set - the
+        same state the measured deployment was in."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        gated = sorted(llm_gated_engine_names())
+        assert gated, "the LLM gate is empty - this test would be vacuous"
+        scan_id = await self._scan(client)
+        await self._seed_health(
+            orchestration_sessionmaker,
+            scan_id,
+            [
+                (_ENGINE.metadata.name, "reported", "ok", 3),
+                (gated[0], "not_reported", None, None),
+            ],
+        )
+
+        coverage = (await client.get(f"/v1/scans/{scan_id}")).json()["engine_coverage"]
+        assert coverage["expected"] == 1
+        assert coverage["reported"] == 1
+        assert coverage["not_applicable"] == 1
+        assert coverage["complete"] is True
+        # Excluded from the count, NOT hidden - `expected` shrinking has a
+        # published reason.
+        entry = next(e for e in coverage["engines"] if e["name"] == gated[0])
+        assert entry["coverage"] == "not_applicable"
+        assert entry["not_reported_attribution"] == "llm_endpoint_unconfigured"
+        assert entry["not_reported_attribution_basis"] == "current_config"
+
+    @pytest.mark.asyncio
+    async def test_an_expected_engine_that_never_arrived_has_no_claimed_cause(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+    ) -> None:
+        """Three of `not_reported`'s five causes have no readable authority, and
+        `not_reported_attribution` refuses to guess. `null` sends an operator to
+        look; a fabricated cause sends them to the wrong fix."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        scan_id = await self._scan(client)
+        await self._seed_health(
+            orchestration_sessionmaker, scan_id, [("skillspector", "not_reported", None, None)]
+        )
+
+        coverage = (await client.get(f"/v1/scans/{scan_id}")).json()["engine_coverage"]
+        assert coverage["complete"] is False
+        entry = coverage["engines"][0]
+        assert entry["coverage"] == "missing"
+        assert entry["not_reported_attribution"] is None
+        assert entry["analyze_duration_ms"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_scan_with_no_health_rows_says_so_rather_than_claiming_complete(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        """A dead-lettered scan (`_dead_letter_and_decide` never aggregates, so
+        it writes no rows - deliberately), one past Task 9's retention window, or
+        one scored before the table existed. `complete: null`, and the object is
+        still present so a consumer's parse never branches on shape."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        scan_id = await self._scan(client)
+
+        coverage = (await client.get(f"/v1/scans/{scan_id}")).json()["engine_coverage"]
+        assert coverage["complete"] is None
+        assert coverage["basis"] is None
+        assert (coverage["expected"], coverage["reported"]) == (0, 0)
+        assert coverage["engines"] == []
+
+    @pytest.mark.asyncio
+    async def test_an_admin_disable_does_not_erase_a_real_timeout(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        orchestration_sessionmaker: SessionmakerFixture,
+        redis_client: aioredis.Redis,
+    ) -> None:
+        """EVIDENCE OUTRANKS INFERENCE. `structurally_absent` is read NOW; a blob
+        is proof about THIS scan. So disabling an engine after the fact must not
+        retroactively turn its recorded timeout into "not applicable" - which
+        would make every historical scan of a since-disabled engine read
+        complete."""
+        app.dependency_overrides[get_session_context] = lambda: _fake_session(
+            "alice", frozenset({"submitter"})
+        )
+        scan_id = await self._scan(client)
+        await self._seed_health(
+            orchestration_sessionmaker,
+            scan_id,
+            [("skillspector", "reported", "timeout", 0)],
+        )
+        await redis_client.sadd(DISABLED_ENGINES_KEY, "skillspector")  # type: ignore[misc]
+        try:
+            coverage = (await client.get(f"/v1/scans/{scan_id}")).json()["engine_coverage"]
+        finally:
+            await redis_client.srem(DISABLED_ENGINES_KEY, "skillspector")  # type: ignore[misc]
+        assert coverage["engines"][0]["coverage"] == "missing"
+        assert coverage["complete"] is False

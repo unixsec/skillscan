@@ -314,9 +314,9 @@ def require_human_role(*roles: str) -> Callable[..., Awaitable[SessionContext]]:
     correctly-enforced boundary into a debugging guessing game for the
     integrator, who would reasonably conclude their own scan had vanished.
 
-    Machine callers are not losing access to anything: `/v1/market/scans` +
-    `/v1/market/scans/{scan_id}` is the surface built for them, and it serves
-    the same scans through the projection.
+    Machine callers are not losing access to anything: `POST /v1/market/scans` +
+    `GET /v1/market/skills/{skill_id}` is the surface built for them, and it
+    serves the same verdicts through the projection.
     """
     role_dependency = require_role(*roles)
 

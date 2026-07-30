@@ -193,7 +193,7 @@ def _bearer_request(app: FastAPI, token: str) -> Request:
         {
             "type": "http",
             "method": "GET",
-            "path": "/v1/market/scans/any",
+            "path": "/v1/market/skills/any",
             "query_string": b"",
             "headers": [(b"authorization", f"Bearer {token}".encode())],
             "app": app,

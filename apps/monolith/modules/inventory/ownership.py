@@ -142,6 +142,48 @@ def authorize_skill_write(
         )
 
 
+def authorize_skill_read(*, skill_id: str, recorded_owner: str | None, actor: str) -> None:
+    """Raises `SkillOwnershipError` unless `actor` owns `skill_id`. The READ-side
+    counterpart of `authorize_skill_write`, added 2026-07-30 for the skill-keyed
+    marketplace poll.
+
+    WHY A SEPARATE FUNCTION rather than reusing the write check. Two of its three
+    behaviours are wrong for a read, and both differences are deliberate:
+
+      * NO ADMIN OVERRIDE, and no `actor_is_admin` parameter to pass one. The
+        write-side override exists because an admin already holds strictly stronger
+        powers over the same object and is the only recovery path for unowned legacy
+        rows. Neither applies here: the only surface that calls this is
+        `/v1/market`, which by construction serves machine identities reading back
+        their own submissions, and its router docstring records that it has NO
+        reviewer/admin escape hatch (unlike the console's `get_scan`) because "read
+        anyone's skill" has no legitimate use on it. A parameter that no caller
+        should ever set to True is a parameter waiting to be set to True.
+      * THE CALLER ANSWERS 404, NOT 403. On the write path a 403 is correct and its
+        existence disclosure is an accepted tradeoff (you had to know the exact
+        skill_id to type it, and a 202 that silently scanned nothing would be a
+        lie). A read has no such excuse: 403 here would confirm that a skill_id
+        exists, which is exactly how you enumerate the console's inventory one
+        guess at a time. Design spec §6.2 already settled this shape for the
+        scan-keyed poll - unknown and not-yours are the SAME 404, deliberately
+        indistinguishable - and replacing the key must not weaken it.
+
+    UNOWNED (`recorded_owner is None`) FAILS CLOSED, same as the write side and for
+    the same reason: NULL means the system holds no record of who owns this skill,
+    and the honest answer to "may this caller read it" is then no. This matters more
+    than it looks - the deployed VM has hundreds of bulk-imported skills with NULL
+    owner, and a permissive default would hand every one of them to any service
+    account that can guess a name.
+    """
+    if recorded_owner is None:
+        raise SkillOwnershipError(
+            f"skill {skill_id!r} has no recorded owner, so no caller can be authorized to "
+            "read its verdict"
+        )
+    if recorded_owner != actor:
+        raise SkillOwnershipError(f"skill {skill_id!r} is registered to another identity")
+
+
 class InvalidOwnerError(ValueError):
     """The proposed owner is not a usable identity string (blank, or longer
     than the column). Callers surface this as **400** - it is a malformed

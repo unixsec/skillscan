@@ -28,6 +28,7 @@ from monolith.modules.inventory.ownership import (
     InvalidOwnerError,
     OwnerAssignmentConflictError,
     SkillOwnershipError,
+    authorize_skill_read,
     authorize_skill_write,
     normalize_owner,
     validate_owner_assignment,
@@ -166,6 +167,57 @@ class TestAuthorizeSkillWrite:
         assert not issubclass(InvalidTransitionError, SkillOwnershipError)
 
 
+class TestAuthorizeSkillRead:
+    """The read-side counterpart (2026-07-30), for the skill-keyed marketplace poll.
+
+    Same pure-logic, no-infrastructure posture as the write side above. The
+    end-to-end proof (a service account polling a skill it does not own and getting
+    404) needs real MySQL + Redis and lives in `test_marketplace_router.py`.
+    """
+
+    def test_the_owner_may_read_and_a_stranger_may_not(self) -> None:
+        authorize_skill_read(skill_id=_SKILL, recorded_owner="svc-market", actor="svc-market")
+        with pytest.raises(SkillOwnershipError):
+            authorize_skill_read(skill_id=_SKILL, recorded_owner="svc-market", actor="svc-other")
+
+    def test_an_unowned_skill_fails_closed_for_everyone(self) -> None:
+        # NULL owner means "the system holds no record of who owns this", and the
+        # honest answer to "may this caller read it" is then no. This matters at
+        # scale, not in theory: the deployed database holds hundreds of
+        # bulk-imported skills with NULL owner, and a permissive default would hand
+        # every one of them to any service account that can guess a name.
+        with pytest.raises(SkillOwnershipError):
+            authorize_skill_read(skill_id=_SKILL, recorded_owner=None, actor="svc-market")
+
+    def test_there_is_no_admin_override_parameter_to_pass(self) -> None:
+        # SECURITY: deliberately asymmetric with `authorize_skill_write`, which DOES
+        # take one. The marketplace surface has no reviewer/admin escape hatch (its
+        # router docstring records why: every caller is a machine identity reading
+        # back its own submissions), and a parameter no caller should ever set to
+        # True is a parameter waiting to be set to True.
+        assert "actor_is_admin" not in inspect.signature(authorize_skill_read).parameters
+        assert "actor_is_admin" in inspect.signature(authorize_skill_write).parameters
+
+    def test_the_refusal_never_names_the_owner(self) -> None:
+        # The read path hides existence entirely (its caller answers 404), but the
+        # message must not become an identity-harvesting oracle if it is ever logged
+        # or surfaced. Same rule the write-side 403 follows.
+        with pytest.raises(SkillOwnershipError) as excinfo:
+            authorize_skill_read(skill_id=_SKILL, recorded_owner="alice", actor="mallory")
+        assert "alice" not in str(excinfo.value)
+
+    def test_an_empty_string_owner_behaves_exactly_like_the_write_side(self) -> None:
+        # Degenerate but worth pinning, and pinned to MATCH the sibling rather than
+        # to some independently-chosen answer: `""` is not NULL, so it goes through
+        # the equality branch (not the fail-closed one) on both sides. An identity
+        # of `""` cannot be authenticated, so the pairing should never occur - what
+        # matters is that the two functions do not quietly disagree about it.
+        authorize_skill_read(skill_id=_SKILL, recorded_owner="", actor="")
+        authorize_skill_write(skill_id=_SKILL, recorded_owner="", actor="", actor_is_admin=False)
+        with pytest.raises(SkillOwnershipError):
+            authorize_skill_read(skill_id=_SKILL, recorded_owner="", actor="somebody")
+
+
 class TestTheOwnershipPerimeter:
     """Which submission paths can reach inventory registration at all.
 
@@ -173,23 +225,77 @@ class TestTheOwnershipPerimeter:
     asserted rather than remembered.
     """
 
-    def test_the_marketplace_submit_endpoint_accepts_no_skill_id(self) -> None:
-        # VERIFIED, not assumed: `register_skill_version` has exactly one
-        # caller in the tree (`gateway.router.create_scan`), because the
-        # marketplace's submit endpoint takes no `skill_id` and therefore has
-        # no inventory-lifecycle side effects at all - it cannot be a
-        # resubmission of a registered skill, so there is nothing there to
-        # own.
-        #
-        # This is the guard on that reasoning. The day someone adds `skill_id`
-        # to the marketplace surface, this fails and says why - rather than
-        # that path quietly becoming a second, unguarded way to take a skill
-        # over. It would need its own `authorize_skill_write` call, and its own
-        # answer for what a machine identity owning a skill even means.
+    def test_the_marketplace_submit_endpoint_now_accepts_skill_id_and_is_inside_the_perimeter(
+        self,
+    ) -> None:
+        """2026-07-30: this guard fired, exactly as designed, and here is the answer.
+
+        Its previous form asserted that `submit_marketplace_scan` takes NO
+        `skill_id`, on the reasoning that `register_skill_version` therefore had
+        exactly one caller and the marketplace path could not be a resubmission of
+        a registered skill. It said "the day someone adds `skill_id` to the
+        marketplace surface, this fails and says why - it would need its own
+        `authorize_skill_write` call, and its own answer for what a machine
+        identity owning a skill even means".
+
+        That day came: the poll is keyed on skill_id now, which is impossible
+        unless skill_id exists in the marketplace's world. Both requirements the
+        old guard named are met - the endpoint calls `authorize_skill_write` in its
+        pre-flight and reaches the authoritative in-transaction check through
+        `register_skill_version`; and a machine identity owning a skill means it
+        may poll that skill's verdict and no other, which is precisely what
+        `authorize_skill_read` enforces.
+
+        So the guard is re-pointed rather than deleted: it now asserts the
+        perimeter itself, self-discovering the callers instead of naming them.
+        """
         from monolith.modules.marketplace_api.router import submit_marketplace_scan
 
-        params = set(inspect.signature(submit_marketplace_scan).parameters)
-        assert "skill_id" not in params
+        params = inspect.signature(submit_marketplace_scan).parameters
+        assert "skill_id" in params
+        # REQUIRED, not optional: a marketplace submission with no skill_id would
+        # be permanently unpollable on the only surface this contract offers, and
+        # a 202 whose result can never be read is worse than an error. The console's
+        # own `skill_id` is `str | None`, so this distinction is real and visible in
+        # the annotation.
+        assert params["skill_id"].annotation == "str"
+
+    def test_every_caller_of_register_skill_version_also_authorizes_the_write(self) -> None:
+        """Self-discovering, not an enumeration of the paths known today.
+
+        Milestone D's lesson: a guard that lists the call sites it remembers only
+        protects those. This walks every module under `apps/monolith/modules/`,
+        finds the ones that call `register_skill_version`, and requires each of
+        them to also call `authorize_skill_write` in its own pre-flight. A third
+        submission path added tomorrow fails here until it does.
+
+        `register_skill_version` re-runs the check inside its writing transaction
+        and THAT run is authoritative - this asserts the pre-flight, which is what
+        keeps a refused caller from leaving a scan_job, a blob and a
+        `scan_submitter` row behind on the way out.
+        """
+        modules_dir = Path(__file__).resolve().parents[1] / "modules"
+        callers: dict[Path, set[str]] = {}
+        for path in sorted(modules_dir.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            called = {
+                node.func.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            if "register_skill_version" in called:
+                callers[path] = called
+
+        assert callers, "found no caller of register_skill_version - has it been renamed?"
+        unguarded = sorted(
+            str(path.relative_to(modules_dir))
+            for path, called in callers.items()
+            if "authorize_skill_write" not in called
+        )
+        assert not unguarded, (
+            f"these submission paths register a skill version without a pre-flight "
+            f"authorize_skill_write: {unguarded}"
+        )
 
     def test_register_skill_version_requires_an_explicit_admin_decision(self) -> None:
         # The Task 12 technique, applied here: `actor_is_admin` is a REQUIRED

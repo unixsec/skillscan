@@ -539,6 +539,21 @@ class VerdictResult:
     effective_severity: Severity
     trifecta_present: bool
     hard_gate_hits: tuple[str, ...]
+    # SECURITY (2026-07-30): TRUE only on `decide()`'s INV-1 fail-closed branch -
+    # "a required engine was missing or failed, so this BLOCK is the conservative
+    # answer to an INCOMPLETE scan", as opposed to a decision made about content
+    # that was actually examined.
+    #
+    # REQUIRED, no default. It was previously not recorded at all and every
+    # consumer INFERRED it structurally from "a verdict exists but no
+    # ScanResultRow does" - which is wrong: only the dead-letter path
+    # (`orchestration.service._dead_letter_and_decide`) omits that row, while the
+    # ordinary collector path writes one (with `required_ok=False`) and its
+    # fail-closed BLOCKs therefore read as ordinary ones. On a real 226-package
+    # run, 17 of 18 BLOCKs were fail-closed and every one of them was misreported.
+    # A default of False would let a new construction site quietly re-assert
+    # exactly that wrong answer, so there is none.
+    fail_closed: bool
     # 0-100 advisory score, derived from (verdict, findings) - NEVER an input
     # to the verdict itself. See scoring.security_score().
     score: int

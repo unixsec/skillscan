@@ -113,7 +113,7 @@ const zh: Dict = {
   'dashboard.engineOptional': '可选',
 
   'scans.title': '扫描',
-  'scans.packageLabel': 'Skill 软件包（tar）',
+  'scans.packageLabel': 'Skill 软件包（tar 或 zip）',
   'scans.skillIdLabel': 'Skill ID（选填）',
   'scans.skillIdPlaceholder': '填写后登记进清单并跟踪生命周期',
   'scans.trustTierLabel': '信任层级',
@@ -139,6 +139,27 @@ const zh: Dict = {
   'scans.colContentHash': '内容哈希',
   'scans.noSkillId': '未登记',
   'scans.noSkillName': '未识别',
+
+  // 上传被拒（POST /v1/scans 的 400）。后端返回的是英文原文，直接弹给用户等于没有提示；
+  // 每条对应 engine_runner/normalizer.py 里一类 UnpackRejected，见 ingestErrors.ts。
+  // 刻意不写具体数值上限：那些数字在后端常量里，写进文案就会各自漂移。
+  'ingest.unsupportedFormat': '这个文件不是可识别的软件包格式。请上传 tar（.tar/.tar.gz/.tgz）或 zip 压缩包。',
+  'ingest.corruptZip': 'zip 压缩包已损坏或无法解析，请重新下载或重新打包后再上传。',
+  'ingest.emptyArchive': '上传的文件是空的。',
+  'ingest.noRegularFiles': '压缩包里没有任何普通文件（只有目录或链接），没有可扫描的内容。',
+  'ingest.archiveTooLarge': '软件包体积超出上限，请精简后再上传。',
+  'ingest.tooManyEntries': '压缩包内的条目数量超出上限，请精简文件数量后再上传。',
+  'ingest.fileTooLarge': '压缩包内有单个文件的体积超出上限。',
+  'ingest.totalTooLarge': '压缩包解压后的总体积超出上限。',
+  'ingest.compressionBomb': '压缩包的压缩比异常高（疑似解压炸弹），已拒绝。',
+  'ingest.encryptedEntry': '压缩包内含加密条目，无法扫描，请上传未加密的软件包。',
+  'ingest.spannedArchive': '不支持分卷（多卷）zip 压缩包，请重新打包成单个文件。',
+  'ingest.linkEntry': '压缩包内含符号链接或硬链接，出于安全原因整包拒绝。',
+  'ingest.duplicatePath': '压缩包内存在重复的文件路径，请重新打包后再上传。',
+  'ingest.pathCollision': '压缩包内同一个路径既是文件又是目录，请重新打包后再上传。',
+  'ingest.illegalPath': '压缩包内含非法路径（绝对路径或包含 ".."），出于安全原因整包拒绝。',
+  'ingest.pathTooDeep': '压缩包内的目录层级过深。',
+  'ingest.unknown': '软件包校验未通过：{detail}',
 
   'scanDetail.title': '扫描 {scanId}',
   'scanDetail.state': '状态',
@@ -189,6 +210,20 @@ const zh: Dict = {
   'scanDetail.colStatus': '态势',
   'scanDetail.statusPass': '通过',
   'scanDetail.statusFail': '不通过',
+  // 2026-07-30 逐次扫描的引擎覆盖度。`required_ok` 只覆盖 floor（必需）引擎且
+  // 是 fail-closed；其余引擎全部 fail-open——不上报就等于"没有发现"，判定照常做出。
+  // 290 次真实扫描的实测：证据完整的扫描 60% 进入复审，证据不完整的只有 29%。
+  'scanDetail.statusNoEvidence': '无证据',
+  'scanDetail.coverage': '引擎覆盖度',
+  'scanDetail.coverageCount': '本次判定基于 {reported}/{expected} 个引擎的证据。',
+  'scanDetail.coverageIncompleteHint':
+    '下列引擎的检测结果未进入本次判定——它们的发现被丢弃，判定是按"这些引擎没有任何发现"计算出来的，因此实际严重级别可能高于上方结论。',
+  'scanDetail.coverageNotApplicable':
+    '另有 {count} 个引擎本部署根本不运行，已从上面的分母中排除（不计为缺失）：',
+  'scanDetail.coverageBasisCurrentConfig':
+    '上述排除依据的是"当前"配置（现在读取的停用集合与 LLM 端点状态），而非本次扫描当时的配置——没有任何记录保存了当时的配置。',
+  'scanDetail.coverageUnrecorded':
+    '本次扫描没有保留逐引擎记录（判定前即被死信处理、已超出健康数据保留窗口，或扫描发生在该记录表启用之前），因此无法说明证据是否完整——这不等于"全部引擎都已上报"。',
   'scanDetail.findings': '发现明细（{count}）',
   'scanDetail.noFindings': '未发现问题。',
   'scanDetail.colRule': '规则',
@@ -810,7 +845,7 @@ const en: Dict = {
   'dashboard.engineOptional': 'Optional',
 
   'scans.title': 'Scans',
-  'scans.packageLabel': 'Skill package (tar)',
+  'scans.packageLabel': 'Skill package (tar or zip)',
   'scans.skillIdLabel': 'Skill ID (optional)',
   'scans.skillIdPlaceholder': 'registers into inventory + lifecycle tracking',
   'scans.trustTierLabel': 'Trust tier',
@@ -836,6 +871,36 @@ const en: Dict = {
   'scans.colContentHash': 'Content hash',
   'scans.noSkillId': 'not registered',
   'scans.noSkillName': 'unnamed',
+
+  // Upload refusals (the 400 from POST /v1/scans). One entry per class of
+  // `UnpackRejected` in engine_runner/normalizer.py - see ingestErrors.ts.
+  // Deliberately no concrete limits in the wording: those numbers live in
+  // backend constants and would drift independently here.
+  'ingest.unsupportedFormat':
+    'That file is not a package format we recognize. Upload a tar (.tar/.tar.gz/.tgz) or a zip.',
+  'ingest.corruptZip':
+    'The zip archive is corrupt or unreadable. Download or repackage it and try again.',
+  'ingest.emptyArchive': 'The uploaded file is empty.',
+  'ingest.noRegularFiles':
+    'The archive holds no regular files (only directories or links), so there is nothing to scan.',
+  'ingest.archiveTooLarge': 'The package is larger than the upload limit. Trim it and try again.',
+  'ingest.tooManyEntries': 'The archive holds more entries than the limit allows.',
+  'ingest.fileTooLarge': 'A single file inside the archive is larger than the limit allows.',
+  'ingest.totalTooLarge': 'The archive expands to more than the uncompressed size limit allows.',
+  'ingest.compressionBomb':
+    'The archive expands far out of proportion to its size (a likely decompression bomb) and was refused.',
+  'ingest.encryptedEntry':
+    'The archive contains encrypted entries, which cannot be scanned. Upload an unencrypted package.',
+  'ingest.spannedArchive': 'Spanned (multi-disk) zip archives are not supported. Repackage as one file.',
+  'ingest.linkEntry':
+    'The archive contains a symlink or hardlink, so the whole package is refused for safety.',
+  'ingest.duplicatePath': 'The archive contains duplicate file paths. Repackage it and try again.',
+  'ingest.pathCollision':
+    'One path inside the archive is both a file and a directory. Repackage it and try again.',
+  'ingest.illegalPath':
+    'The archive contains an illegal path (absolute, or containing ".."), so it is refused for safety.',
+  'ingest.pathTooDeep': 'Directories inside the archive are nested too deeply.',
+  'ingest.unknown': 'Package validation failed: {detail}',
 
   'scanDetail.title': 'Scan {scanId}',
   'scanDetail.state': 'state',
@@ -888,6 +953,22 @@ const en: Dict = {
   'scanDetail.colStatus': 'Status',
   'scanDetail.statusPass': 'Pass',
   'scanDetail.statusFail': 'Fail',
+  // 2026-07-30 per-scan engine coverage. `required_ok` covers the FLOOR only and
+  // fails closed; every other engine fails OPEN - not reporting is treated as
+  // "found nothing" and the verdict is issued anyway. Measured over 290 real
+  // scans: complete-evidence scans went to REVIEW 60% of the time, incomplete
+  // ones 29%.
+  'scanDetail.statusNoEvidence': 'No evidence',
+  'scanDetail.coverage': 'Engine coverage',
+  'scanDetail.coverageCount': 'This verdict was reached on {reported} of {expected} engines.',
+  'scanDetail.coverageIncompleteHint':
+    "The engines below did not deliver a result for this scan. Their findings were discarded and the verdict was computed as though they had found nothing, so the real severity may be higher than the conclusion above.",
+  'scanDetail.coverageNotApplicable':
+    '{count} further engine(s) are not run by this deployment at all, and are excluded from the count above rather than counted as missing:',
+  'scanDetail.coverageBasisCurrentConfig':
+    "That exclusion is based on the CURRENT configuration (the disabled set and LLM endpoint state as read just now), not on the configuration in force when this scan ran - nothing recorded that.",
+  'scanDetail.coverageUnrecorded':
+    'No per-engine record was retained for this scan (dead-lettered before scoring, older than the engine-health retention window, or scanned before that record existed), so whether the evidence was complete cannot be stated - which is not the same as "every engine reported".',
   'scanDetail.findings': 'Findings ({count})',
   'scanDetail.noFindings': 'No findings.',
   'scanDetail.colRule': 'Rule',

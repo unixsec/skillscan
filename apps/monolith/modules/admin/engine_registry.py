@@ -51,6 +51,7 @@ __all__ = [
     "not_reported_attribution",
     "not_reported_attribution_basis",
     "set_engine_enabled",
+    "structurally_absent_engine_names",
 ]
 
 #: Why a listed engine has no `version`. The monolith cannot reach a sandbox
@@ -208,6 +209,40 @@ def llm_unconfigured_engine_names(*, sandbox_llm_configured: bool) -> frozenset[
     if sandbox_llm_configured:
         return frozenset()
     return llm_gated_engine_names()
+
+
+def structurally_absent_engine_names(
+    *, disabled: frozenset[str], llm_unconfigured: frozenset[str]
+) -> frozenset[str]:
+    """The engines TODAY'S configuration says this deployment does not run.
+
+    THE SAME two authorities `not_reported_attribution` names, and deliberately
+    the same union rather than a second opinion about it: this is the set that
+    `orchestration.engine_health.summarize_scan_coverage` subtracts from a
+    scan's expected engines, so if it disagreed with the attribution the console
+    prints beside it, one scan would carry "this engine is disabled" next to
+    "this engine is missing evidence" - two statements about one engine that
+    cannot both be acted on. One function, both consumers.
+
+    WHY A COVERAGE READ NEEDS IT AT ALL (2026-07-30). `aig-mcp-scan` is LLM-gated
+    and has a `not_reported` row on every scan of any deployment without an
+    internal endpoint - 290 of 290 on the run this feature came from. Counting
+    that as missing evidence would publish "incomplete" on every scan forever,
+    and a warning that is always on trains operators to ignore the one that
+    matters. Excluding it makes the flag mean something.
+
+    ITS TENSE IS STILL UNPROVEN, which is the whole reason
+    `engine_health.COVERAGE_BASIS_CURRENT_CONFIG` has to travel with any number
+    computed from this set: read at request time, not at scan time. An engine
+    disabled this morning explains nothing about last week's scans, and the
+    honest framing is "today's configuration would predict this", never "this is
+    what happened".
+
+    NOT ordered or prioritised, unlike `not_reported_attribution`: a coverage
+    read only asks whether the engine is in the set, so the reason it is in it -
+    and which reason outranks which - is that function's business alone.
+    """
+    return disabled | llm_unconfigured
 
 
 def not_reported_attribution(

@@ -228,8 +228,9 @@ def tier_direction(policy: GatePolicy, *, requested: str | None, judged: str | N
 
     LIVES HERE, not in `gateway.router` where Task 14 first wrote it (Task 18):
     two surfaces now disclose the divergence - the console's
-    `GET /v1/scans/{scan_id}` and the marketplace's `GET /v1/market/scans/
-    {scan_id}` - and `marketplace_api` is a deliberate anti-corruption layer
+    `GET /v1/scans/{scan_id}` and the marketplace's
+    `GET /v1/market/skills/{skill_id}` - and `marketplace_api` is a deliberate
+    anti-corruption layer
     that must not import another surface's HTTP router to reach a private
     helper. `gate` is the module that owns applying `GatePolicy`, both callers
     already depend on it, and this function touches no ORM class, so it costs

@@ -24,7 +24,20 @@ const SRC_DIR = path.dirname(fileURLToPath(import.meta.url))
 // Any object shape carrying engine-health enums - see api/types.ts. A file
 // that never mentions one has nothing to get wrong, which is what keeps this
 // from firing on unrelated code.
-const HEALTH_CARRYING_TYPES = ['EngineHealth', 'EngineHealthReport']
+//
+// 2026-07-30: `ScanEngineCoverage` / `ScanEngineCoverageEntry` are the SECOND
+// backend surface carrying `report_state` + `engine_status` (per-scan coverage,
+// with unprefixed field names), and `EngineObservation` is the shape
+// engineHealth.ts now renders. Added here BY HAND, because this list is exactly
+// the kind of sibling registry this codebase has repeatedly failed to update
+// alongside a new producer - and a guard whose scope filter misses the new file
+// passes forever.
+const HEALTH_CARRYING_TYPES = [
+  'EngineHealth',
+  'EngineHealthReport',
+  'EngineObservation',
+  'ScanEngineCoverage',
+]
 
 // The one legitimate way to put these values on screen.
 const SAFE_APIS = ['EngineHealthBadge', 'engineHealthLabel']
@@ -110,10 +123,10 @@ describe('no engine-health enum is rendered outside EngineHealthBadge/engineHeal
 
   // Sanity floor, same as the lifecycle guard's: if the scope filter ever
   // matches nothing (the types got renamed), every assertion below would pass
-  // trivially on an empty list. admin/Engines.tsx and components/Badge.tsx
-  // account for two today.
+  // trivially on an empty list. admin/Engines.tsx, components/Badge.tsx and
+  // pages/ScanDetail.tsx account for three today.
   it('found at least the known engine-health-carrying files', () => {
-    expect(files.length).toBeGreaterThanOrEqual(2)
+    expect(files.length).toBeGreaterThanOrEqual(3)
   })
 
   it.each(files.map((f) => [path.relative(SRC_DIR, f), f] as const))(

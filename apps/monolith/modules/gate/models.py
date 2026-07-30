@@ -29,6 +29,26 @@ class VerdictRow(Base):
     effective_severity: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     score: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    # SECURITY (2026-07-30): was this BLOCK the INV-1 fail-closed answer to an
+    # INCOMPLETE scan (a required engine missing or failed), rather than a
+    # decision about content that was actually examined? Written from
+    # `VerdictResult.fail_closed`, which `skillscan_core.gate.decide` sets on
+    # exactly one branch.
+    #
+    # It exists because the previous answer was INFERRED - "a verdict with no
+    # ScanResultRow" - and that inference only holds for the dead-letter path.
+    # The collector path writes a result row (`required_ok=False`) and its
+    # fail-closed BLOCKs therefore reported `fail_closed: false`; on a real
+    # 226-package run that was 17 of the 18 BLOCKs.
+    #
+    # NOT NULL, backfilled exactly (see db/migrations/versions/
+    # a1f4c7b2e903_*.py: the marker string is one gate wrote itself into
+    # `reasons`, not a repurposed field). The ORM-side `default=False` is for
+    # test fixtures that build a verdict row directly; the one production writer
+    # (`service.decide_and_record`) always passes the real value, and the value
+    # it passes cannot be forgotten because `VerdictResult.fail_closed` is a
+    # required field with no default of its own.
+    fail_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     issued_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=False), nullable=False)
 
 

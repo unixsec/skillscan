@@ -79,8 +79,11 @@ class ScanSubmitterRow(Base):
     """Who is authorized to read one scan (里程碑 B' review, C2).
 
     SECURITY: object-level authorization for `GET /v1/scans/{scan_id}`,
-    `.../sarif`, `GET /v1/scans` and `GET /v1/market/scans/{scan_id}` is
-    membership in THIS table, not equality against `ScanJob.submitter`.
+    `.../sarif` and `GET /v1/scans` is membership in THIS table, not equality
+    against `ScanJob.submitter`. (The marketplace poll used this too until
+    2026-07-30; it is keyed on `skill_id` now and authorizes on `skill.owner` -
+    see `inventory.ownership.authorize_skill_read`. The console paths below are
+    unchanged and are why this table still exists.)
     `submit_scan` is single-flight on `cache_key`, so a second caller
     submitting byte-identical content under the same toolchain is handed the
     FIRST caller's scan_job - and was then refused it, permanently, because
@@ -89,7 +92,7 @@ class ScanSubmitterRow(Base):
     `ScanJob.submitter` is kept as the FIRST submitter: it is what the scan
     list displays, and the trust tier the verdict was judged at is that
     submission's (the adjudication is not redone for a later arrival, so the
-    tier must not be reattributed either - see `views.project_scan`'s
+    tier must not be reattributed either - see `views.project_skill_verdict`'s
     `judged_at_tier`).
 
     Append-only by design, and granted INSERT+SELECT only: revoking a

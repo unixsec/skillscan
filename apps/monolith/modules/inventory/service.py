@@ -523,6 +523,46 @@ async def skill_id_for_content(session: AsyncSession, *, content_hash: str) -> s
     return None if skill_id is None else str(skill_id)
 
 
+async def latest_skill_version_hashes(session: AsyncSession, *, skill_id: str) -> tuple[str, ...]:
+    """The content_hash(es) of this skill's NEWEST version, by `created_at`.
+
+    The first link of the skill-keyed marketplace poll (2026-07-30): skill_id ->
+    latest version -> that version's verdict. It lives here because `inventory` owns
+    `skill_version`, and it is keyed the way the question is asked, unlike
+    `reeval.reconciliation._currency`, which answers a similar "which one is
+    current" question but is keyed on `content_hash` and is fed by
+    `gate.service.list_issued_verdicts` - a full-ledger read, unacceptable behind a
+    polled endpoint.
+
+    SECURITY - WHY A TUPLE INSTEAD OF "the latest one". `skill_version.created_at`
+    is a MySQL DATETIME with no fractional seconds, so two DIFFERENT versions of one
+    skill registered in the same second are an EXACT tie. Any tiebreak this function
+    invented (lowest content_hash, driver order) would be choosing between a PASS
+    and a BLOCK arbitrarily, and submission timing is caller-controlled - "publish
+    v2 alongside v1 within one second and take whichever answer comes back safe" is
+    a bypass, not a corner case. So ties are returned intact and the caller resolves
+    them fail-closed, by answering with the LEAST safe candidate. Same spirit as
+    `_currency`'s "on an EXACT tie the non-PASS verdict wins".
+
+    Normal case: exactly one element. Empty tuple when the skill has no versions
+    recorded at all (registered but never submitted) - a state the caller must
+    report as "nothing judged yet", never as safe.
+
+    Plain values, never ORM rows - the `RegisteredSkill` rule above.
+    """
+    newest = (
+        select(func.max(SkillVersionRow.created_at))
+        .where(SkillVersionRow.skill_id == skill_id)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        select(SkillVersionRow.content_hash)
+        .where(SkillVersionRow.skill_id == skill_id, SkillVersionRow.created_at == newest)
+        .order_by(SkillVersionRow.content_hash)
+    )
+    return tuple(str(content_hash) for content_hash in result.scalars())
+
+
 async def lifecycle_position_for_content(
     session: AsyncSession, *, content_hash: str
 ) -> LifecyclePosition | None:

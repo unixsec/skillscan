@@ -95,6 +95,10 @@ async def decide_and_record(
             effective_severity=int(verdict_result.effective_severity),
             score=verdict_result.score,
             reasons=reasons,
+            # SECURITY (2026-07-30): the gate's OWN answer, persisted, rather
+            # than something a reader reconstructs from which other rows happen
+            # to exist. See `VerdictRow.fail_closed`.
+            fail_closed=verdict_result.fail_closed,
             issued_at=_naive_utcnow(),
         )
     )
@@ -305,7 +309,8 @@ async def get_verdict_view(session: AsyncSession, *, scan_id: str) -> dict[str, 
     project, and gets plain values rather than a `VerdictRow` and rather than
     a licence to `select()` against gate's private table itself.
 
-    The key names are the ones `marketplace_api.views.project_scan` reads.
+    The key names are the ones `marketplace_api.views.project_skill_verdict`
+    reads.
     `issued_at` is serialized here (naive-UTC `.isoformat()`, the convention
     every other router in this codebase uses) because `views` is a pure
     function with no clock and no I/O - handing it a `datetime` would push a
@@ -315,6 +320,12 @@ async def get_verdict_view(session: AsyncSession, *, scan_id: str) -> dict[str, 
     `reasons`. They are internal adjudication detail (spec §5.3) - anything
     returned here is one `views` change away from being part of the external
     contract, so the narrow set is the safe default.
+
+    `fail_closed` IS included (2026-07-30). It is not adjudication detail but a
+    fact about the answer being handed over - "this BLOCK means we could not
+    complete the scan", which the external surface already published as a field
+    and, until this column existed, published WRONGLY: it was inferred from the
+    absence of a `ScanResultRow`, a signature only the dead-letter path has.
     """
     row = (
         await session.execute(select(VerdictRow).where(VerdictRow.scan_id == scan_id))
@@ -327,6 +338,7 @@ async def get_verdict_view(session: AsyncSession, *, scan_id: str) -> dict[str, 
         "policy_version": row.policy_version,
         "issued_at": row.issued_at.isoformat(),
         "jws_signature": row.jws_signature,
+        "fail_closed": bool(row.fail_closed),
     }
 
 

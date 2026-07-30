@@ -1,5 +1,5 @@
 import type { Translate } from './i18n/reasons'
-import type { EngineHealth, EngineInfo } from './api/types'
+import type { EngineHealth, EngineInfo, ScanEngineCoverageEntry } from './api/types'
 
 // Display rules for the admin engine console (milestone C Task 10).
 //
@@ -16,6 +16,50 @@ import type { EngineHealth, EngineInfo } from './api/types'
 // backend enum" becomes a mechanical check instead of something code review
 // has to catch - which it demonstrably does not (c7e9bcd, then again in the
 // same session).
+
+// The minimal shape every renderer below actually reads: the acceptance-
+// criterion-8 pair plus Task 7's duration.
+//
+// WHY THIS TYPE EXISTS (2026-07-30). There are now TWO backend surfaces
+// carrying these three values - the admin window summary
+// (`GET /v1/admin/engines/health`, fields prefixed `last_`) and per-scan
+// coverage (`GET /v1/scans/{id}.engine_coverage.engines`, unprefixed, because
+// on one scan there is no "last"). Teaching this module a second set of field
+// names would have meant a second `not_reported`-vs-`unobserved` decision, a
+// second duration three-state, a second badge-class table - which is exactly
+// the "sibling registry never updated" defect shape milestone D produced five
+// times. One shape, one state machine, an adapter at the window call site.
+export interface EngineObservation {
+  report_state: string
+  engine_status: string | null
+  analyze_duration_ms: number | null
+  // Only per-scan coverage carries this; the window summary's adapter supplies
+  // it from `EngineHealth`. Optional so a caller that has no attribution to
+  // offer cannot be forced to invent one.
+  not_reported_attribution?: string | null
+}
+
+// `EngineHealth` -> the shape above. The `last_*` prefix stops here.
+export function windowObservation(health: EngineHealth): EngineObservation {
+  return {
+    report_state: health.last_report_state,
+    engine_status: health.last_engine_status,
+    analyze_duration_ms: health.last_analyze_duration_ms,
+    not_reported_attribution: health.not_reported_attribution,
+  }
+}
+
+// A per-scan coverage row is already the right shape - this only narrows it, so
+// a page cannot accidentally pass the whole entry where an observation is meant
+// and have `name`/`coverage` silently ride along into a renderer.
+export function coverageObservation(entry: ScanEngineCoverageEntry): EngineObservation {
+  return {
+    report_state: entry.report_state,
+    engine_status: entry.engine_status,
+    analyze_duration_ms: entry.analyze_duration_ms,
+    not_reported_attribution: entry.not_reported_attribution,
+  }
+}
 
 // The console's vocabulary for "what happened to this engine last time".
 // Derived from the backend's TWO fields plus one state the backend cannot
@@ -38,12 +82,12 @@ export type EngineHealthState =
   // A report_state/engine_status pair this console has not been taught.
   | 'unknown'
 
-export function engineHealthState(health: EngineHealth | undefined): EngineHealthState {
+export function engineHealthState(health: EngineObservation | undefined): EngineHealthState {
   if (!health) return 'unobserved'
-  if (health.last_report_state === 'not_reported') return 'not_reported'
-  if (health.last_report_state === 'unreadable') return 'unreadable'
-  if (health.last_report_state !== 'reported') return 'unknown'
-  switch (health.last_engine_status) {
+  if (health.report_state === 'not_reported') return 'not_reported'
+  if (health.report_state === 'unreadable') return 'unreadable'
+  if (health.report_state !== 'reported') return 'unknown'
+  switch (health.engine_status) {
     case 'ok':
       return 'ok'
     case 'partial':
@@ -78,10 +122,10 @@ export const ENGINE_HEALTH_BADGE_CLASS: Record<EngineHealthState, string> = {
 // Translate-or-echo, the same posture as scanStateLabel/reasonLabel: a state
 // the backend grows before this console learns it still shows the raw wire
 // value rather than a bare translation key or an empty cell.
-export function engineHealthLabel(t: Translate, health: EngineHealth | undefined): string {
+export function engineHealthLabel(t: Translate, health: EngineObservation | undefined): string {
   const state = engineHealthState(health)
   if (state === 'unknown' && health) {
-    return health.last_engine_status ?? health.last_report_state
+    return health.engine_status ?? health.report_state
   }
   const key = `engineHealth.${state}`
   const translated = t(key)
@@ -109,27 +153,27 @@ export type EngineDurationDisplay =
   // the data cannot distinguish them and this display does not pretend to.
   | { kind: 'no_run' }
 
-export function engineDurationDisplay(health: EngineHealth | undefined): EngineDurationDisplay {
+export function engineDurationDisplay(health: EngineObservation | undefined): EngineDurationDisplay {
   if (!health) return { kind: 'no_run' }
   // An unreadable blob is EVIDENCE THAT THE ENGINE RAN - something wrote a
   // result and it could not be trusted (aggregate.EngineReportState.UNREADABLE
   // is separate from NOT_REPORTED for exactly that reason). This used to fall
   // into `no_run` beside "never reported", which downgraded a "the engine ran
   // and we lost its output" incident into a blank cell.
-  if (health.last_report_state === 'unreadable') {
+  if (health.report_state === 'unreadable') {
     return { kind: 'not_measured', reason: 'unreadable_result' }
   }
-  if (health.last_report_state !== 'reported') return { kind: 'no_run' }
+  if (health.report_state !== 'reported') return { kind: 'no_run' }
   // `=== null`, never a falsy test: `0` is a real measurement and `!ms` would
   // silently reclassify every floor engine as unmeasured.
-  if (health.last_analyze_duration_ms === null) {
+  if (health.analyze_duration_ms === null) {
     return { kind: 'not_measured', reason: 'no_duration_field' }
   }
-  if (health.last_analyze_duration_ms === 0) return { kind: 'sub_millisecond' }
-  return { kind: 'measured', ms: health.last_analyze_duration_ms }
+  if (health.analyze_duration_ms === 0) return { kind: 'sub_millisecond' }
+  return { kind: 'measured', ms: health.analyze_duration_ms }
 }
 
-export function engineDurationLabel(t: Translate, health: EngineHealth | undefined): string {
+export function engineDurationLabel(t: Translate, health: EngineObservation | undefined): string {
   const display = engineDurationDisplay(health)
   switch (display.kind) {
     case 'measured':
@@ -152,8 +196,14 @@ export function engineDurationLabel(t: Translate, health: EngineHealth | undefin
 // sub-millisecond 0 rendered `<1 ms` with no path to the 4756 ms worst case in
 // the very same window - the number an operator sizing a scan deadline needs,
 // and the only place it is published.
+//
+// STILL TAKES `EngineHealth`, not `EngineObservation`, and that is the point of
+// the split: `max_analyze_duration_ms` / `measured_duration_count` are facts
+// about a WINDOW of scans, and there is no honest per-scan value for them. A
+// single scan's coverage row has no worst case to report, so this hint is
+// simply not shown there rather than being fed a fabricated one.
 export function engineDurationHint(t: Translate, health: EngineHealth | undefined): string {
-  const display = engineDurationDisplay(health)
+  const display = engineDurationDisplay(health && windowObservation(health))
   const parts: string[] = []
   if (display.kind === 'sub_millisecond') {
     parts.push(t('adminEngines.duration.subMillisecondHint'))
@@ -188,10 +238,10 @@ export function engineDurationHint(t: Translate, health: EngineHealth | undefine
 // `unobserved` engine would be a claim about scans nobody has.
 export function notReportedAttributionLabel(
   t: Translate,
-  health: EngineHealth | undefined,
+  health: EngineObservation | undefined,
 ): string | null {
   if (engineHealthState(health) !== 'not_reported' || !health) return null
-  const attribution = health.not_reported_attribution
+  const attribution = health.not_reported_attribution ?? null
   // THE HONEST ANSWER for three of the five causes (never dispatched, still
   // running past the wait, crashed before writing). Saying "cause not
   // recorded" costs an operator nothing; a guess that looks like an
@@ -211,7 +261,7 @@ export function notReportedAttributionLabel(
 
 export function notReportedAttributionHint(
   t: Translate,
-  health: EngineHealth | undefined,
+  health: EngineObservation | undefined,
 ): string {
   if (engineHealthState(health) !== 'not_reported' || !health) return ''
   const attribution = health.not_reported_attribution ?? 'unknown'

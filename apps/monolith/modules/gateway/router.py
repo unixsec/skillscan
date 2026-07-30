@@ -33,14 +33,21 @@ from typing import Any
 from common.frontmatter import parse_frontmatter
 from common.skill_package import root_skill_md_path
 from engine_runner.detectors.skill_permissions import declared_tools
-from engine_runner.normalizer import UnpackRejected, unpack_hardened
+from engine_runner.normalizer import UnpackRejected, unpack_package_archive
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
 from skillscan_core import TrustTier
 from skillscan_core import content_hash as compute_content_hash
 from skillscan_core import toolchain_digest as compute_toolchain_digest
 from sqlalchemy import select
 
-from monolith.modules.admin.engine_registry import filter_enabled_engines
+from monolith.modules.admin.engine_registry import (
+    filter_enabled_engines,
+    list_disabled_engines,
+    llm_unconfigured_engine_names,
+    not_reported_attribution,
+    not_reported_attribution_basis,
+    structurally_absent_engine_names,
+)
 from monolith.modules.gate.models import VerdictRow
 from monolith.modules.gate.policy import tier_divergence
 from monolith.modules.gateway.auth.dependencies import require_csrf, require_human_role
@@ -55,6 +62,12 @@ from monolith.modules.inventory.service import (
     register_skill_version,
     skill_id_for_content,
     transition_skill,
+)
+from monolith.modules.orchestration.engine_health import (
+    COVERAGE_BASIS_CURRENT_CONFIG,
+    EngineCoverageEntry,
+    ScanEngineCoverage,
+    load_scan_engine_coverage,
 )
 from monolith.modules.orchestration.models import ScanJob, ScanResultRow, ScanSubmitterRow
 from monolith.modules.orchestration.service import (
@@ -137,7 +150,10 @@ async def create_scan(
             ) from exc
     raw = await package.read()
     try:
-        files = unpack_hardened(raw)
+        # tar or zip, dispatched on magic bytes (2026-07-30): the zip side is a
+        # bounded transcode in FRONT of the hardened unpacker, so an upload of
+        # either format faces the identical checks - see normalizer.py.
+        files = unpack_package_archive(raw)
     except UnpackRejected as exc:
         # SECURITY: hardening rejections (oversized/malformed/traversal/
         # symlink/decompression-bomb) are all a 400, and the specific reason
@@ -495,6 +511,102 @@ async def create_scan(
     return {"scan_id": scan_id}
 
 
+def _engine_coverage_to_dict(
+    coverage: ScanEngineCoverage, *, disabled: frozenset[str], llm_unconfigured: frozenset[str]
+) -> dict[str, Any]:
+    """WHICH engines did not report on this scan, for the console's scan detail.
+
+    A DIFFERENT SHAPE from the marketplace's, on purpose. That surface gets
+    counts and a boolean because a machine consumer branches on them; a human
+    reading one scan needs the names, so this carries `engines`. Both are
+    computed from the same `ScanEngineCoverage`, and `complete` is that object's
+    own property, so the two surfaces cannot drift into two definitions of
+    completeness.
+
+    Also NOT `reporting.service.build_engine_coverage`, despite the name: that
+    one is deployment-level (the engines lock joined against the disabled set)
+    and answers "what does this installation run". This is per-scan and answers
+    "what actually delivered on THIS scan".
+
+    Only the engines that did NOT deliver are listed. The delivering ones are
+    already visible - they are what the by-engine breakdown on the same page is
+    built from - and repeating fifteen rows on every scan would bury the two
+    that matter.
+
+    `report_state` and `engine_status` stay TWO fields (acceptance criterion 8),
+    so `web/src/engineHealth.ts` renders this with the six-state machine it
+    already has. `analyze_duration_ms` keeps Task 7's three states verbatim: a
+    timed-out engine has a real measured duration, and `0` is a measurement too.
+
+    No `error` text - see `EngineCoverageEntry`. This endpoint is
+    `_submitter_or_above`, which includes reviewers reading someone else's
+    package; an engine's raw error message can quote the scanned bytes, and it
+    is already published on the admin-only health endpoint for operators who
+    need it.
+    """
+    return {
+        "expected": coverage.expected,
+        "reported": coverage.reported,
+        "not_applicable": coverage.not_applicable,
+        # bool | null - `null` means this scan has no per-engine record at all
+        # (dead-lettered, swept by Task 9's retention, or scored before the
+        # table existed). Never `true`: "0 of 0 missing" would be the strongest
+        # claim on the weakest evidence.
+        "complete": coverage.complete,
+        # The caveat, on the wire rather than only in the console's translated
+        # hints - `expected` was computed by subtracting engines TODAY'S config
+        # says this deployment does not run, and nothing recorded the config the
+        # scan ran under. Same posture as
+        # `engine_registry.not_reported_attribution_basis`.
+        "basis": COVERAGE_BASIS_CURRENT_CONFIG if coverage.observed else None,
+        "engines": [
+            {
+                "name": entry.engine_name,
+                "report_state": entry.report_state,
+                "engine_status": entry.engine_status,
+                "analyze_duration_ms": entry.analyze_duration_ms,
+                # `missing` vs `not_applicable`: the console must not render a
+                # structurally-absent engine as a fault. `aig-mcp-scan` is
+                # `not_reported` on 100% of scans of any deployment with no LLM
+                # endpoint, and a red row on every single scan forever would
+                # train operators to ignore the ones that mean something.
+                "coverage": entry.coverage.value,
+                # Only for a row where genuinely nothing arrived, and only the
+                # two of five causes with a readable authority - the guard
+                # `admin.router._engine_health_to_dict` already applies. A
+                # `reported`+`timeout` row is EVIDENCE the engine ran here, so
+                # no configuration-based cause is offered for it at all.
+                **_coverage_attribution(
+                    entry, disabled=disabled, llm_unconfigured=llm_unconfigured
+                ),
+            }
+            for entry in coverage.entries
+        ],
+    }
+
+
+def _coverage_attribution(
+    entry: EngineCoverageEntry, *, disabled: frozenset[str], llm_unconfigured: frozenset[str]
+) -> dict[str, Any]:
+    if entry.report_state != "not_reported":
+        return {"not_reported_attribution": None, "not_reported_attribution_basis": None}
+    attribution = not_reported_attribution(
+        entry.engine_name,
+        disabled=disabled,
+        llm_unconfigured=llm_unconfigured,
+        # ZERO, and it is not a placeholder: that parameter exists to withdraw
+        # the LLM prediction when the engine-runner's own delivered result
+        # disproves it, and on a single scan the only evidence available is this
+        # row - which says nothing arrived. An engine that DID deliver here is
+        # not in `coverage.entries` under a `not_reported` state at all.
+        reported_in_window=0,
+    )
+    return {
+        "not_reported_attribution": attribution,
+        "not_reported_attribution_basis": not_reported_attribution_basis(attribution),
+    }
+
+
 @router.get("/scans/{scan_id}")
 async def get_scan(
     scan_id: str,
@@ -536,6 +648,30 @@ async def get_scan(
         result_row = (
             await db_session.execute(select(ScanResultRow).where(ScanResultRow.scan_id == scan_id))
         ).scalar_one_or_none()
+
+        # 2026-07-30 per-scan engine coverage. Read AFTER the authorization
+        # branch above, deliberately: it is disclosure about a scan the caller
+        # has already been allowed to read, and nothing here may become part of
+        # deciding whether they may.
+        #
+        # `required_ok` right below is NOT this fact. It covers
+        # `GatePolicy.required_engines` only - the floor, which fails closed. On
+        # a 290-scan real-world run 17 of 18 BLOCKs were exactly that and the
+        # mechanism works. Every OTHER engine fails open: its findings are
+        # discarded and the verdict is computed on what remains. Complete-evidence
+        # scans came back 60% REVIEW, incomplete ones 29%, and until this field
+        # the page said nothing at all about the difference.
+        disabled_engines = await list_disabled_engines(runtime.redis)
+        llm_unconfigured = llm_unconfigured_engine_names(
+            sandbox_llm_configured=runtime.sandbox_llm_configured
+        )
+        coverage = await load_scan_engine_coverage(
+            db_session,
+            scan_id=scan_id,
+            structurally_absent=structurally_absent_engine_names(
+                disabled=disabled_engines, llm_unconfigured=llm_unconfigured
+            ),
+        )
 
         # 里程碑 F Task 2: every authorized reader (see `is_scan_submitter`
         # above), not just `job.submitter` (the FIRST submitter only - see
@@ -599,6 +735,14 @@ async def get_scan(
         "findings": result_row.findings if result_row is not None else [],
         "provenance": result_row.provenance if result_row is not None else [],
         "required_ok": result_row.required_ok if result_row is not None else None,
+        # 2026-07-30. `required_ok` above is the FLOOR's answer and it fails
+        # closed; this is every other engine's, and they fail open. Always an
+        # object (never null) so a consumer's parse does not have to branch on
+        # shape - `complete: null` inside it is how "no per-engine record" is
+        # said. See `_engine_coverage_to_dict`.
+        "engine_coverage": _engine_coverage_to_dict(
+            coverage, disabled=disabled_engines, llm_unconfigured=llm_unconfigured
+        ),
         "hard_gate_hits": result_row.hard_gate_hits if result_row is not None else [],
         "reasons": verdict_row.reasons if verdict_row is not None else [],
         "sarif_ref": f"/v1/scans/{scan_id}/sarif",
@@ -607,8 +751,8 @@ async def get_scan(
         #
         # `judged_at_tier` is unchanged - `ScanJob.trust_tier`, the tier the
         # verdict was actually adjudicated at, the same column
-        # `orchestration.service.get_scan_state_and_tier` serves to
-        # `marketplace_api.views.project_scan`. `trust_tier` is now what THIS
+        # `orchestration.service.latest_scan_identities_for_content` serves to
+        # `marketplace_api.views.project_skill_verdict`. `trust_tier` is now what THIS
         # caller asked for, read from their own `scan_submitter` row.
         #
         # They diverge exactly when single-flight dedup hands a later submitter

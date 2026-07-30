@@ -113,6 +113,79 @@ export interface ScanDetail {
   // behind `source`. `source: null` on an entry means that row records no
   // channel; it is passed through verbatim rather than defaulted.
   submitter_sources: SubmitterSource[]
+  // 2026-07-30: how much of the engine evidence this verdict was reached on.
+  //
+  // `required_ok` above covers `GatePolicy.required_engines` only - the floor,
+  // which FAILS CLOSED. Every other engine fails OPEN: its findings are
+  // discarded and the verdict is computed as though it found nothing. On a
+  // 290-scan real-world run, complete-evidence scans came back 60% REVIEW and
+  // incomplete ones 29%, so the difference is not theoretical.
+  //
+  // Always an object, never null - a response whose SHAPE changes with the data
+  // is what a consumer silently mis-parses. "No record" is said inside it, as
+  // `complete: null`.
+  engine_coverage: ScanEngineCoverage
+}
+
+// GET /v1/scans/{id}.engine_coverage
+export interface ScanEngineCoverage {
+  // Engines whose evidence this verdict was supposed to include. ALREADY
+  // EXCLUDES engines this deployment does not run (those are in
+  // `not_applicable`), which is why it can differ between deployments.
+  expected: number
+  // Of `expected`, how many delivered a usable result.
+  reported: number
+  // Excluded from `expected` because this deployment does not run them at all.
+  // Published rather than silently subtracted: `expected` shrinking from 15 to
+  // 14 with no accounting is how a coverage number becomes unfalsifiable.
+  not_applicable: number
+  // THREE-valued. `null` means this scan has no per-engine record at all - a
+  // dead-lettered scan (which never aggregates, so it writes none), one older
+  // than the health-table retention window, or one scored before that table
+  // existed. Never `true` in that case: "0 of 0 engines missing, therefore
+  // complete" is the strongest possible claim on the weakest possible evidence.
+  complete: boolean | null
+  // 'current_config' whenever there is a coverage answer, null otherwise.
+  // `expected` was computed by subtracting engines TODAY'S configuration says
+  // this deployment does not run, and nothing recorded the configuration the
+  // scan actually ran under - so an engine disabled this morning would make
+  // last week's scans read complete. Same caveat, same wording, as
+  // `EngineHealth.not_reported_attribution_basis`.
+  basis: string | null
+  // ONLY the engines that did NOT deliver, in name order. The delivering ones
+  // are what the by-engine breakdown on the same page is built from; repeating
+  // all fifteen on every scan would bury the two that matter.
+  engines: ScanEngineCoverageEntry[]
+}
+
+export interface ScanEngineCoverageEntry {
+  name: string
+  // The acceptance-criterion-8 pair, unmerged, exactly as `EngineHealth`
+  // carries it - see there, and never render either raw (engineHealth.ts owns
+  // both). Unprefixed rather than `last_*` because on ONE scan there is no
+  // "last". `coverageObservation` narrows this to what those renderers read.
+  report_state: string
+  engine_status: string | null
+  // Task 7's three states survive here too: an int is measured, `0` is ALSO
+  // measured, `null` is not measured. A TIMED-OUT engine has a real measured
+  // duration - the airlock timed the run it cut short - so this is not
+  // redundant with the state.
+  analyze_duration_ms: number | null
+  // 'missing' - expected here and its findings are not in the verdict, with no
+  //   readable cause. This is what moves `complete`.
+  // 'not_applicable' - this deployment does not run the engine at all. Listed
+  //   so the absence is visible, but NOT a fault: `aig-mcp-scan` reads
+  //   not_reported on 100% of scans of any deployment with no LLM endpoint, and
+  //   a red row on every scan forever teaches operators to ignore the signal.
+  coverage: 'missing' | 'not_applicable'
+  // Only ever set for a row where genuinely nothing arrived, and only for the
+  // two of five causes with a readable authority. A `reported` row is EVIDENCE
+  // the engine ran on this scan, so no configuration-based cause is offered for
+  // it at all. Null means the cause is not knowable - said out loud, not guessed.
+  not_reported_attribution: string | null
+  // 'current_config' whenever an attribution is present. On the wire, not only
+  // in this console's hints, for the same reason it is on the admin endpoint.
+  not_reported_attribution_basis: string | null
 }
 
 export interface SubmitterSource {

@@ -12,6 +12,7 @@ import { useToast } from '../components/Toast'
 import { ScoreBadge, VerdictBadge } from '../components/Badge'
 import { hasAnyRole, useSession } from '../auth/SessionContext'
 import { useI18n } from '../i18n/I18nContext'
+import { ingestErrorMessage } from '../i18n/ingestErrors'
 import { submitterNames } from '../api/types'
 import type { InventoryDetail, ScanSummary } from '../api/types'
 import { ScanDetailContent } from './ScanDetail'
@@ -37,6 +38,13 @@ const PAGE_SIZE = 50
 // short enough that the answer arrives before the user reaches the tier
 // control.
 const SKILL_LOOKUP_DEBOUNCE_MS = 400
+
+// What `POST /v1/scans` accepts: tar (any compression `tarfile` opens with
+// "r:*") and, since 2026-07-30, zip - both marketplaces this system integrates
+// with distribute zip. Extensions plus MIME types, because a browser's file
+// dialog filters on whichever of the two the platform understands.
+const ARCHIVE_ACCEPT =
+  '.tar,.tar.gz,.tgz,.tar.bz2,.tbz2,.tar.xz,.zip,application/x-tar,application/gzip,application/zip'
 
 export function ScansPage() {
   const { t } = useI18n()
@@ -186,7 +194,13 @@ export function ScansPage() {
       else setPage(1)
       toast.success(t('scans.submitSucceeded'))
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.detail : t('scans.submitFailed'))
+      // `ingestErrorMessage` translates the archive-rejection 400 and returns
+      // every other detail unchanged - a 403/409/503 from this endpoint is
+      // already a sentence, and inventing a translation for a string it does not
+      // recognize is how a confidently wrong message gets shown.
+      toast.error(
+        err instanceof ApiError ? ingestErrorMessage(t, err.detail) : t('scans.submitFailed'),
+      )
     } finally {
       setSubmitting(false)
     }
@@ -196,7 +210,17 @@ export function ScansPage() {
     <div>
       <h1>{t('scans.title')}</h1>
       <form className="inline-form" onSubmit={handleSubmit}>
-        <FileField label={t('scans.packageLabel')} file={file} onSelect={setFile} />
+        {/* `accept` was missing entirely (the component has always supported
+            it), so the native dialog offered every file on disk for an endpoint
+            that takes exactly two container formats. A hint only - the backend
+            dispatches on MAGIC BYTES and never on the filename, so a renamed
+            file is still judged by what it actually is. */}
+        <FileField
+          label={t('scans.packageLabel')}
+          accept={ARCHIVE_ACCEPT}
+          file={file}
+          onSelect={setFile}
+        />
         <label>
           {t('scans.skillIdLabel')}
           <input
