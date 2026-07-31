@@ -32,16 +32,23 @@ SECURITY:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
-import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 import redis.asyncio as aioredis
 from common.log import get_logger
+from common.password import DUMMY_HASH
+
+# Explicit re-export (`X as X`): mypy's strict mode treats a plain
+# `from ... import X` as private, and these two are part of THIS module's public
+# surface - admin routes, tests and operator runbooks all import
+# `hash_password` from here. Moving where they are defined must not move where
+# they are imported from.
+from common.password import hash_password as hash_password
+from common.password import verify_password as verify_password
+from common.redis_window_counter import incr_in_window, read_in_window
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,12 +58,6 @@ from monolith.modules.gateway.auth.middleware import session_ttl_from_env
 from .models import LocalAccountRow
 
 logger = get_logger(__name__)
-
-_SCRYPT_N = 2**14
-_SCRYPT_R = 8
-_SCRYPT_P = 1
-_SCRYPT_DKLEN = 32
-_SALT_BYTES = 16
 
 
 class LocalAuthError(Exception):
@@ -71,43 +72,12 @@ class LocalAccount:
     role: str
 
 
-def hash_password(password: str) -> str:
-    salt = secrets.token_bytes(_SALT_BYTES)
-    digest = hashlib.scrypt(
-        password.encode("utf-8"),
-        salt=salt,
-        n=_SCRYPT_N,
-        r=_SCRYPT_R,
-        p=_SCRYPT_P,
-        dklen=_SCRYPT_DKLEN,
-    )
-    return f"scrypt${salt.hex()}${digest.hex()}"
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    try:
-        scheme, salt_hex, digest_hex = password_hash.split("$")
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
-    except ValueError:
-        return False
-    if scheme != "scrypt":
-        return False
-    candidate = hashlib.scrypt(
-        password.encode("utf-8"),
-        salt=salt,
-        n=_SCRYPT_N,
-        r=_SCRYPT_R,
-        p=_SCRYPT_P,
-        dklen=len(expected),
-    )
-    return hmac.compare_digest(candidate, expected)
-
-
-# SECURITY: fixed at import time purely to give "unknown username" attempts
-# the same scrypt-verification cost as a real account - this hash protects
-# nothing and is never used to authenticate anyone.
-_DUMMY_HASH = hash_password(secrets.token_hex(16))
+# 2026-07-31: the scrypt primitives moved to `common.password` so the M2M
+# username/password path can share them (see that module for why they cannot
+# simply be imported from here). Re-exported rather than relocated-and-renamed:
+# `hash_password` is what operators are told to run to mint a password hash, and
+# it is imported from this module by admin routes, tests and prior runbooks.
+_DUMMY_HASH = DUMMY_HASH
 
 
 class LocalAccountStore(Protocol):
@@ -203,17 +173,22 @@ _LOCKOUT_WINDOW_S = 900  # 15 min
 
 
 async def _is_locked_out(redis: aioredis.Redis, username: str) -> bool:
-    count = await redis.get(f"{_FAIL_KEY_PREFIX}{username}")
-    if count is None:
-        return False
-    return int(count) >= _LOCKOUT_THRESHOLD
+    # Reads through the shared primitive rather than a plain GET because THIS is
+    # the path that has to repair a stranded counter: it returns before
+    # `_record_failure` ever runs, so if the read does not re-arm a missing
+    # expiry, nothing on the authentication path does and the lockout becomes
+    # permanent (correct password included). See common.redis_window_counter.
+    count, _ttl = await read_in_window(
+        redis, f"{_FAIL_KEY_PREFIX}{username}", window_s=_LOCKOUT_WINDOW_S
+    )
+    return count >= _LOCKOUT_THRESHOLD
 
 
 async def _record_failure(redis: aioredis.Redis, username: str) -> None:
-    key = f"{_FAIL_KEY_PREFIX}{username}"
-    new_count = await redis.incr(key)
-    if new_count == 1:
-        await redis.expire(key, _LOCKOUT_WINDOW_S)
+    # 2026-07-31: was `INCR` then a conditional `EXPIRE` - two round-trips, so a
+    # drop between them stranded the counter with no expiry and locked the
+    # account out forever.
+    await incr_in_window(redis, f"{_FAIL_KEY_PREFIX}{username}", window_s=_LOCKOUT_WINDOW_S)
 
 
 async def _clear_failures(redis: aioredis.Redis, username: str) -> None:

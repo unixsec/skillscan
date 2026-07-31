@@ -71,6 +71,44 @@ class TestCheckRateLimit:
         assert second_reject is not None
 
     @pytest.mark.asyncio
+    async def test_counter_left_without_ttl_recovers_instead_of_rejecting_forever(
+        self, redis_client: aioredis.Redis
+    ) -> None:
+        """A counter key that carries NO TTL must get one, not reject forever.
+
+        INCR and EXPIRE were two separate round-trips, so a connection drop or a
+        process restart between them left the key with no expiry at all. From
+        that moment the count only ever grows: every later request reads
+        `count > limit_per_min` and is rejected, and no window ever rolls over.
+        The service account is locked out PERMANENTLY and only deleting the key
+        by hand restores it.
+
+        The 429 is also actively misleading - `Retry-After` reports a fresh
+        window (`ttl <= 0 -> _WINDOW_S`), so the marketplace waits 60s, retries,
+        is rejected again, and loops indefinitely while our own logs look normal.
+        """
+        key = "skillscan:mkt:rate:mkt-stuck"
+        # The residue of a half-completed increment: a live count, no expiry.
+        await redis_client.set(key, 500)
+        assert await redis_client.ttl(key) == -1
+
+        await check_rate_limit(redis_client, service_account="mkt-stuck", limit_per_min=3)
+
+        assert await redis_client.ttl(key) > 0, (
+            "a counter with no expiry must be repaired, or this service account "
+            "stays rejected forever"
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_increment_always_leaves_an_expiry(
+        self, redis_client: aioredis.Redis
+    ) -> None:
+        """The window must be bounded the moment it opens - not one round-trip
+        later, where a crash can strand it (see the recovery test above)."""
+        await check_rate_limit(redis_client, service_account="mkt-fresh", limit_per_min=3)
+        assert await redis_client.ttl("skillscan:mkt:rate:mkt-fresh") > 0
+
+    @pytest.mark.asyncio
     async def test_different_service_accounts_are_independent(
         self, redis_client: aioredis.Redis
     ) -> None:

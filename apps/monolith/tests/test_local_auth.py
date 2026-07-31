@@ -195,6 +195,38 @@ class TestAuthenticateLocal:
         assert result_again == account
 
     @pytest.mark.asyncio
+    async def test_failure_counter_left_without_ttl_does_not_lock_the_account_forever(
+        self, redis_client: aioredis.Redis
+    ) -> None:
+        """A fail-counter carrying NO TTL must not become a permanent lockout.
+
+        INCR and EXPIRE were two separate round-trips, so a connection drop or a
+        process restart between them left the counter with no expiry. Worse here
+        than on the marketplace limiter: `_is_locked_out` returns before
+        `_record_failure` is ever reached, so nothing on the authentication path
+        can repair the key - the lockout window never rolls over and the account
+        is locked out FOREVER, correct password included, until an operator
+        deletes the key by hand.
+        """
+        account, password = _account()
+        store = StaticLocalAccountStore((account,))
+        key = "skillscan:admin:local:failcount:alice"
+        # The residue of a half-completed increment: past the threshold, no expiry.
+        await redis_client.set(key, 99)
+        assert await redis_client.ttl(key) == -1
+
+        # Still refused right now - that part is correct, the counter says locked.
+        assert (
+            await authenticate_local(redis_client, store, username="alice", password=password)
+            is None
+        )
+
+        assert await redis_client.ttl(key) > 0, (
+            "a fail-counter with no expiry must be repaired, or this account is "
+            "locked out permanently"
+        )
+
+    @pytest.mark.asyncio
     async def test_concurrent_attempts_all_resolve_independently(
         self, redis_client: aioredis.Redis
     ) -> None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import os
 import socket
 import time
@@ -388,12 +389,50 @@ def _load_trusted_intel_public_keys() -> tuple[RSAPublicKey, ...]:
     return tuple(keys)
 
 
+def _parse_m2m_basic_accounts(raw: str) -> dict[str, str]:
+    """Parse `SKILLSCAN_M2M_BASIC_ACCOUNTS_JSON`: {service_account: scrypt hash}.
+
+    SECURITY: fail-closed, same posture as `config._parse_m2m_grants` - a
+    malformed value crashes startup rather than degrading to "no accounts",
+    which would leave an operator believing a password login they configured is
+    live when the marketplace is in fact getting 401s.
+
+    Values must be scrypt hashes (`common.password.hash_password`), never
+    plaintext (INV-17). A value that is not in that format is rejected here
+    rather than at first login: `verify_password` returns False for an
+    unparseable hash, so without this check a plaintext password in config would
+    look like a working configuration that refuses every correct login.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"SKILLSCAN_M2M_BASIC_ACCOUNTS_JSON is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "SKILLSCAN_M2M_BASIC_ACCOUNTS_JSON must be a JSON object of "
+            "service_account -> scrypt password hash"
+        )
+    accounts: dict[str, str] = {}
+    for service_account, password_hash in parsed.items():
+        if not isinstance(password_hash, str) or not password_hash.startswith("scrypt$"):
+            raise ValueError(
+                f"SKILLSCAN_M2M_BASIC_ACCOUNTS_JSON entry {service_account!r} must be a "
+                "scrypt hash produced by common.password.hash_password, never a plaintext "
+                "password"
+            )
+        accounts[service_account] = password_hash
+    return accounts
+
+
 def _build_auth_runtime(
     *,
     m2m_grants: dict[str, M2MGrant] | None = None,
     breakglass_redis: aioredis.Redis | None = None,
     saml_redis: aioredis.Redis | None = None,
     local_redis: aioredis.Redis | None = None,
+    m2m_basic_redis: aioredis.Redis | None = None,
 ) -> AuthRuntime:
     settings = SessionSettings(
         introspection_endpoint=_env(
@@ -425,6 +464,12 @@ def _build_auth_runtime(
         )
         - frozenset({""}),
         m2m_grants=m2m_grants,
+        # 2026-07-31: M2M username/password. Empty config = path unavailable
+        # (see AuthRuntime), so this is additive for every existing deployment.
+        m2m_basic_accounts=_parse_m2m_basic_accounts(
+            os.environ.get("SKILLSCAN_M2M_BASIC_ACCOUNTS_JSON", "")
+        ),
+        m2m_basic_redis=m2m_basic_redis,
     )
 
 
@@ -712,6 +757,9 @@ def create_app(
             breakglass_redis=scan_runtime.redis,
             saml_redis=scan_runtime.redis,
             local_redis=scan_runtime.redis,
+            # Same shared connection the three session stores above reuse - the
+            # M2M password path needs Redis only for its brute-force counter.
+            m2m_basic_redis=scan_runtime.redis,
         )
     )
     app.state.scan = scan_runtime

@@ -28,7 +28,12 @@ from common.errors import (
 from fastapi import Depends, HTTPException, Request
 from skillscan_core import TrustTier
 
-from .m2m import M2MError, M2MGrant, authenticate_client_credentials
+from .m2m import (
+    M2MError,
+    M2MGrant,
+    authenticate_basic_service_account,
+    authenticate_client_credentials,
+)
 from .middleware import (
     BREAKGLASS_SESSION_COOKIE_NAME,
     LOCAL_SESSION_COOKIE_NAME,
@@ -63,6 +68,8 @@ class AuthRuntime:
         breakglass_redis: aioredis.Redis | None = None,
         saml_redis: aioredis.Redis | None = None,
         local_redis: aioredis.Redis | None = None,
+        m2m_basic_accounts: dict[str, str] | None = None,
+        m2m_basic_redis: aioredis.Redis | None = None,
     ) -> None:
         self.settings = settings
         self.http_client = http_client
@@ -86,6 +93,31 @@ class AuthRuntime:
         # SECURITY (2026-07-13 local-auth addition): same "only attempted when
         # wired up" posture as breakglass_redis/saml_redis above.
         self.local_redis = local_redis
+        # SECURITY (2026-07-31, M2M username/password): service account ->
+        # scrypt hash. Empty by default, and an empty mapping means the path is
+        # UNAVAILABLE rather than unrestricted (m2m.authenticate_basic_service_
+        # account matches nothing), so no deployment gains a password login by
+        # upgrading. `m2m_basic_redis` carries the brute-force counter and is
+        # required for the path to be attempted at all - same "only when wired
+        # up" posture as the three session stores above.
+        self.m2m_basic_accounts: dict[str, str] = (
+            m2m_basic_accounts if m2m_basic_accounts is not None else {}
+        )
+        self.m2m_basic_redis = m2m_basic_redis
+
+
+def _extract_basic_header(request: Request) -> str | None:
+    """The raw `Authorization: Basic ...` header, or None.
+
+    Returned unparsed on purpose: decoding and validating it belongs to
+    `m2m.authenticate_basic_service_account`, which must answer every malformed
+    shape with the same generic refusal a wrong password gets. Splitting that
+    decision across two modules is how one of them ends up distinguishable.
+    """
+    header = request.headers.get("authorization")
+    if header and header.lower().startswith("basic "):
+        return header
+    return None
 
 
 def _extract_bearer_token(request: Request) -> str | None:
@@ -228,6 +260,7 @@ async def get_session_context(request: Request) -> SessionContext:
     if local_session is not None:
         return local_session
     bearer = _extract_bearer_token(request)
+    basic_header = _extract_basic_header(request)
     try:
         if bearer is not None:
             return await authenticate_client_credentials(
@@ -235,6 +268,20 @@ async def get_session_context(request: Request) -> SessionContext:
                 settings=runtime.settings,
                 http_client=runtime.http_client,
                 cache=runtime.cache,
+                allowed_service_accounts=runtime.allowed_m2m_service_accounts,
+                grants=runtime.m2m_grants,
+            )
+        # 2026-07-31: the M2M username/password path, for deployments with no
+        # IdP to introspect against. Attempted only when it has been wired up
+        # (see AuthRuntime) and strictly AFTER bearer: the two use the same
+        # header and are mutually exclusive by scheme, so ordering only decides
+        # which one an ill-formed header falls through to, and falling through
+        # to the stronger path's rejection is the safer direction.
+        if basic_header is not None and runtime.m2m_basic_redis is not None:
+            return await authenticate_basic_service_account(
+                basic_header,
+                redis=runtime.m2m_basic_redis,
+                accounts=runtime.m2m_basic_accounts,
                 allowed_service_accounts=runtime.allowed_m2m_service_accounts,
                 grants=runtime.m2m_grants,
             )
